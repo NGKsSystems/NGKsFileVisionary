@@ -1,0 +1,9 @@
+7-Zip License
+
+7-Zip is free software distributed under the GNU LGPL license.
+
+You can use 7-Zip on any computer, including a computer in a commercial organization.
+You don't need to register or pay for 7-Zip.
+
+Source and official license text:
+https://www.7-zip.org/

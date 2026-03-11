@@ -1,0 +1,5 @@
+This application bundles 7za.exe as an external archive engine.
+
+- 7za.exe is intended to be bundled unmodified.
+- Official source and binaries are available at: https://www.7-zip.org/
+- This application does not create RAR archives.

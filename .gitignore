@@ -1,0 +1,31 @@
+# Build artifacts
+build/
+build_graph/
+debug/
+
+# Proof and run artifacts
+_proof/
+*.log
+build_run_*.txt
+
+# Local tooling state
+.ngksbuildcore/
+.ngksgraph_cache/
+.pytest_cache/
+.venv/
+
+# IDE/system
+.vscode/
+*.pdb
+*.ilk
+*.obj
+*.idb
+*.exp
+*.lib
+*.dll
+*.exe
+*.sqlite3
+
+# OS
+.DS_Store
+Thumbs.db

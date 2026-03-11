@@ -1,0 +1,10 @@
+{
+  "name": "ngksfilevisionary",
+  "version": "0.0.1",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "smoke": "node -e \"console.log('SMOKE_OK')\"",
+    "build": "cmd /c debug\\run_devfabric_build.cmd"
+  }
+}
