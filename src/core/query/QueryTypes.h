@@ -24,6 +24,8 @@ struct QueryOptions
     QuerySortField sortField = QuerySortField::Name;
     bool ascending = true;
     int maxDepth = -1;
+    int pageSize = 0;
+    int pageOffset = 0;
 
     bool filesOnly = false;
     bool directoriesOnly = false;

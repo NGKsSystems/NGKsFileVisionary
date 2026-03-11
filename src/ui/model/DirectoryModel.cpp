@@ -53,6 +53,8 @@ QueryResult DirectoryModel::query(const Request& request)
     options.sortField = request.sortField;
     options.ascending = request.ascending;
     options.maxDepth = request.maxDepth;
+    options.pageSize = request.pageSize;
+    options.pageOffset = request.pageOffset;
     options.filesOnly = request.filesOnly;
     options.directoriesOnly = request.directoriesOnly;
 

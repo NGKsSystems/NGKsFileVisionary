@@ -24,6 +24,8 @@ public:
         QuerySortField sortField = QuerySortField::Name;
         bool ascending = true;
         int maxDepth = -1;
+        int pageSize = 500;
+        int pageOffset = 0;
         bool filesOnly = false;
         bool directoriesOnly = false;
     };

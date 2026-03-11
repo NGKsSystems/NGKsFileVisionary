@@ -23,6 +23,12 @@
 #include <thread>
 
 #include "core/db/MetaStore.h"
+#include "core/perf/BatchCoordinator.h"
+#include "core/perf/LargeTreeHarness.h"
+#include "core/perf/PerfMetrics.h"
+#include "core/perf/PerfTimer.h"
+#include "core/perf/QueryProfiler.h"
+#include "core/perf/ResultLimiter.h"
 #include "core/db/SqlHelpers.h"
 #include "core/query/QueryCore.h"
 #include "core/query/QueryTypes.h"
@@ -57,6 +63,17 @@ struct WatchSmokeCliOptions {
     QString watchRoot;
     QString watchDbPath;
     QString watchLogPath;
+    QStringList argsReceived;
+    QString parseError;
+};
+
+struct PerfSmokeCliOptions {
+    bool enabled = false;
+    QString perfRoot;
+    QString perfDbPath;
+    QString perfLogPath;
+    qint64 targetFileCount = 100000;
+    int queryRepeats = 3;
     QStringList argsReceived;
     QString parseError;
 };
@@ -118,6 +135,16 @@ bool hasWatchSmokeFlag(int argc, char* argv[])
 {
     for (int i = 1; i < argc; ++i) {
         if (QString::fromLocal8Bit(argv[i]) == QStringLiteral("--watch-smoke")) {
+            return true;
+        }
+    }
+    return false;
+}
+
+bool hasPerfSmokeFlag(int argc, char* argv[])
+{
+    for (int i = 1; i < argc; ++i) {
+        if (QString::fromLocal8Bit(argv[i]) == QStringLiteral("--perf-smoke")) {
             return true;
         }
     }
@@ -217,6 +244,86 @@ WatchSmokeCliOptions parseWatchSmokeOptions(int argc, char* argv[])
             if (!consumeValue(&options.watchLogPath)) {
                 break;
             }
+            continue;
+        }
+    }
+
+    return options;
+}
+
+PerfSmokeCliOptions parsePerfSmokeOptions(int argc, char* argv[])
+{
+    PerfSmokeCliOptions options;
+
+    for (int i = 0; i < argc; ++i) {
+        options.argsReceived << QString::fromLocal8Bit(argv[i]);
+    }
+
+    for (int i = 1; i < argc; ++i) {
+        const QString token = QString::fromLocal8Bit(argv[i]);
+        if (token == QStringLiteral("--perf-smoke")) {
+            options.enabled = true;
+            continue;
+        }
+
+        auto consumeValue = [&](QString* out) {
+            if ((i + 1) >= argc) {
+                options.parseError = QStringLiteral("missing_value_for_%1").arg(token);
+                return false;
+            }
+            ++i;
+            *out = QDir::cleanPath(QString::fromLocal8Bit(argv[i]));
+            return true;
+        };
+
+        if (token == QStringLiteral("--perf-root")) {
+            if (!consumeValue(&options.perfRoot)) {
+                break;
+            }
+            continue;
+        }
+
+        if (token == QStringLiteral("--perf-db-path")) {
+            if (!consumeValue(&options.perfDbPath)) {
+                break;
+            }
+            continue;
+        }
+
+        if (token == QStringLiteral("--perf-log")) {
+            if (!consumeValue(&options.perfLogPath)) {
+                break;
+            }
+            continue;
+        }
+
+        if (token == QStringLiteral("--perf-target-files")) {
+            QString raw;
+            if (!consumeValue(&raw)) {
+                break;
+            }
+            bool ok = false;
+            const qint64 parsed = raw.toLongLong(&ok);
+            if (!ok || parsed <= 0) {
+                options.parseError = QStringLiteral("invalid_value_for_%1").arg(token);
+                break;
+            }
+            options.targetFileCount = parsed;
+            continue;
+        }
+
+        if (token == QStringLiteral("--perf-query-repeats")) {
+            QString raw;
+            if (!consumeValue(&raw)) {
+                break;
+            }
+            bool ok = false;
+            const int parsed = raw.toInt(&ok);
+            if (!ok || parsed <= 0) {
+                options.parseError = QStringLiteral("invalid_value_for_%1").arg(token);
+                break;
+            }
+            options.queryRepeats = parsed;
             continue;
         }
     }
@@ -331,6 +438,48 @@ QString buildEntryHash(const QString& path, const QFileInfo& fileInfo)
                                 .arg(fileInfo.isDir() ? -1 : fileInfo.size())
                                 .arg(toIsoUtc(fileInfo.lastModified()));
     return QString::fromLatin1(QCryptographicHash::hash(payload.toUtf8(), QCryptographicHash::Sha256).toHex());
+}
+
+bool listSqliteIndexes(const QString& dbPath, QStringList* out, QString* errorText)
+{
+    if (!out) {
+        if (errorText) {
+            *errorText = QStringLiteral("null_index_output");
+        }
+        return false;
+    }
+
+    const QString connectionName = QStringLiteral("filevisionary_perf_probe_%1")
+                                       .arg(QDateTime::currentMSecsSinceEpoch());
+    {
+        QSqlDatabase db = QSqlDatabase::addDatabase(QStringLiteral("QSQLITE"), connectionName);
+        db.setDatabaseName(dbPath);
+        if (!db.open()) {
+            if (errorText) {
+                *errorText = db.lastError().text();
+            }
+            QSqlDatabase::removeDatabase(connectionName);
+            return false;
+        }
+
+        QSqlQuery q(db);
+        if (!q.exec(QStringLiteral("SELECT name FROM sqlite_master WHERE type='index' ORDER BY name ASC;"))) {
+            if (errorText) {
+                *errorText = q.lastError().text();
+            }
+            db.close();
+            QSqlDatabase::removeDatabase(connectionName);
+            return false;
+        }
+
+        while (q.next()) {
+            out->append(q.value(0).toString());
+        }
+
+        db.close();
+    }
+    QSqlDatabase::removeDatabase(connectionName);
+    return true;
 }
 
 bool runSynchronousIndexPass(MetaStore& store,
@@ -678,6 +827,288 @@ int runIndexSmokeCli(int argc, char* argv[])
     }
 }
 
+int runPerfSmokeCli(int argc, char* argv[])
+{
+    QCoreApplication cliApp(argc, argv);
+
+    const PerfSmokeCliOptions options = parsePerfSmokeOptions(argc, argv);
+    const QString exePath = QFileInfo(QString::fromLocal8Bit(argv[0])).absoluteFilePath();
+    const QString cwd = QDir::currentPath();
+
+    if (!options.parseError.isEmpty()) {
+        writeStderrLine(QStringLiteral("perf_smoke_parse_error=%1").arg(options.parseError));
+        return 120;
+    }
+
+    if (options.perfLogPath.trimmed().isEmpty()) {
+        writeStderrLine(QStringLiteral("perf_smoke_error=missing_required_arg_--perf-log"));
+        return 121;
+    }
+
+    IndexSmokeLogWriter log;
+    QString logOpenError;
+    if (!log.open(options.perfLogPath, &logOpenError)) {
+        writeStderrLine(QStringLiteral("perf_smoke_error=log_open_failed"));
+        writeStderrLine(QStringLiteral("perf_smoke_log_path=%1").arg(QDir::toNativeSeparators(options.perfLogPath)));
+        writeStderrLine(QStringLiteral("perf_smoke_log_error=%1").arg(logOpenError));
+        return 122;
+    }
+
+    auto finishFail = [&](int exitCode, const QString& reason) {
+        log.writeLine(QStringLiteral("final_status=FAIL"));
+        log.writeLine(QStringLiteral("exit_code=%1").arg(exitCode));
+        log.writeLine(QStringLiteral("failure_reason=%1").arg(reason));
+        log.writeLine(QStringLiteral("timestamp_utc_end=%1").arg(QDateTime::currentDateTimeUtc().toString(Qt::ISODate)));
+        return exitCode;
+    };
+
+    try {
+        if (options.perfRoot.trimmed().isEmpty()) {
+            writeStderrLine(QStringLiteral("perf_smoke_error=missing_required_arg_--perf-root"));
+            return finishFail(123, QStringLiteral("missing_required_arg_--perf-root"));
+        }
+        if (options.perfDbPath.trimmed().isEmpty()) {
+            writeStderrLine(QStringLiteral("perf_smoke_error=missing_required_arg_--perf-db-path"));
+            return finishFail(124, QStringLiteral("missing_required_arg_--perf-db-path"));
+        }
+
+        log.writeLine(QStringLiteral("mode=perf_smoke"));
+        log.writeLine(QStringLiteral("startup_banner=PERF_SMOKE_BEGIN"));
+        log.writeLine(QStringLiteral("exe_path=%1").arg(QDir::toNativeSeparators(exePath)));
+        log.writeLine(QStringLiteral("cwd=%1").arg(QDir::toNativeSeparators(cwd)));
+        log.writeLine(QStringLiteral("args_received=%1").arg(options.argsReceived.join(QStringLiteral(" | "))));
+        log.writeLine(QStringLiteral("perf_root=%1").arg(QDir::toNativeSeparators(options.perfRoot)));
+        log.writeLine(QStringLiteral("perf_db_path=%1").arg(QDir::toNativeSeparators(options.perfDbPath)));
+        log.writeLine(QStringLiteral("perf_log=%1").arg(QDir::toNativeSeparators(options.perfLogPath)));
+        log.writeLine(QStringLiteral("perf_target_files=%1").arg(options.targetFileCount));
+        log.writeLine(QStringLiteral("perf_query_repeats=%1").arg(options.queryRepeats));
+        log.writeLine(QStringLiteral("timestamp_utc=%1").arg(QDateTime::currentDateTimeUtc().toString(Qt::ISODate)));
+
+        const QString normalizedPerfRoot = QDir::fromNativeSeparators(QDir::cleanPath(options.perfRoot));
+        const QString treeRoot = QDir(normalizedPerfRoot).filePath(QStringLiteral("large_tree"));
+        QDir().mkpath(normalizedPerfRoot);
+        if (QDir(treeRoot).exists() && !QDir(treeRoot).removeRecursively()) {
+            return finishFail(125, QStringLiteral("cleanup_tree_root_failed:%1").arg(treeRoot));
+        }
+
+        PerfMetrics metrics;
+        BatchCoordinator batchCoordinator;
+        ResultLimiter limiter;
+
+        PerfTimer harnessTimer;
+        LargeTreeHarness harness;
+        const LargeTreeHarnessResult harnessResult = harness.createTree(treeRoot, options.targetFileCount);
+        const double harnessMs = harnessTimer.elapsedMs();
+        if (!harnessResult.ok) {
+            return finishFail(126, QStringLiteral("large_tree_harness_failed:%1").arg(harnessResult.errorText));
+        }
+        metrics.addWatcherSample(harnessMs, harnessResult.fileCount);
+        log.writeLine(QStringLiteral("harness_ok=true"));
+        log.writeLine(QStringLiteral("harness_tree_root=%1").arg(QDir::toNativeSeparators(treeRoot)));
+        log.writeLine(QStringLiteral("harness_files=%1").arg(harnessResult.fileCount));
+        log.writeLine(QStringLiteral("harness_duration_ms=%1").arg(harnessMs, 0, 'f', 3));
+
+        QFile::remove(options.perfDbPath);
+
+        MetaStore store;
+        QString errorText;
+        QString migrationLog;
+        if (!store.initialize(options.perfDbPath, &errorText, &migrationLog)) {
+            return finishFail(127, QStringLiteral("db_init_failure:%1").arg(errorText));
+        }
+        log.writeLine(QStringLiteral("db_init_ok=true"));
+        if (!migrationLog.isEmpty()) {
+            log.writeLine(QStringLiteral("migration_log_begin"));
+            log.writeLine(migrationLog.trimmed());
+            log.writeLine(QStringLiteral("migration_log_end"));
+        }
+
+        IndexRootRecord indexRoot;
+        indexRoot.rootPath = QDir::fromNativeSeparators(QDir::cleanPath(treeRoot));
+        indexRoot.status = QStringLiteral("active");
+        indexRoot.createdUtc = SqlHelpers::utcNowIso();
+        indexRoot.updatedUtc = indexRoot.createdUtc;
+        if (!store.upsertIndexRoot(indexRoot, nullptr, &errorText)) {
+            store.shutdown();
+            return finishFail(128, QStringLiteral("index_root_upsert_failed:%1").arg(errorText));
+        }
+
+        VolumeRecord volume;
+        volume.volumeKey = QStringLiteral("perf_smoke:%1").arg(indexRoot.rootPath.toLower());
+        volume.rootPath = indexRoot.rootPath;
+        volume.displayName = QFileInfo(indexRoot.rootPath).fileName();
+        volume.fsType = QStringLiteral("native");
+        volume.serialNumber = QStringLiteral("perf_smoke");
+        qint64 volumeId = 0;
+        if (!store.upsertVolume(volume, &volumeId, &errorText)) {
+            store.shutdown();
+            return finishFail(129, QStringLiteral("volume_upsert_failed:%1").arg(errorText));
+        }
+
+        PerfTimer ingestTimer;
+        IndexSmokePassResult ingestPass;
+        if (!runSynchronousIndexPass(store, volumeId, treeRoot, 1, &ingestPass, &errorText)) {
+            store.shutdown();
+            return finishFail(130, QStringLiteral("index_ingest_failed:%1").arg(errorText));
+        }
+        const double ingestMs = ingestTimer.elapsedMs();
+        metrics.addIngestSample(ingestMs, ingestPass.seen);
+        log.writeLine(QStringLiteral("ingest_ok=true"));
+        log.writeLine(QStringLiteral("ingest_seen=%1").arg(ingestPass.seen));
+        log.writeLine(QStringLiteral("ingest_inserted=%1").arg(ingestPass.inserted));
+        log.writeLine(QStringLiteral("ingest_updated=%1").arg(ingestPass.updated));
+        log.writeLine(QStringLiteral("ingest_duration_ms=%1").arg(ingestMs, 0, 'f', 3));
+
+        QueryCore queryCore(store);
+        QueryProfiler queryProfiler(metrics);
+        QueryOptions baseOptions;
+        baseOptions.sortField = QuerySortField::Name;
+        baseOptions.ascending = true;
+        baseOptions.pageSize = batchCoordinator.queryPageSize();
+        baseOptions.pageOffset = 0;
+
+        bool querySuiteOk = true;
+        log.writeLine(QStringLiteral("query_suite_begin"));
+        for (int i = 0; i < options.queryRepeats; ++i) {
+            const int runId = i + 1;
+
+            QString childrenLine;
+            const QueryResult childrenRaw = queryProfiler.profile(QStringLiteral("children"), [&]() {
+                return queryCore.queryChildren(treeRoot, baseOptions);
+            }, &childrenLine);
+            const QueryResult children = limiter.limit(childrenRaw);
+            querySuiteOk = querySuiteOk && children.ok;
+            log.writeLine(QStringLiteral("query_run=%1 %2 limited_rows=%3")
+                              .arg(runId)
+                              .arg(childrenLine)
+                              .arg(children.rows.size()));
+
+            QueryOptions flatOptions = baseOptions;
+            flatOptions.maxDepth = -1;
+            QString flatLine;
+            const QueryResult flatRaw = queryProfiler.profile(QStringLiteral("flat"), [&]() {
+                return queryCore.queryFlat(treeRoot, flatOptions);
+            }, &flatLine);
+            const QueryResult flat = limiter.limit(flatRaw);
+            querySuiteOk = querySuiteOk && flat.ok;
+            log.writeLine(QStringLiteral("query_run=%1 %2 limited_rows=%3")
+                              .arg(runId)
+                              .arg(flatLine)
+                              .arg(flat.rows.size()));
+
+            QueryOptions subtreeOptions = baseOptions;
+            subtreeOptions.maxDepth = -1;
+            QString subtreeLine;
+            const QueryResult subtreeRaw = queryProfiler.profile(QStringLiteral("subtree"), [&]() {
+                return queryCore.querySubtree(treeRoot, subtreeOptions);
+            }, &subtreeLine);
+            const QueryResult subtree = limiter.limit(subtreeRaw);
+            querySuiteOk = querySuiteOk && subtree.ok;
+            log.writeLine(QStringLiteral("query_run=%1 %2 limited_rows=%3")
+                              .arg(runId)
+                              .arg(subtreeLine)
+                              .arg(subtree.rows.size()));
+
+            QueryOptions searchOptions = baseOptions;
+            searchOptions.substringFilter = QStringLiteral("file_1");
+            QString searchLine;
+            const QueryResult searchRaw = queryProfiler.profile(QStringLiteral("search"), [&]() {
+                return queryCore.querySearch(treeRoot, searchOptions);
+            }, &searchLine);
+            const QueryResult search = limiter.limit(searchRaw);
+            querySuiteOk = querySuiteOk && search.ok;
+            log.writeLine(QStringLiteral("query_run=%1 %2 limited_rows=%3")
+                              .arg(runId)
+                              .arg(searchLine)
+                              .arg(search.rows.size()));
+        }
+        log.writeLine(QStringLiteral("query_suite_end"));
+
+        PerfTimer commitTimer;
+        if (store.beginTransaction(&errorText)) {
+            IndexStatRecord stat;
+            stat.key = QStringLiteral("perf_last_query_avg_ms");
+            stat.value = QString::number(metrics.averageQueryMs(), 'f', 3);
+            stat.updatedUtc = SqlHelpers::utcNowIso();
+            if (!store.upsertIndexStat(stat, &errorText)) {
+                store.rollbackTransaction(nullptr);
+            } else if (!store.commitTransaction(&errorText)) {
+                store.rollbackTransaction(nullptr);
+            }
+        }
+        metrics.addDbCommitSample(commitTimer.elapsedMs());
+
+        const qint64 totalEntries = store.countEntries(&errorText);
+        const qint64 totalDirectories = store.countDirectories(&errorText);
+        const qint64 totalFiles = store.countFiles(&errorText);
+
+        QStringList indexes;
+        QString indexError;
+        const bool indexProbeOk = listSqliteIndexes(options.perfDbPath, &indexes, &indexError);
+        if (!indexProbeOk) {
+            store.shutdown();
+            return finishFail(131, QStringLiteral("index_probe_failed:%1").arg(indexError));
+        }
+
+        log.writeLine(QStringLiteral("query_avg_ms=%1").arg(metrics.averageQueryMs(), 0, 'f', 3));
+        log.writeLine(QStringLiteral("ingest_avg_ms=%1").arg(metrics.averageIngestMs(), 0, 'f', 3));
+        log.writeLine(QStringLiteral("watcher_avg_ms=%1").arg(metrics.averageWatcherMs(), 0, 'f', 3));
+        log.writeLine(QStringLiteral("db_commit_avg_ms=%1").arg(metrics.averageDbCommitMs(), 0, 'f', 3));
+        log.writeLine(QStringLiteral("query_total_rows=%1").arg(metrics.totalQueryRows()));
+        log.writeLine(QStringLiteral("ingest_total_rows=%1").arg(metrics.totalIngestRows()));
+        log.writeLine(QStringLiteral("watcher_total_rows=%1").arg(metrics.totalWatcherRows()));
+
+        log.writeLine(QStringLiteral("batch_directory_size=%1").arg(batchCoordinator.directoryBatchSize()));
+        log.writeLine(QStringLiteral("batch_query_page_size=%1").arg(batchCoordinator.queryPageSize()));
+        log.writeLine(QStringLiteral("batch_scan_size=%1").arg(batchCoordinator.scanBatchSize()));
+        log.writeLine(QStringLiteral("result_limiter_max=%1").arg(ResultLimiter::kMaxResultsPerQuery));
+
+        log.writeLine(QStringLiteral("row_count_entries=%1").arg(totalEntries));
+        log.writeLine(QStringLiteral("row_count_files=%1").arg(totalFiles));
+        log.writeLine(QStringLiteral("row_count_directories=%1").arg(totalDirectories));
+
+        bool hasParentPathIndex = false;
+        bool hasPathIndex = false;
+        bool hasNameIndex = false;
+        for (const QString& indexName : indexes) {
+            log.writeLine(QStringLiteral("db_index=%1").arg(indexName));
+            if (indexName.compare(QStringLiteral("idx_entries_parent"), Qt::CaseInsensitive) == 0
+                || indexName.compare(QStringLiteral("idx_entries_parent_path"), Qt::CaseInsensitive) == 0) {
+                hasParentPathIndex = true;
+            }
+            if (indexName.compare(QStringLiteral("idx_entries_path"), Qt::CaseInsensitive) == 0) {
+                hasPathIndex = true;
+            }
+            if (indexName.compare(QStringLiteral("idx_entries_name"), Qt::CaseInsensitive) == 0
+                || indexName.compare(QStringLiteral("idx_entries_name_raw"), Qt::CaseInsensitive) == 0) {
+                hasNameIndex = true;
+            }
+        }
+
+        const bool rowCountsOk = totalEntries >= harnessResult.fileCount;
+        const bool indexesOk = hasParentPathIndex && hasPathIndex && hasNameIndex;
+        const bool pass = querySuiteOk && rowCountsOk && indexesOk;
+
+        store.shutdown();
+
+        log.writeLine(QStringLiteral("query_suite_ok=%1").arg(querySuiteOk ? QStringLiteral("true") : QStringLiteral("false")));
+        log.writeLine(QStringLiteral("row_counts_ok=%1").arg(rowCountsOk ? QStringLiteral("true") : QStringLiteral("false")));
+        log.writeLine(QStringLiteral("indexes_ok=%1").arg(indexesOk ? QStringLiteral("true") : QStringLiteral("false")));
+        log.writeLine(QStringLiteral("gate=%1").arg(pass ? QStringLiteral("PASS") : QStringLiteral("FAIL")));
+        log.writeLine(QStringLiteral("final_status=%1").arg(pass ? QStringLiteral("PASS") : QStringLiteral("FAIL")));
+        log.writeLine(QStringLiteral("exit_code=%1").arg(pass ? 0 : 132));
+        log.writeLine(QStringLiteral("failure_reason=%1").arg(pass ? QString() : QStringLiteral("perf_gate_failed")));
+        log.writeLine(QStringLiteral("timestamp_utc_end=%1").arg(QDateTime::currentDateTimeUtc().toString(Qt::ISODate)));
+        return pass ? 0 : 132;
+    } catch (const std::exception& ex) {
+        writeStderrLine(QStringLiteral("perf_smoke_error=unexpected_exception"));
+        return finishFail(133, QStringLiteral("unexpected_exception:%1").arg(QString::fromLocal8Bit(ex.what())));
+    } catch (...) {
+        writeStderrLine(QStringLiteral("perf_smoke_error=unexpected_error"));
+        return finishFail(134, QStringLiteral("unexpected_error"));
+    }
+}
+
 int runWatchSmokeCli(int argc, char* argv[])
 {
     QCoreApplication cliApp(argc, argv);
@@ -983,6 +1414,10 @@ bool writeLogFile(const QString& logPath, const QStringList& lines)
 
 int main(int argc, char* argv[])
 {
+    if (hasPerfSmokeFlag(argc, argv)) {
+        return runPerfSmokeCli(argc, argv);
+    }
+
     if (hasWatchSmokeFlag(argc, argv)) {
         return runWatchSmokeCli(argc, argv);
     }

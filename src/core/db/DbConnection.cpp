@@ -109,5 +109,20 @@ bool DbConnection::applyPragmas()
         return false;
     }
 
+    if (!q.exec(QStringLiteral("PRAGMA synchronous = NORMAL;"))) {
+        m_lastError = q.lastError().text();
+        return false;
+    }
+
+    if (!q.exec(QStringLiteral("PRAGMA temp_store = MEMORY;"))) {
+        m_lastError = q.lastError().text();
+        return false;
+    }
+
+    if (!q.exec(QStringLiteral("PRAGMA mmap_size = 268435456;"))) {
+        m_lastError = q.lastError().text();
+        return false;
+    }
+
     return true;
 }

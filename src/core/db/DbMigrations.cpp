@@ -303,6 +303,11 @@ bool DbMigrations::applyV2(DbConnection& connection, QString* errorText)
     }
 
     const QStringList indexes = {
+        QStringLiteral("DROP INDEX IF EXISTS idx_entries_name;"),
+        QStringLiteral("CREATE INDEX IF NOT EXISTS idx_entries_name ON entries(name);"),
+        QStringLiteral("CREATE INDEX IF NOT EXISTS idx_entries_normalized_name ON entries(normalized_name);"),
+        QStringLiteral("CREATE INDEX IF NOT EXISTS idx_entries_parent ON entries(parent_path);"),
+        QStringLiteral("CREATE INDEX IF NOT EXISTS idx_entries_path ON entries(path);"),
         QStringLiteral("CREATE INDEX IF NOT EXISTS idx_entries_parent_path ON entries(parent_path);"),
         QStringLiteral("CREATE INDEX IF NOT EXISTS idx_entries_extension_v2 ON entries(extension);"),
         QStringLiteral("CREATE INDEX IF NOT EXISTS idx_entries_modified_time ON entries(modified_utc);"),

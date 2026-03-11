@@ -4,6 +4,7 @@
 #include "SearchQueryService.h"
 #include "SnapshotQueryService.h"
 #include "core/db/MetaStore.h"
+#include "core/perf/ResultLimiter.h"
 
 QueryCore::QueryCore(MetaStore& store)
     : m_folder(new FolderQueryService(store))
@@ -26,20 +27,28 @@ QueryCore::~QueryCore()
 
 QueryResult QueryCore::queryChildren(const QString& parentPath, const QueryOptions& options) const
 {
-    return m_folder->queryChildren(parentPath, options);
+    const QueryResult raw = m_folder->queryChildren(parentPath, options);
+    ResultLimiter limiter;
+    return limiter.limit(raw);
 }
 
 QueryResult QueryCore::queryFlat(const QString& rootPath, const QueryOptions& options) const
 {
-    return m_folder->queryFlatDescendants(rootPath, options);
+    const QueryResult raw = m_folder->queryFlatDescendants(rootPath, options);
+    ResultLimiter limiter;
+    return limiter.limit(raw);
 }
 
 QueryResult QueryCore::querySubtree(const QString& rootPath, const QueryOptions& options) const
 {
-    return m_snapshot->querySubtree(rootPath, options);
+    const QueryResult raw = m_snapshot->querySubtree(rootPath, options);
+    ResultLimiter limiter;
+    return limiter.limit(raw);
 }
 
 QueryResult QueryCore::querySearch(const QString& rootPath, const QueryOptions& options) const
 {
-    return m_search->queryByFilter(rootPath, options);
+    const QueryResult raw = m_search->queryByFilter(rootPath, options);
+    ResultLimiter limiter;
+    return limiter.limit(raw);
 }

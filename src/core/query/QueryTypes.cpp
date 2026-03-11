@@ -183,6 +183,21 @@ bool applyFiltersAndSort(const QueryOptions& options, QVector<QueryRow>* rows, Q
         return compareRows(a, b, options) < 0;
     });
 
+    if (options.pageOffset > 0 || options.pageSize > 0) {
+        const int start = qBound(0, options.pageOffset, filtered.size());
+        int end = filtered.size();
+        if (options.pageSize > 0) {
+            end = qMin(filtered.size(), start + options.pageSize);
+        }
+
+        QVector<QueryRow> paged;
+        paged.reserve(qMax(0, end - start));
+        for (int i = start; i < end; ++i) {
+            paged.push_back(filtered.at(i));
+        }
+        filtered = paged;
+    }
+
     *rows = filtered;
     return true;
 }
