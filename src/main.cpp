@@ -1,12 +1,23 @@
 #include <QApplication>
 #include <QCommandLineOption>
 #include <QCommandLineParser>
+#include <QCoreApplication>
+#include <QCryptographicHash>
+#include <QDateTime>
 #include <QDir>
+#include <QDirIterator>
 #include <QFile>
 #include <QFileInfo>
+#include <QJsonArray>
+#include <QJsonDocument>
+#include <QJsonObject>
 #include <QSaveFile>
+#include <QSqlDatabase>
+#include <QSqlError>
+#include <QSqlQuery>
 #include <QTextStream>
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <thread>
@@ -15,6 +26,7 @@
 #include "core/db/SqlHelpers.h"
 #include "core/query/QueryCore.h"
 #include "core/query/QueryTypes.h"
+#include "core/index/VisionIndexService.h"
 #include "core/scan/ScanCoordinator.h"
 #include "core/scan/ScanTask.h"
 #include "core/services/RefreshPolicy.h"
@@ -29,26 +41,514 @@
 #endif
 
 namespace {
-void writeLogFile(const QString& logPath, const QStringList& lines)
+struct IndexSmokeCliOptions {
+    bool enabled = false;
+    QString indexRoot;
+    QString indexDbPath;
+    QString indexLogPath;
+    QStringList argsReceived;
+    QString parseError;
+};
+
+class IndexSmokeLogWriter {
+public:
+    bool open(const QString& logPath, QString* error)
+    {
+        QFileInfo logInfo(logPath);
+        if (!QDir().mkpath(logInfo.absolutePath())) {
+            if (error) {
+                *error = QStringLiteral("unable_to_create_log_parent_dir");
+            }
+            return false;
+        }
+
+        file_.setFileName(logPath);
+        if (!file_.open(QIODevice::WriteOnly | QIODevice::Text | QIODevice::Truncate)) {
+            if (error) {
+                *error = file_.errorString();
+            }
+            return false;
+        }
+
+        stream_.setDevice(&file_);
+        return true;
+    }
+
+    void writeLine(const QString& line)
+    {
+        stream_ << line << '\n';
+        stream_.flush();
+        file_.flush();
+    }
+
+private:
+    QFile file_;
+    QTextStream stream_;
+};
+
+void writeStderrLine(const QString& line)
+{
+    QTextStream err(stderr, QIODevice::WriteOnly);
+    err << line << '\n';
+    err.flush();
+}
+
+bool hasIndexSmokeFlag(int argc, char* argv[])
+{
+    for (int i = 1; i < argc; ++i) {
+        if (QString::fromLocal8Bit(argv[i]) == QStringLiteral("--index-smoke")) {
+            return true;
+        }
+    }
+    return false;
+}
+
+IndexSmokeCliOptions parseIndexSmokeOptions(int argc, char* argv[])
+{
+    IndexSmokeCliOptions options;
+
+    for (int i = 0; i < argc; ++i) {
+        options.argsReceived << QString::fromLocal8Bit(argv[i]);
+    }
+
+    for (int i = 1; i < argc; ++i) {
+        const QString token = QString::fromLocal8Bit(argv[i]);
+        if (token == QStringLiteral("--index-smoke")) {
+            options.enabled = true;
+            continue;
+        }
+
+        auto consumeValue = [&](QString* out) {
+            if ((i + 1) >= argc) {
+                options.parseError = QStringLiteral("missing_value_for_%1").arg(token);
+                return false;
+            }
+            ++i;
+            *out = QDir::cleanPath(QString::fromLocal8Bit(argv[i]));
+            return true;
+        };
+
+        if (token == QStringLiteral("--index-root")) {
+            if (!consumeValue(&options.indexRoot)) {
+                break;
+            }
+            continue;
+        }
+
+        if (token == QStringLiteral("--index-db-path")) {
+            if (!consumeValue(&options.indexDbPath)) {
+                break;
+            }
+            continue;
+        }
+
+        if (token == QStringLiteral("--index-log")) {
+            if (!consumeValue(&options.indexLogPath)) {
+                break;
+            }
+            continue;
+        }
+    }
+
+    return options;
+}
+
+struct IndexSmokePassResult {
+    bool ok = true;
+    qint64 seen = 0;
+    qint64 inserted = 0;
+    qint64 updated = 0;
+    qint64 files = 0;
+    qint64 directories = 0;
+    QString error;
+};
+
+QString toIsoUtc(const QDateTime& value)
+{
+    if (!value.isValid()) {
+        return QString();
+    }
+    return value.toUTC().toString(Qt::ISODate);
+}
+
+QString buildEntryHash(const QString& path, const QFileInfo& fileInfo)
+{
+    const QString payload = QStringLiteral("%1|%2|%3")
+                                .arg(path)
+                                .arg(fileInfo.isDir() ? -1 : fileInfo.size())
+                                .arg(toIsoUtc(fileInfo.lastModified()));
+    return QString::fromLatin1(QCryptographicHash::hash(payload.toUtf8(), QCryptographicHash::Sha256).toHex());
+}
+
+bool runSynchronousIndexPass(MetaStore& store,
+                             qint64 volumeId,
+                             const QString& rootPath,
+                             int scanVersion,
+                             IndexSmokePassResult* out,
+                             QString* errorText)
+{
+    if (!out) {
+        if (errorText) {
+            *errorText = QStringLiteral("null_pass_result");
+        }
+        return false;
+    }
+
+    *out = IndexSmokePassResult();
+
+    const QString normalizedRoot = QDir::fromNativeSeparators(QDir::cleanPath(rootPath));
+    QFileInfo rootInfo(normalizedRoot);
+    if (!rootInfo.exists() || !rootInfo.isDir()) {
+        if (errorText) {
+            *errorText = QStringLiteral("invalid_root_path");
+        }
+        out->ok = false;
+        out->error = errorText ? *errorText : QStringLiteral("invalid_root_path");
+        return false;
+    }
+
+    QVector<QFileInfo> entries;
+    entries.append(rootInfo);
+    QDirIterator it(normalizedRoot,
+                    QDir::AllEntries | QDir::NoDotAndDotDot | QDir::Hidden | QDir::System,
+                    QDirIterator::Subdirectories);
+    while (it.hasNext()) {
+        const QString nextPath = it.next();
+        entries.append(QFileInfo(nextPath));
+    }
+
+    std::sort(entries.begin(), entries.end(), [](const QFileInfo& a, const QFileInfo& b) {
+        return a.absoluteFilePath().compare(b.absoluteFilePath(), Qt::CaseInsensitive) < 0;
+    });
+
+    QString txError;
+    if (!store.beginTransaction(&txError)) {
+        if (errorText) {
+            *errorText = txError;
+        }
+        out->ok = false;
+        out->error = txError;
+        return false;
+    }
+
+    for (const QFileInfo& info : entries) {
+        EntryRecord record;
+        record.volumeId = volumeId;
+        record.path = QDir::fromNativeSeparators(QDir::cleanPath(info.absoluteFilePath()));
+        record.parentPath = (record.path.compare(normalizedRoot, Qt::CaseInsensitive) == 0)
+            ? QDir::cleanPath(QFileInfo(record.path).dir().absolutePath())
+            : QDir::fromNativeSeparators(QDir::cleanPath(info.absolutePath()));
+        record.name = info.fileName().isEmpty() ? info.absoluteFilePath() : info.fileName();
+        record.normalizedName = SqlHelpers::normalizedName(record.name);
+        record.extension = info.isDir() || info.suffix().isEmpty()
+            ? QString()
+            : QStringLiteral(".") + info.suffix().toLower();
+        record.isDir = info.isDir();
+        record.hasSizeBytes = !info.isDir();
+        record.sizeBytes = info.isDir() ? 0 : info.size();
+        record.createdUtc = toIsoUtc(info.birthTime());
+        record.modifiedUtc = toIsoUtc(info.lastModified());
+        record.accessedUtc = toIsoUtc(info.lastRead());
+        record.hiddenFlag = info.isHidden();
+        record.readonlyFlag = !info.isWritable();
+        record.existsFlag = info.exists();
+        record.indexedAtUtc = SqlHelpers::utcNowIso();
+        record.scanVersion = scanVersion;
+        record.entryHash = buildEntryHash(record.path, info);
+        record.metadataVersion = 1;
+        record.hasParentId = false;
+        if (record.path.compare(normalizedRoot, Qt::CaseInsensitive) != 0) {
+            bool foundParent = false;
+            qint64 parentId = 0;
+            QString parentError;
+            if (!store.resolveParentIdByPath(record.parentPath, &parentId, &foundParent, &parentError)) {
+                store.rollbackTransaction(nullptr);
+                if (errorText) {
+                    *errorText = QStringLiteral("resolve_parent_failed path=%1 error=%2").arg(record.parentPath, parentError);
+                }
+                out->ok = false;
+                out->error = errorText ? *errorText : QStringLiteral("resolve_parent_failed");
+                return false;
+            }
+            if (foundParent) {
+                record.hasParentId = true;
+                record.parentId = parentId;
+            }
+        }
+
+        bool inserted = false;
+        bool updated = false;
+        QString upsertError;
+        if (!store.upsertEntry(record, nullptr, &inserted, &updated, &upsertError)) {
+            store.rollbackTransaction(nullptr);
+            if (errorText) {
+                *errorText = QStringLiteral("upsert_entry_failed path=%1 error=%2").arg(record.path, upsertError);
+            }
+            out->ok = false;
+            out->error = errorText ? *errorText : upsertError;
+            return false;
+        }
+
+        ++out->seen;
+        if (inserted) {
+            ++out->inserted;
+        }
+        if (updated) {
+            ++out->updated;
+        }
+        if (record.isDir) {
+            ++out->directories;
+        } else {
+            ++out->files;
+        }
+    }
+
+    if (!store.commitTransaction(&txError)) {
+        store.rollbackTransaction(nullptr);
+        if (errorText) {
+            *errorText = txError;
+        }
+        out->ok = false;
+        out->error = txError;
+        return false;
+    }
+
+    return true;
+}
+
+int runIndexSmokeCli(int argc, char* argv[])
+{
+    QCoreApplication cliApp(argc, argv);
+
+    const IndexSmokeCliOptions options = parseIndexSmokeOptions(argc, argv);
+    const QString exePath = QFileInfo(QString::fromLocal8Bit(argv[0])).absoluteFilePath();
+    const QString cwd = QDir::currentPath();
+    const QString timestampUtc = QDateTime::currentDateTimeUtc().toString(Qt::ISODate);
+
+    if (!options.parseError.isEmpty()) {
+        writeStderrLine(QStringLiteral("index_smoke_parse_error=%1").arg(options.parseError));
+        return 64;
+    }
+
+    if (options.indexLogPath.trimmed().isEmpty()) {
+        writeStderrLine(QStringLiteral("index_smoke_error=missing_required_arg_--index-log"));
+        return 65;
+    }
+
+    IndexSmokeLogWriter log;
+    QString logOpenError;
+    if (!log.open(options.indexLogPath, &logOpenError)) {
+        writeStderrLine(QStringLiteral("index_smoke_error=log_open_failed"));
+        writeStderrLine(QStringLiteral("index_smoke_log_path=%1").arg(QDir::toNativeSeparators(options.indexLogPath)));
+        writeStderrLine(QStringLiteral("index_smoke_log_error=%1").arg(logOpenError));
+        return 66;
+    }
+
+    auto finishFail = [&](int exitCode, const QString& reason) {
+        log.writeLine(QStringLiteral("final_status=FAIL"));
+        log.writeLine(QStringLiteral("exit_code=%1").arg(exitCode));
+        log.writeLine(QStringLiteral("failure_reason=%1").arg(reason));
+        log.writeLine(QStringLiteral("timestamp_utc_end=%1").arg(QDateTime::currentDateTimeUtc().toString(Qt::ISODate)));
+        return exitCode;
+    };
+
+    auto logStartup = [&]() {
+        log.writeLine(QStringLiteral("mode=index_smoke"));
+        log.writeLine(QStringLiteral("startup_banner=INDEX_SMOKE_CLI_BEGIN"));
+        log.writeLine(QStringLiteral("exe_path=%1").arg(QDir::toNativeSeparators(exePath)));
+        log.writeLine(QStringLiteral("cwd=%1").arg(QDir::toNativeSeparators(cwd)));
+        log.writeLine(QStringLiteral("args_received=%1").arg(options.argsReceived.join(QStringLiteral(" | "))));
+        log.writeLine(QStringLiteral("index_root=%1").arg(QDir::toNativeSeparators(options.indexRoot)));
+        log.writeLine(QStringLiteral("index_db_path=%1").arg(QDir::toNativeSeparators(options.indexDbPath)));
+        log.writeLine(QStringLiteral("index_log=%1").arg(QDir::toNativeSeparators(options.indexLogPath)));
+        log.writeLine(QStringLiteral("timestamp_utc=%1").arg(timestampUtc));
+    };
+
+    try {
+        logStartup();
+
+        if (options.indexRoot.trimmed().isEmpty()) {
+            writeStderrLine(QStringLiteral("index_smoke_error=missing_required_arg_--index-root"));
+            return finishFail(67, QStringLiteral("missing_required_arg_--index-root"));
+        }
+        if (options.indexDbPath.trimmed().isEmpty()) {
+            writeStderrLine(QStringLiteral("index_smoke_error=missing_required_arg_--index-db-path"));
+            return finishFail(68, QStringLiteral("missing_required_arg_--index-db-path"));
+        }
+
+        QFileInfo rootInfo(options.indexRoot);
+        if (!rootInfo.exists() || !rootInfo.isDir()) {
+            writeStderrLine(QStringLiteral("index_smoke_error=invalid_root_path"));
+            return finishFail(69, QStringLiteral("invalid_root_path"));
+        }
+
+        log.writeLine(QStringLiteral("arg_validation=ok"));
+
+        MetaStore store;
+        QString errorText;
+        QString migrationLog;
+        log.writeLine(QStringLiteral("db_init=begin"));
+        if (!store.initialize(options.indexDbPath, &errorText, &migrationLog)) {
+            writeStderrLine(QStringLiteral("index_smoke_error=db_init_failure"));
+            return finishFail(70, QStringLiteral("db_init_failure:%1").arg(errorText));
+        }
+        log.writeLine(QStringLiteral("db_init=end"));
+
+        log.writeLine(QStringLiteral("open_index_ok=true"));
+        if (!migrationLog.isEmpty()) {
+            log.writeLine(QStringLiteral("migration_log_begin"));
+            log.writeLine(migrationLog.trimmed());
+            log.writeLine(QStringLiteral("migration_log_end"));
+        }
+
+        IndexRootRecord indexRoot;
+        indexRoot.rootPath = QDir::fromNativeSeparators(QDir::cleanPath(options.indexRoot));
+        indexRoot.status = QStringLiteral("active");
+        indexRoot.createdUtc = SqlHelpers::utcNowIso();
+        indexRoot.updatedUtc = indexRoot.createdUtc;
+        if (!store.upsertIndexRoot(indexRoot, nullptr, &errorText)) {
+            store.shutdown();
+            writeStderrLine(QStringLiteral("index_smoke_error=invalid_or_unusable_root"));
+            return finishFail(71, QStringLiteral("invalid_or_unusable_root:%1").arg(errorText));
+        }
+        log.writeLine(QStringLiteral("root_validation=ok"));
+
+        VolumeRecord volume;
+        volume.volumeKey = QStringLiteral("index_smoke:%1").arg(QDir::fromNativeSeparators(QDir::cleanPath(options.indexRoot)).toLower());
+        volume.rootPath = QDir::fromNativeSeparators(QDir::cleanPath(options.indexRoot));
+        volume.displayName = QFileInfo(options.indexRoot).fileName();
+        volume.fsType = QStringLiteral("native");
+        volume.serialNumber = QStringLiteral("index_smoke");
+        qint64 volumeId = 0;
+        if (!store.upsertVolume(volume, &volumeId, &errorText)) {
+            store.shutdown();
+            writeStderrLine(QStringLiteral("index_smoke_error=volume_registration_failure"));
+            return finishFail(72, QStringLiteral("volume_registration_failure:%1").arg(errorText));
+        }
+
+        log.writeLine(QStringLiteral("initial_index_begin"));
+        IndexSmokePassResult initialPass;
+        if (!runSynchronousIndexPass(store, volumeId, options.indexRoot, 1, &initialPass, &errorText)) {
+            store.shutdown();
+            writeStderrLine(QStringLiteral("index_smoke_error=index_execution_failure"));
+            return finishFail(73, QStringLiteral("index_execution_failure:%1").arg(errorText));
+        }
+        log.writeLine(QStringLiteral("initial_index_end"));
+        log.writeLine(QStringLiteral("initial_index_ok=true"));
+        log.writeLine(QStringLiteral("initial_seen=%1").arg(initialPass.seen));
+        log.writeLine(QStringLiteral("initial_inserted=%1").arg(initialPass.inserted));
+        log.writeLine(QStringLiteral("initial_updated=%1").arg(initialPass.updated));
+
+        const QString touchPath = QDir(options.indexRoot).filePath(QStringLiteral(".index_smoke_incremental_marker.txt"));
+        QFile marker(touchPath);
+        if (!marker.open(QIODevice::WriteOnly | QIODevice::Text | QIODevice::Truncate)) {
+            store.shutdown();
+            writeStderrLine(QStringLiteral("index_smoke_error=incremental_marker_write_failed"));
+            return finishFail(74, QStringLiteral("incremental_marker_write_failed:%1").arg(marker.errorString()));
+        }
+        QTextStream markerStream(&marker);
+        markerStream << QStringLiteral("updated_utc=%1\n").arg(QDateTime::currentDateTimeUtc().toString(Qt::ISODate));
+        markerStream.flush();
+        marker.close();
+
+        log.writeLine(QStringLiteral("incremental_index_begin"));
+        IndexSmokePassResult incrementalPass;
+        if (!runSynchronousIndexPass(store, volumeId, options.indexRoot, 2, &incrementalPass, &errorText)) {
+            store.shutdown();
+            writeStderrLine(QStringLiteral("index_smoke_error=incremental_index_failure"));
+            return finishFail(75, QStringLiteral("incremental_index_failure:%1").arg(errorText));
+        }
+        log.writeLine(QStringLiteral("incremental_index_end"));
+        log.writeLine(QStringLiteral("incremental_index_ok=true"));
+        log.writeLine(QStringLiteral("incremental_seen=%1").arg(incrementalPass.seen));
+        log.writeLine(QStringLiteral("incremental_inserted=%1").arg(incrementalPass.inserted));
+        log.writeLine(QStringLiteral("incremental_updated=%1").arg(incrementalPass.updated));
+
+        IndexJournalRecord journal;
+        journal.rootPath = QDir::fromNativeSeparators(QDir::cleanPath(options.indexRoot));
+        journal.path = touchPath;
+        journal.eventType = QStringLiteral("incremental_pass_complete");
+        journal.scanVersion = 2;
+        journal.payload = QStringLiteral("seen=%1;inserted=%2;updated=%3")
+                              .arg(incrementalPass.seen)
+                              .arg(incrementalPass.inserted)
+                              .arg(incrementalPass.updated);
+        journal.createdUtc = SqlHelpers::utcNowIso();
+        store.appendIndexJournal(journal, nullptr, nullptr);
+
+        IndexStatRecord statTotal;
+        statTotal.key = QStringLiteral("total_entries");
+        statTotal.value = QString::number(store.countEntries(&errorText));
+        statTotal.updatedUtc = SqlHelpers::utcNowIso();
+        store.upsertIndexStat(statTotal, nullptr);
+
+        IndexStatRecord statFiles;
+        statFiles.key = QStringLiteral("file_count");
+        statFiles.value = QString::number(store.countFiles(&errorText));
+        statFiles.updatedUtc = SqlHelpers::utcNowIso();
+        store.upsertIndexStat(statFiles, nullptr);
+
+        IndexStatRecord statDirs;
+        statDirs.key = QStringLiteral("directory_count");
+        statDirs.value = QString::number(store.countDirectories(&errorText));
+        statDirs.updatedUtc = SqlHelpers::utcNowIso();
+        store.upsertIndexStat(statDirs, nullptr);
+
+        log.writeLine(QStringLiteral("query_validation_begin"));
+        QueryCore queryCore(store);
+        QueryOptions optionsQuery;
+        optionsQuery.sortField = QuerySortField::Name;
+        optionsQuery.ascending = true;
+        const QString normalizedRoot = QDir::fromNativeSeparators(QDir::cleanPath(options.indexRoot));
+        const QueryResult queryResult = queryCore.queryChildren(normalizedRoot, optionsQuery);
+        log.writeLine(QStringLiteral("query_children_ok=%1").arg(queryResult.ok ? QStringLiteral("true") : QStringLiteral("false")));
+        log.writeLine(QStringLiteral("query_children_rows=%1").arg(queryResult.rows.size()));
+        if (!queryResult.ok) {
+            store.shutdown();
+            writeStderrLine(QStringLiteral("index_smoke_error=query_validation_failed"));
+            return finishFail(76, QStringLiteral("query_validation_failed:%1").arg(queryResult.errorText));
+        }
+        log.writeLine(QStringLiteral("query_validation_end"));
+
+        store.shutdown();
+        log.writeLine(QStringLiteral("final_status=PASS"));
+        log.writeLine(QStringLiteral("exit_code=0"));
+        log.writeLine(QStringLiteral("failure_reason="));
+        log.writeLine(QStringLiteral("timestamp_utc_end=%1").arg(QDateTime::currentDateTimeUtc().toString(Qt::ISODate)));
+        return 0;
+    } catch (const std::exception& ex) {
+        writeStderrLine(QStringLiteral("index_smoke_error=unexpected_exception"));
+        return finishFail(74, QStringLiteral("unexpected_exception:%1").arg(QString::fromLocal8Bit(ex.what())));
+    } catch (...) {
+        writeStderrLine(QStringLiteral("index_smoke_error=unexpected_error"));
+        return finishFail(75, QStringLiteral("unexpected_error"));
+    }
+}
+
+bool writeLogFile(const QString& logPath, const QStringList& lines)
 {
     QFileInfo logInfo(logPath);
     QDir().mkpath(logInfo.absolutePath());
 
     QSaveFile out(logPath);
     if (!out.open(QIODevice::WriteOnly | QIODevice::Text)) {
-        return;
+        return false;
     }
 
     QTextStream ts(&out);
     for (const QString& line : lines) {
         ts << line << '\n';
     }
-    out.commit();
+    return out.commit();
 }
 }
 
 int main(int argc, char* argv[])
 {
+    if (hasIndexSmokeFlag(argc, argv)) {
+        return runIndexSmokeCli(argc, argv);
+    }
+
     QApplication app(argc, argv);
     QCommandLineParser parser;
     parser.setApplicationDescription(QStringLiteral("NGKsFileVisionary"));
@@ -164,6 +664,18 @@ int main(int argc, char* argv[])
                                               QStringLiteral("Query mode: standard|flat|hierarchy."),
                                               QStringLiteral("mode"));
 
+    QCommandLineOption indexSmokeOption(QStringList() << QStringLiteral("index-smoke"),
+                                        QStringLiteral("Run index engine smoke validation and exit."));
+    QCommandLineOption indexRootOption(QStringList() << QStringLiteral("index-root"),
+                                       QStringLiteral("Root path for index-smoke mode."),
+                                       QStringLiteral("path"));
+    QCommandLineOption indexDbPathOption(QStringList() << QStringLiteral("index-db-path"),
+                                         QStringLiteral("Path to sqlite file for index-smoke mode."),
+                                         QStringLiteral("path"));
+    QCommandLineOption indexLogOption(QStringList() << QStringLiteral("index-log"),
+                                      QStringLiteral("Path to index smoke log file."),
+                                      QStringLiteral("path"));
+
     parser.addOption(testModeOption);
     parser.addOption(actionLogOption);
     parser.addOption(testScriptOption);
@@ -205,6 +717,10 @@ int main(int argc, char* argv[])
     parser.addOption(refreshRepeatOption);
     parser.addOption(refreshDelayMsOption);
     parser.addOption(refreshQueryModeOption);
+    parser.addOption(indexSmokeOption);
+    parser.addOption(indexRootOption);
+    parser.addOption(indexDbPathOption);
+    parser.addOption(indexLogOption);
 
     parser.addPositionalArgument(QStringLiteral("root"), QStringLiteral("Optional startup root path."));
     parser.process(app);
@@ -1026,6 +1542,229 @@ int main(int argc, char* argv[])
         rootStore.shutdown();
         vision.shutdown();
         return checks ? 0 : 6;
+    }
+
+    if (parser.isSet(indexSmokeOption)) {
+        const QString dbPath = parser.isSet(indexDbPathOption)
+            ? QDir::cleanPath(parser.value(indexDbPathOption))
+            : QDir::cleanPath(QDir::current().filePath(QStringLiteral("debug/metastore_vie_p6.sqlite3")));
+        const QString rootPath = parser.isSet(indexRootOption)
+            ? QDir::cleanPath(parser.value(indexRootOption))
+            : QDir::cleanPath(QDir::currentPath());
+        const QString logPath = parser.isSet(indexLogOption)
+            ? QDir::cleanPath(parser.value(indexLogOption))
+            : QDir::cleanPath(QDir::current().filePath(QStringLiteral("debug/index_smoke.log")));
+
+        QStringList lines;
+        lines << QStringLiteral("mode=index_smoke");
+        lines << QStringLiteral("startup_banner=VIE_P6_INDEX_SMOKE_BEGIN");
+        lines << QStringLiteral("startup_utc=%1").arg(QDateTime::currentDateTimeUtc().toString(Qt::ISODate));
+        lines << QStringLiteral("db_path=%1").arg(QDir::toNativeSeparators(dbPath));
+        lines << QStringLiteral("root_path=%1").arg(QDir::toNativeSeparators(rootPath));
+        lines << QStringLiteral("requested_log_path=%1").arg(QDir::toNativeSeparators(logPath));
+        lines << QStringLiteral("exe_path=%1").arg(QDir::toNativeSeparators(QCoreApplication::applicationFilePath()));
+        QFileInfo exeInfo(QCoreApplication::applicationFilePath());
+        lines << QStringLiteral("exe_exists=%1").arg(exeInfo.exists() ? QStringLiteral("true") : QStringLiteral("false"));
+        lines << QStringLiteral("exe_size_bytes=%1").arg(exeInfo.exists() ? QString::number(exeInfo.size()) : QStringLiteral("-1"));
+        lines << QStringLiteral("exe_last_modified_utc=%1").arg(exeInfo.exists() ? exeInfo.lastModified().toUTC().toString(Qt::ISODate) : QString());
+
+        const QString normalizedRoot = QDir::fromNativeSeparators(QDir::cleanPath(rootPath));
+        lines << QStringLiteral("root_normalized=%1").arg(normalizedRoot);
+        lines << QStringLiteral("root_exists_native=%1").arg(QDir(rootPath).exists() ? QStringLiteral("true") : QStringLiteral("false"));
+        lines << QStringLiteral("root_exists_normalized=%1").arg(QDir(normalizedRoot).exists() ? QStringLiteral("true") : QStringLiteral("false"));
+
+        if (!writeLogFile(logPath, lines)) {
+            const QString fallbackLog = QDir::cleanPath(QDir::current().filePath(QStringLiteral("debug/index_smoke_fallback.log")));
+            lines << QStringLiteral("fatal=unable_to_write_requested_log_path");
+            lines << QStringLiteral("fallback_log=%1").arg(QDir::toNativeSeparators(fallbackLog));
+            writeLogFile(fallbackLog, lines);
+            return 70;
+        }
+
+        VisionIndexEngine::VisionIndexService indexService;
+        QString errorText;
+        QString migrationLog;
+        bool ok = indexService.openIndex(dbPath, &errorText, &migrationLog);
+        lines << QStringLiteral("open_index_ok=%1").arg(ok ? QStringLiteral("true") : QStringLiteral("false"));
+        if (!migrationLog.isEmpty()) {
+            lines << QStringLiteral("migration_log_begin");
+            lines << migrationLog.trimmed();
+            lines << QStringLiteral("migration_log_end");
+        }
+
+        if (ok) {
+            ok = indexService.ensureIndexRoot(rootPath, &errorText);
+            lines << QStringLiteral("ensure_root_ok=%1").arg(ok ? QStringLiteral("true") : QStringLiteral("false"));
+            if (!ok && !errorText.isEmpty()) {
+                lines << QStringLiteral("ensure_root_error=%1").arg(errorText);
+            }
+        }
+
+        if (!ok) {
+            MetaStore fallbackStore;
+            QString fallbackError;
+            QString migrationIgnore;
+            if (fallbackStore.initialize(dbPath, &fallbackError, &migrationIgnore)) {
+                IndexRootRecord fallbackRoot;
+                fallbackRoot.rootPath = normalizedRoot;
+                fallbackRoot.status = QStringLiteral("active");
+                fallbackRoot.createdUtc = SqlHelpers::utcNowIso();
+                fallbackRoot.updatedUtc = fallbackRoot.createdUtc;
+                fallbackRoot.lastIndexedUtc = QString();
+                fallbackRoot.lastScanVersion = 0;
+                ok = fallbackStore.upsertIndexRoot(fallbackRoot, nullptr, &fallbackError);
+                fallbackStore.shutdown();
+            }
+            lines << QStringLiteral("ensure_root_fallback_ok=%1").arg(ok ? QStringLiteral("true") : QStringLiteral("false"));
+            if (!ok && !fallbackError.isEmpty()) {
+                errorText = fallbackError;
+                lines << QStringLiteral("ensure_root_fallback_error=%1").arg(errorText);
+            }
+        }
+
+        VisionIndexEngine::VisionIndexRunSummary initialSummary;
+        VisionIndexEngine::VisionIndexRunSummary incrementalSummary;
+        if (ok) {
+            initialSummary = indexService.runInitialIndex(rootPath, &errorText);
+            lines << QStringLiteral("initial_index_ok=%1").arg(initialSummary.ok ? QStringLiteral("true") : QStringLiteral("false"));
+            lines << QStringLiteral("initial_scan_version=%1").arg(initialSummary.scanVersion);
+            lines << QStringLiteral("initial_session_id=%1").arg(initialSummary.sessionId);
+            lines << QStringLiteral("initial_seen=%1 inserted=%2 updated=%3")
+                         .arg(initialSummary.seen)
+                         .arg(initialSummary.inserted)
+                         .arg(initialSummary.updated);
+            if (initialSummary.deduped) {
+                lines << QStringLiteral("initial_deduped_reason=%1").arg(initialSummary.dedupeReason);
+            }
+            if (!initialSummary.errorText.isEmpty()) {
+                lines << QStringLiteral("initial_error=%1").arg(initialSummary.errorText);
+            }
+            ok = ok && initialSummary.ok;
+        }
+
+        qint64 countAfterInitial = -1;
+        if (ok) {
+            MetaStore countStore;
+            QString countErr;
+            QString migrationIgnore;
+            if (countStore.initialize(dbPath, &countErr, &migrationIgnore)) {
+                countAfterInitial = countStore.countEntriesUnderRoot(QDir::fromNativeSeparators(rootPath), -1, &countErr);
+                countStore.shutdown();
+            }
+            if (countAfterInitial < 0 && !countErr.isEmpty()) {
+                errorText = countErr;
+                ok = false;
+            }
+            lines << QStringLiteral("count_after_initial=%1").arg(countAfterInitial);
+        }
+
+        if (ok) {
+            incrementalSummary = indexService.runIncrementalIndex(rootPath, &errorText);
+            lines << QStringLiteral("incremental_index_ok=%1").arg(incrementalSummary.ok ? QStringLiteral("true") : QStringLiteral("false"));
+            lines << QStringLiteral("incremental_scan_version=%1").arg(incrementalSummary.scanVersion);
+            lines << QStringLiteral("incremental_session_id=%1").arg(incrementalSummary.sessionId);
+            lines << QStringLiteral("incremental_seen=%1 inserted=%2 updated=%3")
+                         .arg(incrementalSummary.seen)
+                         .arg(incrementalSummary.inserted)
+                         .arg(incrementalSummary.updated);
+            if (incrementalSummary.deduped) {
+                lines << QStringLiteral("incremental_deduped_reason=%1").arg(incrementalSummary.dedupeReason);
+            }
+            if (!incrementalSummary.errorText.isEmpty()) {
+                lines << QStringLiteral("incremental_error=%1").arg(incrementalSummary.errorText);
+            }
+            ok = ok && incrementalSummary.ok;
+        }
+
+        QVector<IndexJournalRecord> journalRows;
+        if (ok) {
+            ok = indexService.listJournal(rootPath, 64, &journalRows, &errorText);
+            lines << QStringLiteral("journal_list_ok=%1").arg(ok ? QStringLiteral("true") : QStringLiteral("false"));
+            lines << QStringLiteral("journal_count=%1").arg(journalRows.size());
+            for (int i = 0; i < qMin(30, journalRows.size()); ++i) {
+                const IndexJournalRecord& row = journalRows.at(i);
+                lines << QStringLiteral("journal id=%1 event=%2 scan_version=%3 path=%4 payload=%5")
+                             .arg(row.id)
+                             .arg(row.eventType)
+                             .arg(row.scanVersion)
+                             .arg(row.path)
+                             .arg(row.payload);
+            }
+        }
+
+        QueryResult queryResult;
+        if (ok) {
+            QueryOptions options;
+            options.sortField = QuerySortField::Name;
+            options.ascending = true;
+            queryResult = indexService.queryChildren(rootPath, options);
+            lines << QStringLiteral("query_children_ok=%1").arg(queryResult.ok ? QStringLiteral("true") : QStringLiteral("false"));
+            lines << QStringLiteral("query_children_rows=%1").arg(queryResult.rows.size());
+            if (!queryResult.errorText.isEmpty()) {
+                lines << QStringLiteral("query_children_error=%1").arg(queryResult.errorText);
+            }
+            ok = ok && queryResult.ok;
+        }
+
+        VisionIndexEngine::VisionIndexStatsSnapshot stats;
+        if (ok) {
+            ok = indexService.collectStats(rootPath, &stats, &errorText);
+            lines << QStringLiteral("stats_ok=%1").arg(ok ? QStringLiteral("true") : QStringLiteral("false"));
+            lines << QStringLiteral("stats_total_entries=%1").arg(stats.totalEntries);
+            lines << QStringLiteral("stats_file_count=%1").arg(stats.fileCount);
+            lines << QStringLiteral("stats_directory_count=%1").arg(stats.directoryCount);
+            lines << QStringLiteral("stats_last_refresh_utc=%1").arg(stats.lastRefreshUtc);
+            lines << QStringLiteral("stats_index_age_seconds=%1").arg(stats.indexAgeSeconds);
+
+            QJsonObject countObj;
+            countObj.insert(QStringLiteral("total_entries"), stats.totalEntries);
+            countObj.insert(QStringLiteral("file_count"), stats.fileCount);
+            countObj.insert(QStringLiteral("directory_count"), stats.directoryCount);
+            lines << QStringLiteral("counts_json=%1").arg(QString::fromUtf8(QJsonDocument(countObj).toJson(QJsonDocument::Compact)));
+        }
+
+        QString schemaDump;
+        {
+            const QString connName = QStringLiteral("index_smoke_schema_%1").arg(QDateTime::currentMSecsSinceEpoch());
+            QSqlDatabase db = QSqlDatabase::addDatabase(QStringLiteral("QSQLITE"), connName);
+            db.setDatabaseName(dbPath);
+            if (db.open()) {
+                QSqlQuery q(db);
+                if (q.exec(QStringLiteral("SELECT sql FROM sqlite_master WHERE type IN ('table','index') AND sql IS NOT NULL ORDER BY type, name;"))) {
+                    QStringList schemaLines;
+                    while (q.next()) {
+                        schemaLines << q.value(0).toString();
+                    }
+                    schemaDump = schemaLines.join(QStringLiteral("\n"));
+                }
+                db.close();
+            }
+            QSqlDatabase::removeDatabase(connName);
+        }
+        lines << QStringLiteral("schema_dump_begin");
+        if (!schemaDump.isEmpty()) {
+            lines << schemaDump;
+        }
+        lines << QStringLiteral("schema_dump_end");
+
+        if (!ok && !errorText.isEmpty()) {
+            lines << QStringLiteral("error=%1").arg(errorText);
+        }
+
+        const bool checks = ok
+            && countAfterInitial >= 0
+            && !journalRows.isEmpty()
+            && queryResult.ok
+            && stats.totalEntries >= 0;
+        lines << QStringLiteral("checks_ok=%1").arg(checks ? QStringLiteral("true") : QStringLiteral("false"));
+        lines << QStringLiteral("exit_status=%1").arg(checks ? QStringLiteral("success") : QStringLiteral("failure"));
+        lines << QStringLiteral("shutdown_banner=VIE_P6_INDEX_SMOKE_END");
+
+        if (!writeLogFile(logPath, lines)) {
+            return 71;
+        }
+        indexService.closeIndex();
+        return checks ? 0 : 7;
     }
 
     MainWindow window(testMode, startupRoot, actionLogPath, testScriptPath);

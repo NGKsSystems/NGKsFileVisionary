@@ -33,9 +33,12 @@ EntryRecord fromQuery(const QSqlQuery& q)
     r.existsFlag = q.value(17).toInt() != 0;
     r.fileId = q.value(18).toString();
     r.indexedAtUtc = q.value(19).toString();
-    r.lastSeenScanId = q.value(20).toLongLong();
-    r.hasLastSeenScanId = !q.value(20).isNull();
-    r.metadataVersion = q.value(21).toInt();
+    r.parentPath = q.value(20).toString();
+    r.lastSeenScanId = q.value(21).toLongLong();
+    r.hasLastSeenScanId = !q.value(21).isNull();
+    r.scanVersion = q.value(22).toInt();
+    r.entryHash = q.value(23).toString();
+    r.metadataVersion = q.value(24).toInt();
     return r;
 }
 }
@@ -79,8 +82,8 @@ bool EntryRepository::upsertEntry(const EntryRecord& record,
         "INSERT INTO entries(" \
         "volume_id, parent_id, path, name, normalized_name, extension, is_dir, size_bytes, " \
         "created_utc, modified_utc, accessed_utc, hidden_flag, system_flag, readonly_flag, archive_flag, reparse_flag, " \
-        "exists_flag, file_id, indexed_at_utc, last_seen_scan_id, metadata_version" \
-        ") VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) "
+        "exists_flag, file_id, indexed_at_utc, parent_path, last_seen_scan_id, scan_version, entry_hash, metadata_version" \
+        ") VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) "
         "ON CONFLICT(path) DO UPDATE SET "
         "volume_id=excluded.volume_id, "
         "parent_id=excluded.parent_id, "
@@ -100,7 +103,10 @@ bool EntryRepository::upsertEntry(const EntryRecord& record,
         "exists_flag=excluded.exists_flag, "
         "file_id=excluded.file_id, "
         "indexed_at_utc=excluded.indexed_at_utc, "
+        "parent_path=excluded.parent_path, "
         "last_seen_scan_id=excluded.last_seen_scan_id, "
+        "scan_version=excluded.scan_version, "
+        "entry_hash=excluded.entry_hash, "
         "metadata_version=excluded.metadata_version;"));
 
     q.addBindValue(record.volumeId);
@@ -122,7 +128,10 @@ bool EntryRepository::upsertEntry(const EntryRecord& record,
     q.addBindValue(SqlHelpers::boolToInt(record.existsFlag));
     q.addBindValue(record.fileId);
     q.addBindValue(record.indexedAtUtc.isEmpty() ? SqlHelpers::utcNowIso() : record.indexedAtUtc);
+    q.addBindValue(record.parentPath);
     q.addBindValue(SqlHelpers::nullableInt64(record.hasLastSeenScanId, record.lastSeenScanId));
+    q.addBindValue(record.scanVersion);
+    q.addBindValue(record.entryHash);
     q.addBindValue(record.metadataVersion);
 
     if (!q.exec()) {
@@ -175,7 +184,7 @@ bool EntryRepository::getByPath(const QString& path, EntryRecord* out, QString* 
     q.prepare(QStringLiteral(
         "SELECT id, volume_id, parent_id, path, name, normalized_name, extension, is_dir, size_bytes, "
         "created_utc, modified_utc, accessed_utc, hidden_flag, system_flag, readonly_flag, archive_flag, reparse_flag, "
-        "exists_flag, file_id, indexed_at_utc, last_seen_scan_id, metadata_version "
+        "exists_flag, file_id, indexed_at_utc, parent_path, last_seen_scan_id, scan_version, entry_hash, metadata_version "
         "FROM entries WHERE path=? LIMIT 1;"));
     q.addBindValue(path);
 
@@ -217,7 +226,7 @@ bool EntryRepository::listChildren(qint64 parentId, QVector<EntryRecord>* out, Q
     q.prepare(QStringLiteral(
         "SELECT id, volume_id, parent_id, path, name, normalized_name, extension, is_dir, size_bytes, "
         "created_utc, modified_utc, accessed_utc, hidden_flag, system_flag, readonly_flag, archive_flag, reparse_flag, "
-        "exists_flag, file_id, indexed_at_utc, last_seen_scan_id, metadata_version "
+        "exists_flag, file_id, indexed_at_utc, parent_path, last_seen_scan_id, scan_version, entry_hash, metadata_version "
         "FROM entries WHERE parent_id=? ORDER BY is_dir DESC, normalized_name ASC;"));
     q.addBindValue(parentId);
 
@@ -284,7 +293,7 @@ bool EntryRepository::findFlatDescendantsByRootPath(const QString& rootPath,
         ") "
         "SELECT e.id, e.volume_id, e.parent_id, e.path, e.name, e.normalized_name, e.extension, e.is_dir, e.size_bytes, "
         "e.created_utc, e.modified_utc, e.accessed_utc, e.hidden_flag, e.system_flag, e.readonly_flag, e.archive_flag, e.reparse_flag, "
-        "e.exists_flag, e.file_id, e.indexed_at_utc, e.last_seen_scan_id, e.metadata_version "
+        "e.exists_flag, e.file_id, e.indexed_at_utc, e.parent_path, e.last_seen_scan_id, e.scan_version, e.entry_hash, e.metadata_version "
         "FROM entries e JOIN tree t ON e.id=t.id WHERE t.depth > 0 "
         "ORDER BY t.depth ASC, e.is_dir DESC, e.normalized_name ASC, e.path ASC;");
 
@@ -338,7 +347,7 @@ bool EntryRepository::findSubtreeByRootPath(const QString& rootPath,
         ") "
         "SELECT e.id, e.volume_id, e.parent_id, e.path, e.name, e.normalized_name, e.extension, e.is_dir, e.size_bytes, "
         "e.created_utc, e.modified_utc, e.accessed_utc, e.hidden_flag, e.system_flag, e.readonly_flag, e.archive_flag, e.reparse_flag, "
-        "e.exists_flag, e.file_id, e.indexed_at_utc, e.last_seen_scan_id, e.metadata_version "
+        "e.exists_flag, e.file_id, e.indexed_at_utc, e.parent_path, e.last_seen_scan_id, e.scan_version, e.entry_hash, e.metadata_version "
         "FROM entries e JOIN tree t ON e.id=t.id "
         "ORDER BY t.depth ASC, e.path ASC;");
 
@@ -500,7 +509,7 @@ bool EntryRepository::listSomeEntries(int limit, QVector<EntryRecord>* out, QStr
     q.prepare(QStringLiteral(
         "SELECT id, volume_id, parent_id, path, name, normalized_name, extension, is_dir, size_bytes, "
         "created_utc, modified_utc, accessed_utc, hidden_flag, system_flag, readonly_flag, archive_flag, reparse_flag, "
-        "exists_flag, file_id, indexed_at_utc, last_seen_scan_id, metadata_version "
+        "exists_flag, file_id, indexed_at_utc, parent_path, last_seen_scan_id, scan_version, entry_hash, metadata_version "
         "FROM entries ORDER BY is_dir DESC, normalized_name ASC LIMIT ?;"));
     q.addBindValue(limit > 0 ? limit : 20);
 

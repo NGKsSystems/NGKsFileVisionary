@@ -85,6 +85,19 @@ public:
                            QString* errorText = nullptr);
     bool listScanSessions(QVector<ScanSessionRecord>* out, QString* errorText = nullptr);
 
+    bool upsertIndexRoot(const IndexRootRecord& record, qint64* rootId = nullptr, QString* errorText = nullptr);
+    bool getIndexRoot(const QString& rootPath, IndexRootRecord* out, QString* errorText = nullptr);
+    bool listIndexRoots(QVector<IndexRootRecord>* out, QString* errorText = nullptr);
+
+    bool appendIndexJournal(const IndexJournalRecord& record, qint64* journalId = nullptr, QString* errorText = nullptr);
+    bool listIndexJournal(const QString& rootPath,
+                          int limit,
+                          QVector<IndexJournalRecord>* out,
+                          QString* errorText = nullptr);
+
+    bool upsertIndexStat(const IndexStatRecord& record, QString* errorText = nullptr);
+    bool listIndexStats(QVector<IndexStatRecord>* out, QString* errorText = nullptr);
+
     bool listVolumes(QVector<VolumeRecord>* out, QString* errorText = nullptr);
     bool listFavorites(QVector<FavoriteRecord>* out, QString* errorText = nullptr);
 

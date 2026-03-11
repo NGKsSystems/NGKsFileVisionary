@@ -171,6 +171,9 @@ bool ScanCoordinator::ingestBatch(const QVector<ScanIngestItem>& batch,
     bool ok = true;
     for (const ScanIngestItem& item : batch) {
         EntryRecord record = item.record;
+        record.parentPath = item.parentPath.isEmpty()
+            ? QDir::cleanPath(QFileInfo(record.path).dir().absolutePath())
+            : QDir::cleanPath(item.parentPath);
 
         if (!item.parentPath.isEmpty()) {
             bool found = false;

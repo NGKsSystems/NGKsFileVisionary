@@ -3,6 +3,7 @@
 #include <QDateTime>
 #include <QDir>
 #include <QFileInfo>
+#include <QCryptographicHash>
 
 #include "ScanTask.h"
 #include "core/db/SqlHelpers.h"
@@ -67,8 +68,19 @@ bool FileMetadataExtractor::extract(const QFileInfo& fileInfo,
     r.readonlyFlag = !fileInfo.isWritable();
     r.existsFlag = fileInfo.exists();
     r.indexedAtUtc = SqlHelpers::utcNowIso();
+    r.parentPath = QDir::cleanPath(parentPath);
     r.hasLastSeenScanId = true;
     r.lastSeenScanId = scanSessionId;
+    r.scanVersion = static_cast<int>(scanSessionId);
+    r.entryHash = QString::fromLatin1(QCryptographicHash::hash(
+                                           QStringLiteral("%1|%2|%3|%4")
+                                               .arg(r.path)
+                                               .arg(r.modifiedUtc)
+                                               .arg(r.hasSizeBytes ? QString::number(r.sizeBytes) : QStringLiteral("dir"))
+                                               .arg(r.isDir ? QStringLiteral("d") : QStringLiteral("f"))
+                                               .toUtf8(),
+                                           QCryptographicHash::Sha1)
+                                           .toHex());
     r.metadataVersion = 1;
 
 #ifdef Q_OS_WIN

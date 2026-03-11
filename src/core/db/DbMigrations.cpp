@@ -22,6 +22,24 @@ bool execBatch(QSqlDatabase db, const QStringList& sqlStatements, QString* error
     }
     return true;
 }
+
+bool columnExists(QSqlDatabase db, const QString& tableName, const QString& columnName, QString* errorText)
+{
+    QSqlQuery q(db);
+    if (!q.exec(QStringLiteral("PRAGMA table_info(%1);").arg(tableName))) {
+        if (errorText) {
+            *errorText = q.lastError().text();
+        }
+        return false;
+    }
+
+    while (q.next()) {
+        if (q.value(1).toString().compare(columnName, Qt::CaseInsensitive) == 0) {
+            return true;
+        }
+    }
+    return false;
+}
 }
 
 bool DbMigrations::migrate(DbConnection& connection, QString* migrationLog)
@@ -65,6 +83,13 @@ bool DbMigrations::migrate(DbConnection& connection, QString* migrationLog)
         ok = applyV1(connection, &errorText);
         if (migrationLog) {
             migrationLog->append(ok ? QStringLiteral("applied_v1=true\n") : QStringLiteral("applied_v1=false\n"));
+        }
+    }
+
+    if (ok && current < 2) {
+        ok = applyV2(connection, &errorText);
+        if (migrationLog) {
+            migrationLog->append(ok ? QStringLiteral("applied_v2=true\n") : QStringLiteral("applied_v2=false\n"));
         }
     }
 
@@ -211,4 +236,80 @@ bool DbMigrations::applyV1(DbConnection& connection, QString* errorText)
     };
 
     return execBatch(connection.database(), statements, errorText);
+}
+
+bool DbMigrations::applyV2(DbConnection& connection, QString* errorText)
+{
+    QSqlDatabase db = connection.database();
+
+    const QStringList newTables = {
+        QStringLiteral("CREATE TABLE IF NOT EXISTS index_roots(" \
+                       "id INTEGER PRIMARY KEY AUTOINCREMENT," \
+                       "root_path TEXT NOT NULL UNIQUE," \
+                       "status TEXT NOT NULL," \
+                       "last_scan_version INTEGER NOT NULL DEFAULT 0," \
+                       "last_indexed_utc TEXT," \
+                       "created_utc TEXT NOT NULL," \
+                       "updated_utc TEXT NOT NULL" \
+                       ");"),
+        QStringLiteral("CREATE TABLE IF NOT EXISTS index_journal(" \
+                       "id INTEGER PRIMARY KEY AUTOINCREMENT," \
+                       "root_path TEXT NOT NULL," \
+                       "path TEXT NOT NULL," \
+                       "event_type TEXT NOT NULL," \
+                       "scan_version INTEGER NOT NULL DEFAULT 0," \
+                       "payload TEXT," \
+                       "created_utc TEXT NOT NULL" \
+                       ");"),
+        QStringLiteral("CREATE TABLE IF NOT EXISTS index_stats(" \
+                       "key TEXT PRIMARY KEY," \
+                       "value TEXT NOT NULL," \
+                       "updated_utc TEXT NOT NULL" \
+                       ");")
+    };
+
+    if (!execBatch(db, newTables, errorText)) {
+        return false;
+    }
+
+    struct ColumnDef
+    {
+        QString name;
+        QString typeSql;
+    };
+    const QVector<ColumnDef> newColumns = {
+        {QStringLiteral("parent_path"), QStringLiteral("TEXT")},
+        {QStringLiteral("scan_version"), QStringLiteral("INTEGER NOT NULL DEFAULT 0")},
+        {QStringLiteral("entry_hash"), QStringLiteral("TEXT")}
+    };
+
+    for (const ColumnDef& col : newColumns) {
+        const bool exists = columnExists(db, QStringLiteral("entries"), col.name, errorText);
+        if (!exists && errorText && !errorText->isEmpty()) {
+            return false;
+        }
+        if (exists) {
+            continue;
+        }
+
+        QSqlQuery alter(db);
+        const QString sql = QStringLiteral("ALTER TABLE entries ADD COLUMN %1 %2;").arg(col.name, col.typeSql);
+        if (!alter.exec(sql)) {
+            if (errorText) {
+                *errorText = alter.lastError().text();
+            }
+            return false;
+        }
+    }
+
+    const QStringList indexes = {
+        QStringLiteral("CREATE INDEX IF NOT EXISTS idx_entries_parent_path ON entries(parent_path);"),
+        QStringLiteral("CREATE INDEX IF NOT EXISTS idx_entries_extension_v2 ON entries(extension);"),
+        QStringLiteral("CREATE INDEX IF NOT EXISTS idx_entries_modified_time ON entries(modified_utc);"),
+        QStringLiteral("CREATE INDEX IF NOT EXISTS idx_index_journal_root_created ON index_journal(root_path, created_utc);"),
+        QStringLiteral("CREATE INDEX IF NOT EXISTS idx_index_journal_path ON index_journal(path);"),
+        QStringLiteral("CREATE INDEX IF NOT EXISTS idx_index_roots_path ON index_roots(root_path);")
+    };
+
+    return execBatch(db, indexes, errorText);
 }
