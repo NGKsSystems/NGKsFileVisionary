@@ -51,6 +51,9 @@
 
 #include "TreeSnapshotDialog.h"
 #include "TreeSnapshotPreviewDialog.h"
+#include "model/DirectoryModel.h"
+#include "model/QueryResultAdapter.h"
+#include "core/services/RefreshTypes.h"
 #include "../util/PathUtils.h"
 
 namespace {
@@ -92,12 +95,19 @@ MainWindow::MainWindow(bool testMode,
     setupActionRegistry();
     setupTestSurface();
     setupScanner();
+    m_directoryModel = new DirectoryModel();
+    m_viewModeController.setModeFromIndex(m_viewModeCombo ? m_viewModeCombo->currentIndex() : 0);
+    m_viewMode = m_viewModeController.toFileViewMode();
+    m_uiDbPath = resolveUiDbPath();
     configureObjectNames();
     ensureUiActionTracePath();
     maybeOpenStartupRoot();
 
     m_publishTimer.setInterval(16);
     connect(&m_publishTimer, &QTimer::timeout, this, &MainWindow::onPublishTick);
+    m_refreshPollTimer.setInterval(250);
+    connect(&m_refreshPollTimer, &QTimer::timeout, this, &MainWindow::onRefreshPollTick);
+    m_refreshPollTimer.start();
 
     if (m_testMode && !m_testScriptPath.trimmed().isEmpty()) {
         QTimer::singleShot(250, this, &MainWindow::onRunTestScript);
@@ -123,6 +133,9 @@ MainWindow::~MainWindow()
     }
     m_scannerThread.quit();
     m_scannerThread.wait();
+
+    delete m_directoryModel;
+    m_directoryModel = nullptr;
 }
 
 void MainWindow::setupUi()
@@ -508,15 +521,7 @@ void MainWindow::onRunTestScript()
 
 void MainWindow::setupScanner()
 {
-    m_fileScanner = new FileScanner();
-    m_fileScanner->moveToThread(&m_scannerThread);
-
-    connect(m_fileScanner, &FileScanner::batchReady, this, &MainWindow::onBatchReady);
-    connect(m_fileScanner, &FileScanner::progress, this, &MainWindow::onScanProgress);
-    connect(m_fileScanner, &FileScanner::finished, this, &MainWindow::onScanFinished);
-    connect(&m_scannerThread, &QThread::finished, m_fileScanner, &QObject::deleteLater);
-
-    m_scannerThread.start();
+    m_fileScanner = nullptr;
 }
 
 void MainWindow::onBrowseRoot()
@@ -529,14 +534,9 @@ void MainWindow::onBrowseRoot()
 
 void MainWindow::onRescan()
 {
-    if (!m_fileScanner) {
-        return;
-    }
-
     if (m_scanInProgress) {
         m_rescanPending = true;
-        m_fileScanner->cancel();
-        appendRuntimeLog(QStringLiteral("rescan_requested_while_scanning cancel_requested=true"));
+        appendRuntimeLog(QStringLiteral("rescan_requested_while_busy queued=true"));
         m_statusLabel->setText(QStringLiteral("Canceling previous scan..."));
         return;
     }
@@ -544,13 +544,53 @@ void MainWindow::onRescan()
     startScanNow();
 }
 
-void MainWindow::onCancelScan()
+void MainWindow::onRefreshPollTick()
 {
-    if (!m_fileScanner) {
+    if (!m_directoryModel || !m_directoryModel->isReady()) {
         return;
     }
+
+    const QVector<RefreshEvent> events = m_directoryModel->takeRefreshEvents();
+    if (events.isEmpty()) {
+        return;
+    }
+
+    const QString visibleRoot = currentRootPath();
+    bool shouldRequery = false;
+
+    for (const RefreshEvent& event : events) {
+        appendRuntimeLog(QStringLiteral("refresh_event request_id=%1 state=%2 path=%3 mode=%4 reason=%5 session=%6 inserted=%7 updated=%8 error=%9")
+                             .arg(event.requestId)
+                             .arg(RefreshTypes::stateToString(event.state))
+                             .arg(event.path)
+                             .arg(event.mode)
+                             .arg(event.reason)
+                             .arg(event.sessionId)
+                             .arg(event.totalInserted)
+                             .arg(event.totalUpdated)
+                             .arg(event.errorText));
+
+        if (event.state == RefreshState::Completed
+            && !visibleRoot.isEmpty()
+            && (QString::compare(QDir::cleanPath(event.path), QDir::cleanPath(visibleRoot), Qt::CaseInsensitive) == 0
+                || QDir::cleanPath(visibleRoot).startsWith(QDir::cleanPath(event.path), Qt::CaseInsensitive))) {
+            shouldRequery = true;
+        }
+    }
+
+    if (shouldRequery && !m_scanInProgress) {
+        const QDateTime now = QDateTime::currentDateTimeUtc();
+        if (!m_lastRefreshRequeryAt.isValid() || m_lastRefreshRequeryAt.msecsTo(now) > 300) {
+            m_lastRefreshRequeryAt = now;
+            appendRuntimeLog(QStringLiteral("refresh_triggered_requery root=%1").arg(visibleRoot));
+            QMetaObject::invokeMethod(this, "onRescan", Qt::QueuedConnection);
+        }
+    }
+}
+
+void MainWindow::onCancelScan()
+{
     m_rescanPending = false;
-    m_fileScanner->cancel();
     m_publishQueue.clear();
     m_publishTimer.stop();
     m_scanInProgress = false;
@@ -656,8 +696,8 @@ void MainWindow::onScanFinished(quint64 scanId,
 
 void MainWindow::onSearchChanged(const QString& text)
 {
-    m_proxyModel.setFilterFixedString(text);
     appendRuntimeLog(QStringLiteral("search_changed text=%1").arg(text));
+    onRescan();
 }
 
 void MainWindow::onTreeContextMenu(const QPoint& pos)
@@ -686,7 +726,19 @@ void MainWindow::onTreeContextMenu(const QPoint& pos)
             return;
         }
         if (chosen == refreshAction || chosen == rescanAction) {
-            onRescan();
+            if (chosen == refreshAction && ensureDirectoryModelReady()) {
+                const RefreshRequestResult rr = m_directoryModel->requestRefresh(currentRootPath(), true, QStringLiteral("visible_refresh"), QStringLiteral("ui_context_refresh"));
+                appendRuntimeLog(QStringLiteral("ui_refresh_request accepted=%1 state=%2 path=%3 reason=%4 error=%5")
+                                     .arg(rr.accepted ? QStringLiteral("true") : QStringLiteral("false"))
+                                     .arg(RefreshTypes::stateToString(rr.state))
+                                     .arg(rr.path)
+                                     .arg(rr.reason)
+                                     .arg(rr.errorText));
+                m_statusLabel->setText(QStringLiteral("Refresh request: %1").arg(RefreshTypes::stateToString(rr.state)));
+            }
+            if (chosen == rescanAction) {
+                onRescan();
+            }
         } else if (chosen == pasteAction) {
             QMessageBox::information(this, QStringLiteral("Paste"), QStringLiteral("Paste integration is not available in this pass."));
         } else if (chosen == newFolderAction) {
@@ -1188,7 +1240,8 @@ void MainWindow::onViewModeChanged(int index)
         return;
     }
 
-    const FileViewMode requestedMode = static_cast<FileViewMode>(index);
+    m_viewModeController.setModeFromIndex(index);
+    const FileViewMode requestedMode = m_viewModeController.toFileViewMode();
     if (requestedMode == m_viewMode) {
         return;
     }
@@ -2030,10 +2083,6 @@ void MainWindow::appendRuntimeLog(const QString& message) const
 
 void MainWindow::startScanNow()
 {
-    if (!m_fileScanner) {
-        return;
-    }
-
     m_fileModel.clear();
     m_publishQueue.clear();
     m_publishTimer.stop();
@@ -2041,7 +2090,13 @@ void MainWindow::startScanNow()
     const QStringList extensions = PathUtils::splitExtensionsFilter(m_extensionFilterEdit->text());
     const QString search = m_searchEdit->text().trimmed();
 
-    m_fileModel.setViewMode(m_viewMode, root);
+    m_fileModel.setViewMode(m_viewModeController.toFileViewMode(), root);
+
+    if (!ensureDirectoryModelReady()) {
+        m_statusLabel->setText(QStringLiteral("Error: db_not_ready"));
+        appendRuntimeLog(QStringLiteral("ui_query_error db_not_ready path=%1").arg(m_uiDbPath));
+        return;
+    }
 
     m_scanInProgress = true;
     m_activeScanId = ++m_nextScanId;
@@ -2051,25 +2106,108 @@ void MainWindow::startScanNow()
     m_statusLabel->setText(QStringLiteral("Enumerating..."));
     m_treeView->setSortingEnabled(false);
 
-    appendRuntimeLog(QStringLiteral("rescan_begin scan_id=%1 root=%2 showHidden=%3 showSystem=%4 ext=%5 search=%6 ui_thread=%7")
+    appendRuntimeLog(QStringLiteral("ui_query_begin scan_id=%1 root=%2 mode=%3 db=%4 showHidden=%5 showSystem=%6 ext=%7 search=%8")
                          .arg(m_activeScanId)
-                         .arg(root,
-                              m_showHiddenCheck->isChecked() ? QStringLiteral("true") : QStringLiteral("false"),
-                              m_showSystemCheck->isChecked() ? QStringLiteral("true") : QStringLiteral("false"),
-                              extensions.join(';'),
-                              search,
-                              QString::number(reinterpret_cast<quintptr>(QThread::currentThreadId()))));
+                         .arg(root)
+                         .arg(static_cast<int>(m_viewModeController.mode()))
+                         .arg(m_uiDbPath)
+                         .arg(m_showHiddenCheck->isChecked() ? QStringLiteral("true") : QStringLiteral("false"))
+                         .arg(m_showSystemCheck->isChecked() ? QStringLiteral("true") : QStringLiteral("false"))
+                         .arg(extensions.join(';'))
+                         .arg(search));
 
-    QMetaObject::invokeMethod(m_fileScanner,
-                              "startScan",
-                              Qt::QueuedConnection,
-                              Q_ARG(quint64, m_activeScanId),
-                              Q_ARG(QString, root),
-                              Q_ARG(bool, m_showHiddenCheck->isChecked()),
-                              Q_ARG(bool, m_showSystemCheck->isChecked()),
-                              Q_ARG(QStringList, extensions),
-                              Q_ARG(QString, search),
-                              Q_ARG(int, static_cast<int>(m_viewMode)));
+    DirectoryModel::Request request;
+    request.rootPath = root;
+    request.mode = m_viewModeController.mode();
+    request.includeHidden = m_showHiddenCheck->isChecked();
+    request.includeSystem = m_showSystemCheck->isChecked();
+    request.foldersFirst = true;
+    request.extensionFilter = extensions.join(';');
+    request.substringFilter = search;
+    request.sortField = currentQuerySortField();
+    request.ascending = m_treeView->header()->sortIndicatorOrder() == Qt::AscendingOrder;
+    request.maxDepth = request.mode == ViewModeController::UiViewMode::Hierarchy ? 64 : -1;
+    request.filesOnly = request.mode == ViewModeController::UiViewMode::Flat;
+
+    const QueryResult result = m_directoryModel->query(request);
+    if (!result.ok) {
+        m_scanInProgress = false;
+        m_statusLabel->setText(QStringLiteral("Error: %1").arg(result.errorText));
+        appendRuntimeLog(QStringLiteral("ui_query_failed error=%1").arg(result.errorText));
+        return;
+    }
+
+    const QVector<FileEntry> rows = QueryResultAdapter::toFileEntries(result);
+    m_publishQueue = rows;
+    m_scanBatchCount = 1;
+    m_scanEntryCount = static_cast<quint64>(rows.size());
+    m_scanEnumeratedCount = static_cast<quint64>(rows.size());
+    m_scanInProgress = false;
+    if (!m_publishQueue.isEmpty()) {
+        m_publishTimer.start();
+    } else {
+        m_treeView->setSortingEnabled(true);
+    }
+
+    m_statusLabel->setText(QStringLiteral("Complete: %1 items").arg(rows.size()));
+    appendRuntimeLog(QStringLiteral("ui_query_complete rows=%1").arg(rows.size()));
+
+    if (m_viewModeController.mode() == ViewModeController::UiViewMode::Hierarchy) {
+        m_treeView->expandAll();
+    } else if (m_viewModeController.mode() == ViewModeController::UiViewMode::Standard) {
+        m_treeView->collapseAll();
+    }
+}
+
+bool MainWindow::ensureDirectoryModelReady()
+{
+    if (!m_directoryModel) {
+        return false;
+    }
+    if (m_directoryModel->isReady()) {
+        return true;
+    }
+
+    QString errorText;
+    if (!m_directoryModel->initialize(m_uiDbPath, &errorText)) {
+        appendRuntimeLog(QStringLiteral("directory_model_init_failed db=%1 error=%2").arg(m_uiDbPath, errorText));
+        return false;
+    }
+    appendRuntimeLog(QStringLiteral("directory_model_ready db=%1").arg(m_uiDbPath));
+    return true;
+}
+
+QString MainWindow::resolveUiDbPath() const
+{
+    const QStringList candidates = {
+        QDir::cleanPath(QDir::current().filePath(QStringLiteral("debug/metastore_vie_p3.sqlite3"))),
+        QDir::cleanPath(QDir::current().filePath(QStringLiteral("debug/metastore_vie_p2_main.sqlite3"))),
+        QDir::cleanPath(QDir::current().filePath(QStringLiteral("debug/metastore_vie_p2.sqlite3"))),
+        QDir::cleanPath(QDir::current().filePath(QStringLiteral("debug/metastore.sqlite3"))),
+    };
+
+    for (const QString& candidate : candidates) {
+        if (QFileInfo::exists(candidate)) {
+            return candidate;
+        }
+    }
+    return candidates.first();
+}
+
+QuerySortField MainWindow::currentQuerySortField() const
+{
+    const int column = m_treeView ? m_treeView->header()->sortIndicatorSection() : 0;
+    switch (column) {
+    case 2:
+        return QuerySortField::Size;
+    case 3:
+        return QuerySortField::Modified;
+    case 4:
+        return QuerySortField::Path;
+    case 0:
+    default:
+        return QuerySortField::Name;
+    }
 }
 
 void MainWindow::onPublishTick()

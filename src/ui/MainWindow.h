@@ -20,6 +20,9 @@
 #include "../core/FileScanner.h"
 #include "../core/TreeSnapshotService.h"
 #include "ArchiveExplorer.h"
+#include "model/ViewModeController.h"
+#include "core/query/QueryTypes.h"
+#include "core/services/RefreshTypes.h"
 
 class QCheckBox;
 class QComboBox;
@@ -27,6 +30,7 @@ class QLabel;
 class QProcess;
 class QProgressDialog;
 class QTreeWidgetItem;
+class DirectoryModel;
 
 class MainWindow : public QMainWindow
 {
@@ -75,10 +79,14 @@ private slots:
     void onActionPinFavorite();
     void onActionUnpinFavorite();
     void onRunTestScript();
+    void onRefreshPollTick();
 
 private:
     void setupUi();
     void setupScanner();
+    bool ensureDirectoryModelReady();
+    QString resolveUiDbPath() const;
+    QuerySortField currentQuerySortField() const;
     QString selectedPath(const QModelIndex& index) const;
     void appendRuntimeLog(const QString& message) const;
     void startScanNow();
@@ -133,6 +141,9 @@ private:
     QSortFilterProxyModel m_proxyModel;
     QThread m_scannerThread;
     FileScanner* m_fileScanner = nullptr;
+    DirectoryModel* m_directoryModel = nullptr;
+    ViewModeController m_viewModeController;
+    QString m_uiDbPath;
 
     QLineEdit* m_rootEdit = nullptr;
     QPushButton* m_browseButton = nullptr;
@@ -164,6 +175,7 @@ private:
     quint64 m_scanEnumeratedCount = 0;
     QVector<FileEntry> m_publishQueue;
     QTimer m_publishTimer;
+    QTimer m_refreshPollTimer;
     FileViewMode m_viewMode = FileViewMode::Standard;
     QStringList m_navigationHistory;
     int m_navigationIndex = -1;
@@ -188,6 +200,7 @@ private:
     QString m_testScriptPath;
     QStringList m_actionContextPaths;
     QString m_actionContextType;
+    QDateTime m_lastRefreshRequeryAt;
 
     QAction* m_actionTreeSnapshot = nullptr;
     QAction* m_actionCompressZip = nullptr;
