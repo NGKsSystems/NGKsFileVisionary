@@ -24,6 +24,9 @@
         "src/core/db/EntryRepository.cpp",
         "src/core/db/VolumeRepository.cpp",
         "src/core/db/FavoriteRepository.cpp",
+        "src/core/watch/ChangeEvent.cpp",
+        "src/core/watch/WatchSession.cpp",
+        "src/core/watch/WatchBridge.cpp",
         "src/util/PathUtils.cpp"
       ],
       "include_dirs": [

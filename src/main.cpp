@@ -32,6 +32,8 @@
 #include "core/services/RefreshPolicy.h"
 #include "core/services/RefreshTypes.h"
 #include "core/services/VisionIndexService.h"
+#include "core/watch/ChangeEvent.h"
+#include "core/watch/WatchBridge.h"
 #include "ui/MainWindow.h"
 #include "ui/model/DirectoryModel.h"
 #include "ui/model/QueryResultAdapter.h"
@@ -46,6 +48,15 @@ struct IndexSmokeCliOptions {
     QString indexRoot;
     QString indexDbPath;
     QString indexLogPath;
+    QStringList argsReceived;
+    QString parseError;
+};
+
+struct WatchSmokeCliOptions {
+    bool enabled = false;
+    QString watchRoot;
+    QString watchDbPath;
+    QString watchLogPath;
     QStringList argsReceived;
     QString parseError;
 };
@@ -103,6 +114,16 @@ bool hasIndexSmokeFlag(int argc, char* argv[])
     return false;
 }
 
+bool hasWatchSmokeFlag(int argc, char* argv[])
+{
+    for (int i = 1; i < argc; ++i) {
+        if (QString::fromLocal8Bit(argv[i]) == QStringLiteral("--watch-smoke")) {
+            return true;
+        }
+    }
+    return false;
+}
+
 IndexSmokeCliOptions parseIndexSmokeOptions(int argc, char* argv[])
 {
     IndexSmokeCliOptions options;
@@ -151,6 +172,138 @@ IndexSmokeCliOptions parseIndexSmokeOptions(int argc, char* argv[])
     }
 
     return options;
+}
+
+WatchSmokeCliOptions parseWatchSmokeOptions(int argc, char* argv[])
+{
+    WatchSmokeCliOptions options;
+
+    for (int i = 0; i < argc; ++i) {
+        options.argsReceived << QString::fromLocal8Bit(argv[i]);
+    }
+
+    for (int i = 1; i < argc; ++i) {
+        const QString token = QString::fromLocal8Bit(argv[i]);
+        if (token == QStringLiteral("--watch-smoke")) {
+            options.enabled = true;
+            continue;
+        }
+
+        auto consumeValue = [&](QString* out) {
+            if ((i + 1) >= argc) {
+                options.parseError = QStringLiteral("missing_value_for_%1").arg(token);
+                return false;
+            }
+            ++i;
+            *out = QDir::cleanPath(QString::fromLocal8Bit(argv[i]));
+            return true;
+        };
+
+        if (token == QStringLiteral("--watch-root")) {
+            if (!consumeValue(&options.watchRoot)) {
+                break;
+            }
+            continue;
+        }
+
+        if (token == QStringLiteral("--watch-db-path")) {
+            if (!consumeValue(&options.watchDbPath)) {
+                break;
+            }
+            continue;
+        }
+
+        if (token == QStringLiteral("--watch-log")) {
+            if (!consumeValue(&options.watchLogPath)) {
+                break;
+            }
+            continue;
+        }
+    }
+
+    return options;
+}
+
+QString toIsoUtc(const QDateTime& value);
+QString buildEntryHash(const QString& path, const QFileInfo& fileInfo);
+
+bool upsertPathFromFilesystem(MetaStore& store,
+                              qint64 volumeId,
+                              const QString& rootPath,
+                              const QString& path,
+                              int scanVersion,
+                              QString* errorText)
+{
+    QFileInfo info(path);
+    if (!info.exists()) {
+        if (errorText) {
+            *errorText = QStringLiteral("target_missing_on_filesystem");
+        }
+        return false;
+    }
+
+    const QString normalizedRoot = QDir::fromNativeSeparators(QDir::cleanPath(rootPath));
+    EntryRecord record;
+    record.volumeId = volumeId;
+    record.path = QDir::fromNativeSeparators(QDir::cleanPath(info.absoluteFilePath()));
+    record.parentPath = (record.path.compare(normalizedRoot, Qt::CaseInsensitive) == 0)
+        ? QDir::cleanPath(QFileInfo(record.path).dir().absolutePath())
+        : QDir::fromNativeSeparators(QDir::cleanPath(info.absolutePath()));
+    record.name = info.fileName().isEmpty() ? info.absoluteFilePath() : info.fileName();
+    record.normalizedName = SqlHelpers::normalizedName(record.name);
+    record.extension = info.isDir() || info.suffix().isEmpty()
+        ? QString()
+        : QStringLiteral(".") + info.suffix().toLower();
+    record.isDir = info.isDir();
+    record.hasSizeBytes = !info.isDir();
+    record.sizeBytes = info.isDir() ? 0 : info.size();
+    record.createdUtc = toIsoUtc(info.birthTime());
+    record.modifiedUtc = toIsoUtc(info.lastModified());
+    record.accessedUtc = toIsoUtc(info.lastRead());
+    record.hiddenFlag = info.isHidden();
+    record.readonlyFlag = !info.isWritable();
+    record.existsFlag = true;
+    record.indexedAtUtc = SqlHelpers::utcNowIso();
+    record.scanVersion = scanVersion;
+    record.entryHash = buildEntryHash(record.path, info);
+    record.metadataVersion = 1;
+
+    record.hasParentId = false;
+    if (record.path.compare(normalizedRoot, Qt::CaseInsensitive) != 0) {
+        bool foundParent = false;
+        qint64 parentId = 0;
+        QString parentError;
+        if (!store.resolveParentIdByPath(record.parentPath, &parentId, &foundParent, &parentError)) {
+            if (errorText) {
+                *errorText = QStringLiteral("resolve_parent_failed path=%1 error=%2").arg(record.parentPath, parentError);
+            }
+            return false;
+        }
+        if (foundParent) {
+            record.hasParentId = true;
+            record.parentId = parentId;
+        }
+    }
+
+    if (!store.upsertEntry(record, nullptr, nullptr, nullptr, errorText)) {
+        return false;
+    }
+    return true;
+}
+
+bool markPathDeleted(MetaStore& store, const QString& path, int scanVersion, QString* errorText)
+{
+    EntryRecord existing;
+    if (!store.getEntryByPath(path, &existing, errorText)) {
+        return false;
+    }
+
+    existing.existsFlag = false;
+    existing.hasSizeBytes = false;
+    existing.sizeBytes = 0;
+    existing.scanVersion = scanVersion;
+    existing.indexedAtUtc = SqlHelpers::utcNowIso();
+    return store.upsertEntry(existing, nullptr, nullptr, nullptr, errorText);
 }
 
 struct IndexSmokePassResult {
@@ -525,6 +678,291 @@ int runIndexSmokeCli(int argc, char* argv[])
     }
 }
 
+int runWatchSmokeCli(int argc, char* argv[])
+{
+    QCoreApplication cliApp(argc, argv);
+
+    const WatchSmokeCliOptions options = parseWatchSmokeOptions(argc, argv);
+    const QString exePath = QFileInfo(QString::fromLocal8Bit(argv[0])).absoluteFilePath();
+    const QString cwd = QDir::currentPath();
+    const QString timestampUtc = QDateTime::currentDateTimeUtc().toString(Qt::ISODate);
+
+    if (!options.parseError.isEmpty()) {
+        writeStderrLine(QStringLiteral("watch_smoke_parse_error=%1").arg(options.parseError));
+        return 90;
+    }
+
+    if (options.watchLogPath.trimmed().isEmpty()) {
+        writeStderrLine(QStringLiteral("watch_smoke_error=missing_required_arg_--watch-log"));
+        return 91;
+    }
+
+    IndexSmokeLogWriter log;
+    QString logOpenError;
+    if (!log.open(options.watchLogPath, &logOpenError)) {
+        writeStderrLine(QStringLiteral("watch_smoke_error=log_open_failed"));
+        writeStderrLine(QStringLiteral("watch_smoke_log_path=%1").arg(QDir::toNativeSeparators(options.watchLogPath)));
+        writeStderrLine(QStringLiteral("watch_smoke_log_error=%1").arg(logOpenError));
+        return 92;
+    }
+
+    auto finishFail = [&](int exitCode, const QString& reason) {
+        log.writeLine(QStringLiteral("final_status=FAIL"));
+        log.writeLine(QStringLiteral("exit_code=%1").arg(exitCode));
+        log.writeLine(QStringLiteral("failure_reason=%1").arg(reason));
+        log.writeLine(QStringLiteral("timestamp_utc_end=%1").arg(QDateTime::currentDateTimeUtc().toString(Qt::ISODate)));
+        return exitCode;
+    };
+
+    try {
+        log.writeLine(QStringLiteral("mode=watch_smoke"));
+        log.writeLine(QStringLiteral("startup_banner=WATCH_SMOKE_BEGIN"));
+        log.writeLine(QStringLiteral("exe_path=%1").arg(QDir::toNativeSeparators(exePath)));
+        log.writeLine(QStringLiteral("cwd=%1").arg(QDir::toNativeSeparators(cwd)));
+        log.writeLine(QStringLiteral("args_received=%1").arg(options.argsReceived.join(QStringLiteral(" | "))));
+        log.writeLine(QStringLiteral("watch_root=%1").arg(QDir::toNativeSeparators(options.watchRoot)));
+        log.writeLine(QStringLiteral("watch_db_path=%1").arg(QDir::toNativeSeparators(options.watchDbPath)));
+        log.writeLine(QStringLiteral("watch_log=%1").arg(QDir::toNativeSeparators(options.watchLogPath)));
+        log.writeLine(QStringLiteral("timestamp_utc=%1").arg(timestampUtc));
+
+        if (options.watchRoot.trimmed().isEmpty()) {
+            writeStderrLine(QStringLiteral("watch_smoke_error=missing_required_arg_--watch-root"));
+            return finishFail(93, QStringLiteral("missing_required_arg_--watch-root"));
+        }
+        if (options.watchDbPath.trimmed().isEmpty()) {
+            writeStderrLine(QStringLiteral("watch_smoke_error=missing_required_arg_--watch-db-path"));
+            return finishFail(94, QStringLiteral("missing_required_arg_--watch-db-path"));
+        }
+
+        QFileInfo rootInfo(options.watchRoot);
+        if (!rootInfo.exists() || !rootInfo.isDir()) {
+            writeStderrLine(QStringLiteral("watch_smoke_error=invalid_watch_root"));
+            return finishFail(95, QStringLiteral("invalid_watch_root"));
+        }
+
+        log.writeLine(QStringLiteral("arg_validation=ok"));
+
+        MetaStore store;
+        QString errorText;
+        QString migrationLog;
+        log.writeLine(QStringLiteral("db_init=begin"));
+        if (!store.initialize(options.watchDbPath, &errorText, &migrationLog)) {
+            writeStderrLine(QStringLiteral("watch_smoke_error=db_init_failure"));
+            return finishFail(96, QStringLiteral("db_init_failure:%1").arg(errorText));
+        }
+        log.writeLine(QStringLiteral("db_init=end"));
+
+        if (!migrationLog.isEmpty()) {
+            log.writeLine(QStringLiteral("migration_log_begin"));
+            log.writeLine(migrationLog.trimmed());
+            log.writeLine(QStringLiteral("migration_log_end"));
+        }
+
+        const QString normalizedRoot = QDir::fromNativeSeparators(QDir::cleanPath(options.watchRoot));
+        IndexRootRecord indexRoot;
+        indexRoot.rootPath = normalizedRoot;
+        indexRoot.status = QStringLiteral("active");
+        indexRoot.createdUtc = SqlHelpers::utcNowIso();
+        indexRoot.updatedUtc = indexRoot.createdUtc;
+        if (!store.upsertIndexRoot(indexRoot, nullptr, &errorText)) {
+            store.shutdown();
+            return finishFail(97, QStringLiteral("index_root_upsert_failed:%1").arg(errorText));
+        }
+
+        VolumeRecord volume;
+        volume.volumeKey = QStringLiteral("watch_smoke:%1").arg(normalizedRoot.toLower());
+        volume.rootPath = normalizedRoot;
+        volume.displayName = QFileInfo(normalizedRoot).fileName();
+        volume.fsType = QStringLiteral("native");
+        volume.serialNumber = QStringLiteral("watch_smoke");
+        qint64 volumeId = 0;
+        if (!store.upsertVolume(volume, &volumeId, &errorText)) {
+            store.shutdown();
+            return finishFail(98, QStringLiteral("volume_upsert_failed:%1").arg(errorText));
+        }
+
+        IndexSmokePassResult initialPass;
+        if (!runSynchronousIndexPass(store, volumeId, normalizedRoot, 1, &initialPass, &errorText)) {
+            store.shutdown();
+            return finishFail(99, QStringLiteral("initial_index_failed:%1").arg(errorText));
+        }
+
+        WatchBridge bridge;
+        if (!bridge.start(normalizedRoot, &errorText)) {
+            store.shutdown();
+            return finishFail(100, QStringLiteral("watcher_start_failed:%1").arg(errorText));
+        }
+        log.writeLine(QStringLiteral("watcher_start_ok=true"));
+
+        bool createSeen = false;
+        bool modifySeen = false;
+        bool renameSeen = false;
+        bool deleteSeen = false;
+        int targetedUpdates = 0;
+        int scanVersion = 10;
+        bool fullRescanTriggered = false;
+
+        auto processEvents = [&](int waitMs) -> bool {
+            const qint64 deadline = QDateTime::currentMSecsSinceEpoch() + waitMs;
+            while (QDateTime::currentMSecsSinceEpoch() < deadline) {
+                const QVector<ChangeEvent> events = bridge.takePendingEvents();
+                if (!events.isEmpty()) {
+                    for (const ChangeEvent& event : events) {
+                        log.writeLine(QStringLiteral("event_json=%1").arg(changeEventToJsonLine(event)));
+
+                        if (event.type == ChangeEventType::Created) {
+                            createSeen = true;
+                        } else if (event.type == ChangeEventType::Modified) {
+                            modifySeen = true;
+                        } else if (event.type == ChangeEventType::Deleted) {
+                            deleteSeen = true;
+                        } else if (event.type == ChangeEventType::RenamedOld
+                                   || event.type == ChangeEventType::RenamedNew
+                                   || event.type == ChangeEventType::RenamedPair) {
+                            renameSeen = true;
+                        }
+
+                        QString updateError;
+                        bool eventApplied = true;
+                        if (event.type == ChangeEventType::Created || event.type == ChangeEventType::Modified || event.type == ChangeEventType::RenamedNew) {
+                            eventApplied = upsertPathFromFilesystem(store, volumeId, normalizedRoot, event.targetPath, ++scanVersion, &updateError);
+                        } else if (event.type == ChangeEventType::Deleted || event.type == ChangeEventType::RenamedOld) {
+                            eventApplied = markPathDeleted(store, event.targetPath, ++scanVersion, &updateError);
+                        } else if (event.type == ChangeEventType::RenamedPair) {
+                            const bool markOldOk = markPathDeleted(store, event.oldPath, ++scanVersion, &updateError);
+                            const bool upsertNewOk = upsertPathFromFilesystem(store, volumeId, normalizedRoot, event.targetPath, ++scanVersion, &updateError);
+                            eventApplied = markOldOk || upsertNewOk;
+                        }
+
+                        log.writeLine(QStringLiteral("targeted_update event=%1 applied=%2")
+                                          .arg(changeEventTypeToString(event.type), eventApplied ? QStringLiteral("true") : QStringLiteral("false")));
+
+                        if (!eventApplied && !updateError.contains(QStringLiteral("target_missing_on_filesystem"), Qt::CaseInsensitive)
+                            && !updateError.contains(QStringLiteral("not_found"), Qt::CaseInsensitive)) {
+                            bridge.stop();
+                            store.shutdown();
+                            fullRescanTriggered = false;
+                            return false;
+                        }
+
+                        if (eventApplied) {
+                            ++targetedUpdates;
+                        }
+                    }
+                    return true;
+                }
+                std::this_thread::sleep_for(std::chrono::milliseconds(50));
+            }
+            return true;
+        };
+
+        const QString createPath = QDir(normalizedRoot).filePath(QStringLiteral("watch_live_create.txt"));
+        QFile createFile(createPath);
+        if (!createFile.open(QIODevice::WriteOnly | QIODevice::Text | QIODevice::Truncate)) {
+            bridge.stop();
+            store.shutdown();
+            return finishFail(101, QStringLiteral("create_file_failed:%1").arg(createFile.errorString()));
+        }
+        QTextStream createStream(&createFile);
+        createStream << QStringLiteral("created\n");
+        createFile.close();
+        if (!processEvents(3000)) {
+            return finishFail(102, QStringLiteral("process_events_failed_after_create"));
+        }
+
+        std::this_thread::sleep_for(std::chrono::milliseconds(600));
+
+        QFile modifyFile(createPath);
+        if (!modifyFile.open(QIODevice::WriteOnly | QIODevice::Text | QIODevice::Truncate)) {
+            bridge.stop();
+            store.shutdown();
+            return finishFail(103, QStringLiteral("modify_file_failed:%1").arg(modifyFile.errorString()));
+        }
+        QTextStream modifyStream(&modifyFile);
+        modifyStream << QStringLiteral("modified_payload_%1\n").arg(QDateTime::currentDateTimeUtc().toString(Qt::ISODate));
+        modifyStream.flush();
+        modifyFile.close();
+        if (!processEvents(3000)) {
+            return finishFail(104, QStringLiteral("process_events_failed_after_modify"));
+        }
+
+        const QString renamedPath = QDir(normalizedRoot).filePath(QStringLiteral("watch_live_renamed.txt"));
+        if (!QFile::rename(createPath, renamedPath)) {
+            bridge.stop();
+            store.shutdown();
+            return finishFail(105, QStringLiteral("rename_failed"));
+        }
+        if (!processEvents(3000)) {
+            return finishFail(106, QStringLiteral("process_events_failed_after_rename"));
+        }
+
+        if (!QFile::remove(renamedPath)) {
+            bridge.stop();
+            store.shutdown();
+            return finishFail(107, QStringLiteral("delete_failed"));
+        }
+        if (!processEvents(3000)) {
+            return finishFail(108, QStringLiteral("process_events_failed_after_delete"));
+        }
+
+        processEvents(1000);
+
+        QueryCore queryCore(store);
+        QueryOptions optionsQuery;
+        optionsQuery.sortField = QuerySortField::Name;
+        optionsQuery.ascending = true;
+        const QueryResult queryResult = queryCore.queryChildren(normalizedRoot, optionsQuery);
+        if (!queryResult.ok) {
+            bridge.stop();
+            store.shutdown();
+            return finishFail(109, QStringLiteral("query_validation_failed:%1").arg(queryResult.errorText));
+        }
+
+        EntryRecord deletedCheck;
+        QString deletedError;
+        const bool deletedTracked = store.getEntryByPath(QDir::fromNativeSeparators(QDir::cleanPath(renamedPath)), &deletedCheck, &deletedError);
+        const bool finalDbMatchesFs = deletedTracked && !deletedCheck.existsFlag;
+
+        bridge.stop();
+        store.shutdown();
+
+        log.writeLine(QStringLiteral("create_event_seen=%1").arg(createSeen ? QStringLiteral("true") : QStringLiteral("false")));
+        log.writeLine(QStringLiteral("modify_event_seen=%1").arg(modifySeen ? QStringLiteral("true") : QStringLiteral("false")));
+        log.writeLine(QStringLiteral("rename_event_seen=%1").arg(renameSeen ? QStringLiteral("true") : QStringLiteral("false")));
+        log.writeLine(QStringLiteral("delete_event_seen=%1").arg(deleteSeen ? QStringLiteral("true") : QStringLiteral("false")));
+        log.writeLine(QStringLiteral("targeted_update_count=%1").arg(targetedUpdates));
+        log.writeLine(QStringLiteral("full_rescan_triggered=%1").arg(fullRescanTriggered ? QStringLiteral("true") : QStringLiteral("false")));
+        log.writeLine(QStringLiteral("query_children_ok=%1").arg(queryResult.ok ? QStringLiteral("true") : QStringLiteral("false")));
+        log.writeLine(QStringLiteral("query_children_rows=%1").arg(queryResult.rows.size()));
+        log.writeLine(QStringLiteral("db_state_matches_fs=%1").arg(finalDbMatchesFs ? QStringLiteral("true") : QStringLiteral("false")));
+
+        const bool checksOk = createSeen
+            && modifySeen
+            && renameSeen
+            && deleteSeen
+            && targetedUpdates > 0
+            && !fullRescanTriggered
+            && queryResult.ok
+            && finalDbMatchesFs;
+
+        if (!checksOk) {
+            return finishFail(110, QStringLiteral("watch_smoke_checks_failed"));
+        }
+
+        log.writeLine(QStringLiteral("final_status=PASS"));
+        log.writeLine(QStringLiteral("exit_code=0"));
+        log.writeLine(QStringLiteral("failure_reason="));
+        log.writeLine(QStringLiteral("timestamp_utc_end=%1").arg(QDateTime::currentDateTimeUtc().toString(Qt::ISODate)));
+        return 0;
+    } catch (const std::exception& ex) {
+        writeStderrLine(QStringLiteral("watch_smoke_error=unexpected_exception"));
+        return finishFail(111, QStringLiteral("unexpected_exception:%1").arg(QString::fromLocal8Bit(ex.what())));
+    } catch (...) {
+        writeStderrLine(QStringLiteral("watch_smoke_error=unexpected_error"));
+        return finishFail(112, QStringLiteral("unexpected_error"));
+    }
+}
+
 bool writeLogFile(const QString& logPath, const QStringList& lines)
 {
     QFileInfo logInfo(logPath);
@@ -545,6 +983,10 @@ bool writeLogFile(const QString& logPath, const QStringList& lines)
 
 int main(int argc, char* argv[])
 {
+    if (hasWatchSmokeFlag(argc, argv)) {
+        return runWatchSmokeCli(argc, argv);
+    }
+
     if (hasIndexSmokeFlag(argc, argv)) {
         return runIndexSmokeCli(argc, argv);
     }
