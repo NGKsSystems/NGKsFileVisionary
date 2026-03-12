@@ -34,6 +34,7 @@
 #include "core/query/QueryCore.h"
 #include "core/query/QueryTypes.h"
 #include "core/querylang/QueryParser.h"
+#include "core/reference/ReferenceGraphEngine.h"
 #include "core/snapshot/SnapshotDiffEngine.h"
 #include "core/snapshot/SnapshotDiffTypes.h"
 #include "core/snapshot/SnapshotEngine.h"
@@ -151,6 +152,15 @@ struct ArchiveSnapshotSmokeCliOptions {
     bool enabled = false;
     QString archiveRoot;
     QString archiveLogPath;
+    QStringList argsReceived;
+    QString parseError;
+};
+
+struct ReferenceSmokeCliOptions {
+    bool enabled = false;
+    QString referenceRoot;
+    QString referenceDbPath;
+    QString referenceLogPath;
     QStringList argsReceived;
     QString parseError;
 };
@@ -292,6 +302,16 @@ bool hasArchiveSnapshotSmokeFlag(int argc, char* argv[])
 {
     for (int i = 1; i < argc; ++i) {
         if (QString::fromLocal8Bit(argv[i]) == QStringLiteral("--archive-snapshot-smoke")) {
+            return true;
+        }
+    }
+    return false;
+}
+
+bool hasReferenceSmokeFlag(int argc, char* argv[])
+{
+    for (int i = 1; i < argc; ++i) {
+        if (QString::fromLocal8Bit(argv[i]) == QStringLiteral("--reference-smoke")) {
             return true;
         }
     }
@@ -870,6 +890,56 @@ ArchiveSnapshotSmokeCliOptions parseArchiveSnapshotSmokeOptions(int argc, char* 
     return options;
 }
 
+ReferenceSmokeCliOptions parseReferenceSmokeOptions(int argc, char* argv[])
+{
+    ReferenceSmokeCliOptions options;
+
+    for (int i = 0; i < argc; ++i) {
+        options.argsReceived << QString::fromLocal8Bit(argv[i]);
+    }
+
+    for (int i = 1; i < argc; ++i) {
+        const QString token = QString::fromLocal8Bit(argv[i]);
+        if (token == QStringLiteral("--reference-smoke")) {
+            options.enabled = true;
+            continue;
+        }
+
+        auto consumeValue = [&](QString* out) {
+            if ((i + 1) >= argc) {
+                options.parseError = QStringLiteral("missing_value_for_%1").arg(token);
+                return false;
+            }
+            ++i;
+            *out = QDir::cleanPath(QString::fromLocal8Bit(argv[i]));
+            return true;
+        };
+
+        if (token == QStringLiteral("--reference-root")) {
+            if (!consumeValue(&options.referenceRoot)) {
+                break;
+            }
+            continue;
+        }
+
+        if (token == QStringLiteral("--reference-db-path")) {
+            if (!consumeValue(&options.referenceDbPath)) {
+                break;
+            }
+            continue;
+        }
+
+        if (token == QStringLiteral("--reference-log")) {
+            if (!consumeValue(&options.referenceLogPath)) {
+                break;
+            }
+            continue;
+        }
+    }
+
+    return options;
+}
+
 QString toIsoUtc(const QDateTime& value);
 QString buildEntryHash(const QString& path, const QFileInfo& fileInfo);
 
@@ -1155,6 +1225,368 @@ bool runSynchronousIndexPass(MetaStore& store,
     }
 
     return true;
+}
+
+int runReferenceSmokeCli(int argc, char* argv[])
+{
+    QCoreApplication cliApp(argc, argv);
+
+    const ReferenceSmokeCliOptions options = parseReferenceSmokeOptions(argc, argv);
+    const QString exePath = QFileInfo(QString::fromLocal8Bit(argv[0])).absoluteFilePath();
+    const QString cwd = QDir::currentPath();
+    const QString timestampUtc = QDateTime::currentDateTimeUtc().toString(Qt::ISODate);
+
+    if (!options.parseError.isEmpty()) {
+        writeStderrLine(QStringLiteral("reference_smoke_parse_error=%1").arg(options.parseError));
+        return 510;
+    }
+
+    if (options.referenceLogPath.trimmed().isEmpty()) {
+        writeStderrLine(QStringLiteral("reference_smoke_error=missing_required_arg_--reference-log"));
+        return 511;
+    }
+
+    IndexSmokeLogWriter log;
+    QString logOpenError;
+    if (!log.open(options.referenceLogPath, &logOpenError)) {
+        writeStderrLine(QStringLiteral("reference_smoke_error=log_open_failed"));
+        writeStderrLine(QStringLiteral("reference_smoke_log_path=%1").arg(QDir::toNativeSeparators(options.referenceLogPath)));
+        writeStderrLine(QStringLiteral("reference_smoke_log_error=%1").arg(logOpenError));
+        return 512;
+    }
+
+    auto finishFail = [&](int exitCode, const QString& reason) {
+        log.writeLine(QStringLiteral("final_status=FAIL"));
+        log.writeLine(QStringLiteral("exit_code=%1").arg(exitCode));
+        log.writeLine(QStringLiteral("failure_reason=%1").arg(reason));
+        log.writeLine(QStringLiteral("timestamp_utc_end=%1").arg(QDateTime::currentDateTimeUtc().toString(Qt::ISODate)));
+        return exitCode;
+    };
+
+    auto writeTextFile = [](const QString& filePath, const QString& content, QString* errorText) {
+        const QFileInfo fileInfo(filePath);
+        if (!QDir().mkpath(fileInfo.absolutePath())) {
+            if (errorText) {
+                *errorText = QStringLiteral("create_parent_dir_failed:%1").arg(fileInfo.absolutePath());
+            }
+            return false;
+        }
+
+        QFile out(filePath);
+        if (!out.open(QIODevice::WriteOnly | QIODevice::Text | QIODevice::Truncate)) {
+            if (errorText) {
+                *errorText = QStringLiteral("open_write_failed:%1").arg(out.errorString());
+            }
+            return false;
+        }
+
+        QTextStream ts(&out);
+        ts << content;
+        ts.flush();
+        out.close();
+        return true;
+    };
+
+    auto logStartup = [&]() {
+        log.writeLine(QStringLiteral("mode=reference_smoke"));
+        log.writeLine(QStringLiteral("startup_banner=REFERENCE_SMOKE_CLI_BEGIN"));
+        log.writeLine(QStringLiteral("exe_path=%1").arg(QDir::toNativeSeparators(exePath)));
+        log.writeLine(QStringLiteral("cwd=%1").arg(QDir::toNativeSeparators(cwd)));
+        log.writeLine(QStringLiteral("args_received=%1").arg(options.argsReceived.join(QStringLiteral(" | "))));
+        log.writeLine(QStringLiteral("reference_root=%1").arg(QDir::toNativeSeparators(options.referenceRoot)));
+        log.writeLine(QStringLiteral("reference_db_path=%1").arg(QDir::toNativeSeparators(options.referenceDbPath)));
+        log.writeLine(QStringLiteral("reference_log=%1").arg(QDir::toNativeSeparators(options.referenceLogPath)));
+        log.writeLine(QStringLiteral("timestamp_utc=%1").arg(timestampUtc));
+    };
+
+    try {
+        logStartup();
+
+        if (options.referenceRoot.trimmed().isEmpty()) {
+            writeStderrLine(QStringLiteral("reference_smoke_error=missing_required_arg_--reference-root"));
+            return finishFail(513, QStringLiteral("missing_required_arg_--reference-root"));
+        }
+        if (options.referenceDbPath.trimmed().isEmpty()) {
+            writeStderrLine(QStringLiteral("reference_smoke_error=missing_required_arg_--reference-db-path"));
+            return finishFail(514, QStringLiteral("missing_required_arg_--reference-db-path"));
+        }
+
+        const QString normalizedParentRoot = QDir::fromNativeSeparators(
+            QDir::cleanPath(QFileInfo(options.referenceRoot).absoluteFilePath()));
+        if (!QDir().mkpath(normalizedParentRoot)) {
+            writeStderrLine(QStringLiteral("reference_smoke_error=unable_to_create_reference_root"));
+            return finishFail(515, QStringLiteral("unable_to_create_reference_root"));
+        }
+
+        const QString sampleRoot = QDir(normalizedParentRoot).filePath(QStringLiteral("reference_smoke_case"));
+        QDir sampleRootDir(sampleRoot);
+        if (sampleRootDir.exists() && !sampleRootDir.removeRecursively()) {
+            return finishFail(516, QStringLiteral("cleanup_existing_sample_root_failed"));
+        }
+        if (!QDir().mkpath(sampleRoot)) {
+            return finishFail(517, QStringLiteral("sample_root_create_failed"));
+        }
+        log.writeLine(QStringLiteral("sample_root=%1").arg(QDir::toNativeSeparators(sampleRoot)));
+
+        const QString includeHeaderPath = QDir(sampleRoot).filePath(QStringLiteral("include/common.h"));
+        const QString sourceCppPath = QDir(sampleRoot).filePath(QStringLiteral("src/main.cpp"));
+        const QString helperJsPath = QDir(sampleRoot).filePath(QStringLiteral("lib/helper.js"));
+        const QString appJsPath = QDir(sampleRoot).filePath(QStringLiteral("web/app.js"));
+        const QString configJsonPath = QDir(sampleRoot).filePath(QStringLiteral("web/config.json"));
+        const QString logoPath = QDir(sampleRoot).filePath(QStringLiteral("web/assets/logo.svg"));
+        const QString pythonPath = QDir(sampleRoot).filePath(QStringLiteral("py/module.py"));
+
+        QString writeError;
+        if (!writeTextFile(includeHeaderPath,
+                           QStringLiteral("#pragma once\nint shared_value();\n"),
+                           &writeError)) {
+            return finishFail(518, QStringLiteral("sample_write_failed:%1").arg(writeError));
+        }
+
+        if (!writeTextFile(sourceCppPath,
+                           QStringLiteral("#include \"../include/common.h\"\n#include \"missing.hpp\"\nint main() { return 0; }\n"),
+                           &writeError)) {
+            return finishFail(519, QStringLiteral("sample_write_failed:%1").arg(writeError));
+        }
+
+        if (!writeTextFile(helperJsPath,
+                           QStringLiteral("export function helper() { return 1; }\n"),
+                           &writeError)) {
+            return finishFail(520, QStringLiteral("sample_write_failed:%1").arg(writeError));
+        }
+
+        if (!writeTextFile(configJsonPath,
+                           QStringLiteral("{\n  \"enabled\": true\n}\n"),
+                           &writeError)) {
+            return finishFail(521, QStringLiteral("sample_write_failed:%1").arg(writeError));
+        }
+
+        if (!writeTextFile(logoPath,
+                           QStringLiteral("<svg xmlns=\"http://www.w3.org/2000/svg\"></svg>\n"),
+                           &writeError)) {
+            return finishFail(522, QStringLiteral("sample_write_failed:%1").arg(writeError));
+        }
+
+        if (!writeTextFile(appJsPath,
+                           QStringLiteral("import { helper } from \"../lib/helper.js\";\n")
+                               + QStringLiteral("const cfg = require(\"./config.json\");\n")
+                               + QStringLiteral("const missing = require(\"./missing.json\");\n")
+                               + QStringLiteral("const logoPath = \"./assets/logo.svg\";\n")
+                               + QStringLiteral("console.log(helper(), cfg, missing, logoPath);\n"),
+                           &writeError)) {
+            return finishFail(523, QStringLiteral("sample_write_failed:%1").arg(writeError));
+        }
+
+        if (!writeTextFile(pythonPath,
+                           QStringLiteral("import os\nfrom app import missing_symbol\n"),
+                           &writeError)) {
+            return finishFail(524, QStringLiteral("sample_write_failed:%1").arg(writeError));
+        }
+
+        log.writeLine(QStringLiteral("sample_workspace_ready=true"));
+
+        MetaStore store;
+        QString errorText;
+        QString migrationLog;
+        if (!store.initialize(options.referenceDbPath, &errorText, &migrationLog)) {
+            writeStderrLine(QStringLiteral("reference_smoke_error=db_init_failure"));
+            return finishFail(525, QStringLiteral("db_init_failure:%1").arg(errorText));
+        }
+        if (!migrationLog.isEmpty()) {
+            log.writeLine(QStringLiteral("migration_log_begin"));
+            log.writeLine(migrationLog.trimmed());
+            log.writeLine(QStringLiteral("migration_log_end"));
+        }
+
+        const QString normalizedSampleRoot = QDir::fromNativeSeparators(QDir::cleanPath(sampleRoot));
+
+        IndexRootRecord indexRoot;
+        indexRoot.rootPath = normalizedSampleRoot;
+        indexRoot.status = QStringLiteral("active");
+        indexRoot.createdUtc = SqlHelpers::utcNowIso();
+        indexRoot.updatedUtc = indexRoot.createdUtc;
+        if (!store.upsertIndexRoot(indexRoot, nullptr, &errorText)) {
+            store.shutdown();
+            return finishFail(526, QStringLiteral("upsert_index_root_failed:%1").arg(errorText));
+        }
+
+        VolumeRecord volume;
+        volume.volumeKey = QStringLiteral("reference_smoke:%1").arg(normalizedSampleRoot.toLower());
+        volume.rootPath = normalizedSampleRoot;
+        volume.displayName = QFileInfo(normalizedSampleRoot).fileName();
+        volume.fsType = QStringLiteral("native");
+        volume.serialNumber = QStringLiteral("reference_smoke");
+        qint64 volumeId = 0;
+        if (!store.upsertVolume(volume, &volumeId, &errorText)) {
+            store.shutdown();
+            return finishFail(527, QStringLiteral("upsert_volume_failed:%1").arg(errorText));
+        }
+
+        IndexSmokePassResult indexPass;
+        if (!runSynchronousIndexPass(store, volumeId, normalizedSampleRoot, 1, &indexPass, &errorText)) {
+            store.shutdown();
+            return finishFail(528, QStringLiteral("index_pass_failed:%1").arg(errorText));
+        }
+        log.writeLine(QStringLiteral("index_pass_seen=%1").arg(indexPass.seen));
+        log.writeLine(QStringLiteral("index_pass_files=%1").arg(indexPass.files));
+        log.writeLine(QStringLiteral("index_pass_directories=%1").arg(indexPass.directories));
+
+        QSqlDatabase db = store.database();
+        if (!db.isValid() || !db.isOpen()) {
+            store.shutdown();
+            return finishFail(529, QStringLiteral("metastore_db_not_open"));
+        }
+
+        bool tableFound = false;
+        {
+            QSqlQuery q(db);
+            q.prepare(QStringLiteral("SELECT COUNT(1) FROM sqlite_master WHERE type='table' AND name='reference_edges';"));
+            if (!q.exec() || !q.next()) {
+                const QString qError = q.lastError().text();
+                store.shutdown();
+                return finishFail(530, QStringLiteral("schema_probe_failed:%1").arg(qError));
+            }
+            tableFound = q.value(0).toInt() > 0;
+        }
+
+        bool idxSource = false;
+        bool idxTarget = false;
+        bool idxType = false;
+        bool idxSourceRoot = false;
+        {
+            QSqlQuery q(db);
+            q.prepare(QStringLiteral("SELECT name FROM sqlite_master WHERE type='index' AND tbl_name='reference_edges';"));
+            if (!q.exec()) {
+                const QString qError = q.lastError().text();
+                store.shutdown();
+                return finishFail(531, QStringLiteral("index_probe_failed:%1").arg(qError));
+            }
+            while (q.next()) {
+                const QString name = q.value(0).toString();
+                idxSource = idxSource || (name == QStringLiteral("idx_reference_edges_source"));
+                idxTarget = idxTarget || (name == QStringLiteral("idx_reference_edges_target"));
+                idxType = idxType || (name == QStringLiteral("idx_reference_edges_type"));
+                idxSourceRoot = idxSourceRoot || (name == QStringLiteral("idx_reference_edges_source_root"));
+            }
+        }
+
+        log.writeLine(QStringLiteral("schema_table_reference_edges=%1").arg(tableFound ? QStringLiteral("true") : QStringLiteral("false")));
+        log.writeLine(QStringLiteral("schema_index_source=%1").arg(idxSource ? QStringLiteral("true") : QStringLiteral("false")));
+        log.writeLine(QStringLiteral("schema_index_target=%1").arg(idxTarget ? QStringLiteral("true") : QStringLiteral("false")));
+        log.writeLine(QStringLiteral("schema_index_type=%1").arg(idxType ? QStringLiteral("true") : QStringLiteral("false")));
+        log.writeLine(QStringLiteral("schema_index_source_root=%1").arg(idxSourceRoot ? QStringLiteral("true") : QStringLiteral("false")));
+
+        ReferenceGraph::ReferenceGraphEngine referenceEngine(store);
+        qint64 scanEdgesCount = 0;
+        if (!referenceEngine.scanReferencesUnderRoot(normalizedSampleRoot, &scanEdgesCount, &errorText)) {
+            store.shutdown();
+            return finishFail(532, QStringLiteral("reference_scan_failed:%1").arg(errorText));
+        }
+        log.writeLine(QStringLiteral("reference_scan_edge_count=%1").arg(scanEdgesCount));
+
+        QVector<ReferenceGraph::ReferenceEdge> rootEdges;
+        if (!referenceEngine.listReferencesUnderRoot(normalizedSampleRoot, &rootEdges, &errorText)) {
+            store.shutdown();
+            return finishFail(533, QStringLiteral("list_root_edges_failed:%1").arg(errorText));
+        }
+
+        int resolvedCount = 0;
+        int unresolvedCount = 0;
+        bool hasIncludeType = false;
+        bool hasImportOrRequireType = false;
+        for (const ReferenceGraph::ReferenceEdge& edge : rootEdges) {
+            if (edge.resolvedFlag) {
+                ++resolvedCount;
+            } else {
+                ++unresolvedCount;
+            }
+
+            if (edge.referenceType == QStringLiteral("include_ref")) {
+                hasIncludeType = true;
+            }
+            if (edge.referenceType == QStringLiteral("import_ref") || edge.referenceType == QStringLiteral("require_ref")) {
+                hasImportOrRequireType = true;
+            }
+        }
+
+        log.writeLine(QStringLiteral("references_total=%1").arg(rootEdges.size()));
+        log.writeLine(QStringLiteral("references_resolved=%1").arg(resolvedCount));
+        log.writeLine(QStringLiteral("references_unresolved=%1").arg(unresolvedCount));
+        log.writeLine(QStringLiteral("has_include_ref=%1").arg(hasIncludeType ? QStringLiteral("true") : QStringLiteral("false")));
+        log.writeLine(QStringLiteral("has_import_or_require_ref=%1").arg(hasImportOrRequireType ? QStringLiteral("true") : QStringLiteral("false")));
+
+        const QString normalizedSampleSource = QDir::fromNativeSeparators(QDir::cleanPath(appJsPath));
+        const QString normalizedSampleTarget = QDir::fromNativeSeparators(QDir::cleanPath(includeHeaderPath));
+        QVector<ReferenceGraph::ReferenceEdge> outgoing;
+        QVector<ReferenceGraph::ReferenceEdge> incoming;
+
+        if (!referenceEngine.listOutgoingReferences(normalizedSampleSource, &outgoing, &errorText)) {
+            store.shutdown();
+            return finishFail(534, QStringLiteral("list_outgoing_failed:%1").arg(errorText));
+        }
+        if (!referenceEngine.listIncomingReferences(normalizedSampleTarget, &incoming, &errorText)) {
+            store.shutdown();
+            return finishFail(535, QStringLiteral("list_incoming_failed:%1").arg(errorText));
+        }
+
+        log.writeLine(QStringLiteral("outgoing_sample_source=%1").arg(QDir::toNativeSeparators(normalizedSampleSource)));
+        log.writeLine(QStringLiteral("outgoing_count=%1").arg(outgoing.size()));
+        log.writeLine(QStringLiteral("incoming_sample_target=%1").arg(QDir::toNativeSeparators(normalizedSampleTarget)));
+        log.writeLine(QStringLiteral("incoming_count=%1").arg(incoming.size()));
+
+        for (int i = 0; i < qMin(5, outgoing.size()); ++i) {
+            const ReferenceGraph::ReferenceEdge& edge = outgoing.at(i);
+            log.writeLine(QStringLiteral("outgoing_sample_%1=type:%2 resolved:%3 target:%4 raw:%5 line:%6")
+                              .arg(i)
+                              .arg(edge.referenceType)
+                              .arg(edge.resolvedFlag ? QStringLiteral("true") : QStringLiteral("false"))
+                              .arg(QDir::toNativeSeparators(edge.targetPath))
+                              .arg(edge.rawTarget)
+                              .arg(edge.sourceLine));
+        }
+
+        for (int i = 0; i < qMin(5, incoming.size()); ++i) {
+            const ReferenceGraph::ReferenceEdge& edge = incoming.at(i);
+            log.writeLine(QStringLiteral("incoming_sample_%1=type:%2 source:%3 raw:%4 line:%5")
+                              .arg(i)
+                              .arg(edge.referenceType)
+                              .arg(QDir::toNativeSeparators(edge.sourcePath))
+                              .arg(edge.rawTarget)
+                              .arg(edge.sourceLine));
+        }
+
+        const bool checksOk = tableFound
+            && idxSource
+            && idxTarget
+            && idxType
+            && scanEdgesCount > 0
+            && !rootEdges.isEmpty()
+            && hasIncludeType
+            && hasImportOrRequireType
+            && resolvedCount > 0
+            && unresolvedCount > 0
+            && !outgoing.isEmpty()
+            && !incoming.isEmpty();
+
+        log.writeLine(QStringLiteral("validation_checks_ok=%1").arg(checksOk ? QStringLiteral("true") : QStringLiteral("false")));
+        if (!checksOk) {
+            store.shutdown();
+            return finishFail(536, QStringLiteral("reference_smoke_checks_failed"));
+        }
+
+        store.shutdown();
+        log.writeLine(QStringLiteral("final_status=PASS"));
+        log.writeLine(QStringLiteral("exit_code=0"));
+        log.writeLine(QStringLiteral("failure_reason="));
+        log.writeLine(QStringLiteral("timestamp_utc_end=%1").arg(QDateTime::currentDateTimeUtc().toString(Qt::ISODate)));
+        return 0;
+    } catch (const std::exception& ex) {
+        writeStderrLine(QStringLiteral("reference_smoke_error=unexpected_exception"));
+        return finishFail(537, QStringLiteral("unexpected_exception:%1").arg(QString::fromLocal8Bit(ex.what())));
+    } catch (...) {
+        writeStderrLine(QStringLiteral("reference_smoke_error=unexpected_error"));
+        return finishFail(538, QStringLiteral("unexpected_error"));
+    }
 }
 
 int runQueryLangSmokeCli(int argc, char* argv[])
@@ -3422,6 +3854,10 @@ bool writeLogFile(const QString& logPath, const QStringList& lines)
 
 int main(int argc, char* argv[])
 {
+    if (hasReferenceSmokeFlag(argc, argv)) {
+        return runReferenceSmokeCli(argc, argv);
+    }
+
     if (hasArchiveSnapshotSmokeFlag(argc, argv)) {
         return runArchiveSnapshotSmokeCli(argc, argv);
     }

@@ -108,6 +108,13 @@ bool DbMigrations::migrate(DbConnection& connection, QString* migrationLog)
         }
     }
 
+    if (ok && current < 5) {
+        ok = applyV5(connection, &errorText);
+        if (migrationLog) {
+            migrationLog->append(ok ? QStringLiteral("applied_v5=true\n") : QStringLiteral("applied_v5=false\n"));
+        }
+    }
+
     if (!ok) {
         connection.rollback();
         if (migrationLog) {
@@ -426,4 +433,28 @@ bool DbMigrations::applyV4(DbConnection& connection, QString* errorText)
         QStringLiteral("CREATE INDEX IF NOT EXISTS idx_snapshot_entries_archive_entry_path ON snapshot_entries(archive_entry_path);")
     };
     return execBatch(db, statements, errorText);
+}
+
+bool DbMigrations::applyV5(DbConnection& connection, QString* errorText)
+{
+    const QStringList statements = {
+        QStringLiteral("CREATE TABLE IF NOT EXISTS reference_edges(" \
+                       "id INTEGER PRIMARY KEY AUTOINCREMENT," \
+                       "source_root TEXT," \
+                       "source_path TEXT NOT NULL," \
+                       "target_path TEXT," \
+                       "raw_target TEXT NOT NULL," \
+                       "reference_type TEXT NOT NULL," \
+                       "resolved_flag INTEGER NOT NULL DEFAULT 0," \
+                       "confidence TEXT NOT NULL," \
+                       "source_line INTEGER," \
+                       "created_utc TEXT NOT NULL," \
+                       "extractor_version TEXT" \
+                       ");"),
+        QStringLiteral("CREATE INDEX IF NOT EXISTS idx_reference_edges_source ON reference_edges(source_path);"),
+        QStringLiteral("CREATE INDEX IF NOT EXISTS idx_reference_edges_target ON reference_edges(target_path);"),
+        QStringLiteral("CREATE INDEX IF NOT EXISTS idx_reference_edges_type ON reference_edges(reference_type);"),
+        QStringLiteral("CREATE INDEX IF NOT EXISTS idx_reference_edges_source_root ON reference_edges(source_root);")
+    };
+    return execBatch(connection.database(), statements, errorText);
 }
