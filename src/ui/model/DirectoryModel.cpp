@@ -81,6 +81,20 @@ QueryResult DirectoryModel::query(const Request& request)
     return result;
 }
 
+QueryResult DirectoryModel::queryGraph(const QString& rootPath,
+                                       QueryGraphMode mode,
+                                       const QString& graphTarget,
+                                       const QueryOptions& options)
+{
+    QueryResult result;
+    if (!isReady()) {
+        result.ok = false;
+        result.errorText = QStringLiteral("directory_model_not_ready");
+        return result;
+    }
+    return m_visionService->queryGraph(rootPath, mode, graphTarget, options);
+}
+
 RefreshRequestResult DirectoryModel::requestRefresh(const QString& path,
                                                    bool force,
                                                    const QString& mode,

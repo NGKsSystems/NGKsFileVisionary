@@ -6,6 +6,7 @@
 #include "ViewModeController.h"
 #include "core/services/RefreshTypes.h"
 #include "core/query/QueryTypes.h"
+#include "core/querylang/QueryPlan.h"
 
 class VisionIndexService;
 namespace ArchiveNav {
@@ -40,6 +41,10 @@ public:
     bool isReady() const;
 
     QueryResult query(const Request& request);
+    QueryResult queryGraph(const QString& rootPath,
+                           QueryGraphMode mode,
+                           const QString& graphTarget,
+                           const QueryOptions& options);
     RefreshRequestResult requestRefresh(const QString& path,
                                         bool force,
                                         const QString& mode = QStringLiteral("visible_refresh"),

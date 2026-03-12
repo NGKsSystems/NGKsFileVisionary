@@ -126,6 +126,24 @@ QueryResult VisionIndexService::queryHierarchy(const QString& path, const QueryO
     return result;
 }
 
+QueryResult VisionIndexService::queryGraph(const QString& rootPath,
+                                           QueryGraphMode mode,
+                                           const QString& graphTarget,
+                                           const QueryOptions& options)
+{
+    QueryResult result;
+    if (!isReady()) {
+        result.ok = false;
+        result.errorText = QStringLiteral("vision_index_not_ready");
+        return result;
+    }
+
+    return m_queryCore->queryGraph(QDir::fromNativeSeparators(QDir::cleanPath(rootPath)),
+                                   mode,
+                                   graphTarget,
+                                   options);
+}
+
 RefreshRequestResult VisionIndexService::requestRefresh(const QString& path,
                                                         const QString& mode,
                                                         bool force,

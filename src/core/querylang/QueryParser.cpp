@@ -175,9 +175,23 @@ bool parseSingleToken(const QString& term, bool negated, ParsedToken* out, QStri
     }
 
     const int sep = term.indexOf(':');
-    if (sep <= 0 || sep >= term.size() - 1) {
+    if (sep <= 0) {
         if (error) {
             *error = QStringLiteral("malformed_token:%1").arg(term);
+        }
+        return false;
+    }
+
+    if (sep >= term.size() - 1) {
+        const QString graphKey = term.left(sep).trimmed().toLower();
+        if (graphKey == QStringLiteral("references") || graphKey == QStringLiteral("usedby")) {
+            if (error) {
+                *error = QStringLiteral("missing_graph_target:%1").arg(graphKey);
+            }
+            return false;
+        }
+        if (error) {
+            *error = QStringLiteral("missing_value_for:%1").arg(graphKey);
         }
         return false;
     }
@@ -363,6 +377,28 @@ bool applyParsedToken(const ParsedToken& token, QueryPlan* plan, QString* error)
         return true;
     }
 
+    if (key == QStringLiteral("references") || key == QStringLiteral("usedby")) {
+        if (token.negated) {
+            if (error) {
+                *error = QStringLiteral("unsupported_not_for:%1").arg(key);
+            }
+            return false;
+        }
+
+        const QueryGraphMode parsedMode = (key == QStringLiteral("references"))
+            ? QueryGraphMode::References
+            : QueryGraphMode::UsedBy;
+        if (plan->graphMode != QueryGraphMode::None && plan->graphMode != parsedMode) {
+            if (error) {
+                *error = QStringLiteral("conflicting_graph_modes");
+            }
+            return false;
+        }
+        plan->graphMode = parsedMode;
+        plan->graphTarget = QDir::fromNativeSeparators(QDir::cleanPath(value));
+        return true;
+    }
+
     if (key == QStringLiteral("hidden")) {
         if (token.negated) {
             if (error) {
@@ -426,6 +462,13 @@ bool applyOrTokenPair(const ParsedToken& left, const ParsedToken& right, QueryPl
         return false;
     }
 
+    if (left.key == QStringLiteral("references") || left.key == QStringLiteral("usedby")) {
+        if (error) {
+            *error = QStringLiteral("unsupported_or_for_graph_query");
+        }
+        return false;
+    }
+
     if (left.key == QStringLiteral("ext")) {
         QStringList merged;
         const QStringList leftParts = left.value.split(',', Qt::SkipEmptyParts);
@@ -476,6 +519,9 @@ QueryParseResult QueryParser::parse(const QString& queryString) const
     }
 
     bool negateNext = false;
+    bool sawGraphToken = false;
+    bool sawNonGraphToken = false;
+    bool sawNonSortOrderToken = false;
     for (int i = 0; i < terms.size(); ++i) {
         const QString term = terms.at(i);
         if (term.compare(QStringLiteral("NOT"), Qt::CaseInsensitive) == 0) {
@@ -498,6 +544,11 @@ QueryParseResult QueryParser::parse(const QString& queryString) const
         }
         negateNext = false;
 
+        const bool leftIsGraph = left.key == QStringLiteral("references") || left.key == QStringLiteral("usedby");
+        const bool leftIsSortOrder = left.key == QStringLiteral("sort") || left.key == QStringLiteral("order");
+        const bool leftIsNonGraph = !leftIsGraph;
+        const bool leftIsNonSortOrder = !leftIsGraph && !leftIsSortOrder;
+
         const bool hasOr = (i + 1) < terms.size()
             && terms.at(i + 1).compare(QStringLiteral("OR"), Qt::CaseInsensitive) == 0;
         if (hasOr) {
@@ -509,8 +560,19 @@ QueryParseResult QueryParser::parse(const QString& queryString) const
             if (!parseSingleToken(terms.at(i + 2), false, &right, &result.errorMessage)) {
                 return result;
             }
+
+            const bool rightIsGraph = right.key == QStringLiteral("references") || right.key == QStringLiteral("usedby");
+            if (leftIsGraph || rightIsGraph) {
+                result.errorMessage = QStringLiteral("unsupported_or_for_graph_query");
+                return result;
+            }
+
             if (!applyOrTokenPair(left, right, &plan, &result.errorMessage)) {
                 return result;
+            }
+            sawNonGraphToken = true;
+            if (!(left.key == QStringLiteral("sort") || left.key == QStringLiteral("order"))) {
+                sawNonSortOrderToken = true;
             }
             i += 2;
             continue;
@@ -519,11 +581,37 @@ QueryParseResult QueryParser::parse(const QString& queryString) const
         if (!applyParsedToken(left, &plan, &result.errorMessage)) {
             return result;
         }
+
+        if (leftIsGraph) {
+            sawGraphToken = true;
+        }
+        if (leftIsNonGraph) {
+            sawNonGraphToken = true;
+        }
+        if (leftIsNonSortOrder) {
+            sawNonSortOrderToken = true;
+        }
+
+        if (sawGraphToken && sawNonSortOrderToken) {
+            result.errorMessage = QStringLiteral("unsupported_graph_combination");
+            return result;
+        }
     }
 
     if (negateNext) {
         result.errorMessage = QStringLiteral("dangling_not_operator");
         return result;
+    }
+
+    if (plan.graphMode != QueryGraphMode::None) {
+        if (plan.graphTarget.trimmed().isEmpty()) {
+            result.errorMessage = QStringLiteral("missing_graph_target");
+            return result;
+        }
+        if (sawNonGraphToken && sawNonSortOrderToken) {
+            result.errorMessage = QStringLiteral("unsupported_graph_combination");
+            return result;
+        }
     }
 
     result.ok = true;

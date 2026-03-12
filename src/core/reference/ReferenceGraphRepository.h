@@ -1,6 +1,7 @@
 #pragma once
 
 #include <QString>
+#include <QStringList>
 #include <QVector>
 
 #include "ReferenceEdge.h"
@@ -26,6 +27,13 @@ public:
     bool listBySourceRoot(const QString& sourceRoot,
                           QVector<ReferenceEdge>* out,
                           QString* errorText = nullptr) const;
+
+    bool listDistinctSourcePathsByRoot(const QString& sourceRoot,
+                                       QStringList* out,
+                                       QString* errorText = nullptr) const;
+    bool listDistinctTargetPathsByRoot(const QString& sourceRoot,
+                                       QStringList* out,
+                                       QString* errorText = nullptr) const;
 
 private:
     MetaStore& m_store;

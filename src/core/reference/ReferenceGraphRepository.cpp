@@ -3,6 +3,7 @@
 #include <QSqlDatabase>
 #include <QSqlError>
 #include <QSqlQuery>
+#include <QStringList>
 
 #include "core/db/MetaStore.h"
 #include "core/db/SqlHelpers.h"
@@ -204,6 +205,84 @@ bool ReferenceGraphRepository::listBySourceRoot(const QString& sourceRoot,
 
     while (q.next()) {
         out->push_back(fromQuery(q));
+    }
+    return true;
+}
+
+bool ReferenceGraphRepository::listDistinctSourcePathsByRoot(const QString& sourceRoot,
+                                                             QStringList* out,
+                                                             QString* errorText) const
+{
+    if (!out) {
+        if (errorText) {
+            *errorText = QStringLiteral("null_output_list");
+        }
+        return false;
+    }
+
+    QSqlDatabase db = m_store.database();
+    if (!db.isValid() || !db.isOpen()) {
+        if (errorText) {
+            *errorText = QStringLiteral("metastore_not_ready");
+        }
+        return false;
+    }
+
+    out->clear();
+    QSqlQuery q(db);
+    q.prepare(QStringLiteral(
+        "SELECT DISTINCT source_path "
+        "FROM reference_edges WHERE source_root=? "
+        "ORDER BY source_path ASC;"));
+    q.addBindValue(sourceRoot);
+    if (!q.exec()) {
+        if (errorText) {
+            *errorText = q.lastError().text();
+        }
+        return false;
+    }
+
+    while (q.next()) {
+        out->append(q.value(0).toString());
+    }
+    return true;
+}
+
+bool ReferenceGraphRepository::listDistinctTargetPathsByRoot(const QString& sourceRoot,
+                                                             QStringList* out,
+                                                             QString* errorText) const
+{
+    if (!out) {
+        if (errorText) {
+            *errorText = QStringLiteral("null_output_list");
+        }
+        return false;
+    }
+
+    QSqlDatabase db = m_store.database();
+    if (!db.isValid() || !db.isOpen()) {
+        if (errorText) {
+            *errorText = QStringLiteral("metastore_not_ready");
+        }
+        return false;
+    }
+
+    out->clear();
+    QSqlQuery q(db);
+    q.prepare(QStringLiteral(
+        "SELECT DISTINCT target_path "
+        "FROM reference_edges WHERE source_root=? "
+        "ORDER BY target_path ASC;"));
+    q.addBindValue(sourceRoot);
+    if (!q.exec()) {
+        if (errorText) {
+            *errorText = q.lastError().text();
+        }
+        return false;
+    }
+
+    while (q.next()) {
+        out->append(q.value(0).toString());
     }
     return true;
 }

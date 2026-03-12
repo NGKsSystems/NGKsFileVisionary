@@ -30,6 +30,10 @@ struct QueryPlan
     QueryComparator modifiedAgeComparator = QueryComparator::None;
     qint64 modifiedAgeSeconds = 0;
 
+    QueryGraphMode graphMode = QueryGraphMode::None;
+    QString graphTarget;
+    QString graphMatchPrecedence = QStringLiteral("exact_path_then_suffix_then_basename");
+
     QueryOptions toQueryOptions(const QString& runtimeRoot) const;
     QString resolveRootPath(const QString& runtimeRoot) const;
 

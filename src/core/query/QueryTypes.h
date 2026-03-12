@@ -21,6 +21,13 @@ enum class QueryComparator
     GreaterEqual = 4,
 };
 
+enum class QueryGraphMode
+{
+    None = 0,
+    References = 1,
+    UsedBy = 2,
+};
+
 struct QueryOptions
 {
     bool includeHidden = false;
@@ -71,6 +78,14 @@ struct QueryRow
     bool systemFlag = false;
     bool archiveFlag = false;
     bool existsFlag = true;
+
+    bool hasGraphEdge = false;
+    QString graphSourcePath;
+    QString graphTargetPath;
+    QString graphReferenceType;
+    bool graphResolvedFlag = false;
+    QString graphConfidence;
+    int graphSourceLine = 0;
 
     int depth = -1;
 };

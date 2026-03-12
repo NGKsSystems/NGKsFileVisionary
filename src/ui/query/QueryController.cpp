@@ -54,6 +54,15 @@ QueryController::ExecutionResult QueryController::execute(const QString& querySt
 
     const QueryOptions options = plan.toQueryOptions(runtimeRoot);
 
+    if (plan.graphMode != QueryGraphMode::None) {
+        out.queryResult = m_directoryModel->queryGraph(out.executionRoot,
+                                                       plan.graphMode,
+                                                       plan.graphTarget,
+                                                       options);
+        out.ok = out.queryResult.ok;
+        return out;
+    }
+
     DirectoryModel::Request request;
     request.rootPath = out.executionRoot;
     request.mode = viewMode;

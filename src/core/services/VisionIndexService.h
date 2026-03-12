@@ -27,6 +27,10 @@ public:
     QueryResult queryChildren(const QString& path, const QueryOptions& options);
     QueryResult queryFlat(const QString& path, const QueryOptions& options);
     QueryResult queryHierarchy(const QString& path, const QueryOptions& options);
+    QueryResult queryGraph(const QString& rootPath,
+                           QueryGraphMode mode,
+                           const QString& graphTarget,
+                           const QueryOptions& options);
 
     RefreshRequestResult requestRefresh(const QString& path,
                                         const QString& mode,

@@ -165,6 +165,16 @@ struct ReferenceSmokeCliOptions {
     QString parseError;
 };
 
+struct ReferenceQuerySmokeCliOptions {
+    bool enabled = false;
+    QString referenceRoot;
+    QString referenceDbPath;
+    QString referenceQuery;
+    QString referenceLogPath;
+    QStringList argsReceived;
+    QString parseError;
+};
+
 class IndexSmokeLogWriter {
 public:
     bool open(const QString& logPath, QString* error)
@@ -312,6 +322,16 @@ bool hasReferenceSmokeFlag(int argc, char* argv[])
 {
     for (int i = 1; i < argc; ++i) {
         if (QString::fromLocal8Bit(argv[i]) == QStringLiteral("--reference-smoke")) {
+            return true;
+        }
+    }
+    return false;
+}
+
+bool hasReferenceQuerySmokeFlag(int argc, char* argv[])
+{
+    for (int i = 1; i < argc; ++i) {
+        if (QString::fromLocal8Bit(argv[i]) == QStringLiteral("--reference-query-smoke")) {
             return true;
         }
     }
@@ -924,6 +944,73 @@ ReferenceSmokeCliOptions parseReferenceSmokeOptions(int argc, char* argv[])
 
         if (token == QStringLiteral("--reference-db-path")) {
             if (!consumeValue(&options.referenceDbPath)) {
+                break;
+            }
+            continue;
+        }
+
+        if (token == QStringLiteral("--reference-log")) {
+            if (!consumeValue(&options.referenceLogPath)) {
+                break;
+            }
+            continue;
+        }
+    }
+
+    return options;
+}
+
+ReferenceQuerySmokeCliOptions parseReferenceQuerySmokeOptions(int argc, char* argv[])
+{
+    ReferenceQuerySmokeCliOptions options;
+
+    for (int i = 0; i < argc; ++i) {
+        options.argsReceived << QString::fromLocal8Bit(argv[i]);
+    }
+
+    for (int i = 1; i < argc; ++i) {
+        const QString token = QString::fromLocal8Bit(argv[i]);
+        if (token == QStringLiteral("--reference-query-smoke")) {
+            options.enabled = true;
+            continue;
+        }
+
+        auto consumeValue = [&](QString* out) {
+            if ((i + 1) >= argc) {
+                options.parseError = QStringLiteral("missing_value_for_%1").arg(token);
+                return false;
+            }
+            ++i;
+            *out = QDir::cleanPath(QString::fromLocal8Bit(argv[i]));
+            return true;
+        };
+
+        auto consumeRawValue = [&](QString* out) {
+            if ((i + 1) >= argc) {
+                options.parseError = QStringLiteral("missing_value_for_%1").arg(token);
+                return false;
+            }
+            ++i;
+            *out = QString::fromLocal8Bit(argv[i]);
+            return true;
+        };
+
+        if (token == QStringLiteral("--reference-root")) {
+            if (!consumeValue(&options.referenceRoot)) {
+                break;
+            }
+            continue;
+        }
+
+        if (token == QStringLiteral("--reference-db-path")) {
+            if (!consumeValue(&options.referenceDbPath)) {
+                break;
+            }
+            continue;
+        }
+
+        if (token == QStringLiteral("--reference-query")) {
+            if (!consumeRawValue(&options.referenceQuery)) {
                 break;
             }
             continue;
@@ -1589,6 +1676,326 @@ int runReferenceSmokeCli(int argc, char* argv[])
     }
 }
 
+int runReferenceQuerySmokeCli(int argc, char* argv[])
+{
+    QCoreApplication cliApp(argc, argv);
+
+    const ReferenceQuerySmokeCliOptions options = parseReferenceQuerySmokeOptions(argc, argv);
+    const QString exePath = QFileInfo(QString::fromLocal8Bit(argv[0])).absoluteFilePath();
+    const QString cwd = QDir::currentPath();
+
+    if (!options.parseError.isEmpty()) {
+        writeStderrLine(QStringLiteral("reference_query_smoke_parse_error=%1").arg(options.parseError));
+        return 539;
+    }
+
+    if (options.referenceLogPath.trimmed().isEmpty()) {
+        writeStderrLine(QStringLiteral("reference_query_smoke_error=missing_required_arg_--reference-log"));
+        return 540;
+    }
+
+    IndexSmokeLogWriter log;
+    QString logOpenError;
+    if (!log.open(options.referenceLogPath, &logOpenError)) {
+        writeStderrLine(QStringLiteral("reference_query_smoke_error=log_open_failed"));
+        writeStderrLine(QStringLiteral("reference_query_smoke_log_path=%1").arg(QDir::toNativeSeparators(options.referenceLogPath)));
+        writeStderrLine(QStringLiteral("reference_query_smoke_log_error=%1").arg(logOpenError));
+        return 541;
+    }
+
+    auto finishFail = [&](int exitCode, const QString& reason) {
+        log.writeLine(QStringLiteral("final_status=FAIL"));
+        log.writeLine(QStringLiteral("exit_code=%1").arg(exitCode));
+        log.writeLine(QStringLiteral("failure_reason=%1").arg(reason));
+        log.writeLine(QStringLiteral("timestamp_utc_end=%1").arg(QDateTime::currentDateTimeUtc().toString(Qt::ISODate)));
+        return exitCode;
+    };
+
+    auto writeTextFile = [](const QString& filePath, const QString& content, QString* errorText) {
+        const QFileInfo fileInfo(filePath);
+        if (!QDir().mkpath(fileInfo.absolutePath())) {
+            if (errorText) {
+                *errorText = QStringLiteral("create_parent_dir_failed:%1").arg(fileInfo.absolutePath());
+            }
+            return false;
+        }
+
+        QFile out(filePath);
+        if (!out.open(QIODevice::WriteOnly | QIODevice::Text | QIODevice::Truncate)) {
+            if (errorText) {
+                *errorText = QStringLiteral("open_write_failed:%1").arg(out.errorString());
+            }
+            return false;
+        }
+
+        QTextStream ts(&out);
+        ts << content;
+        ts.flush();
+        out.close();
+        return true;
+    };
+
+    try {
+        if (options.referenceRoot.trimmed().isEmpty()) {
+            return finishFail(542, QStringLiteral("missing_required_arg_--reference-root"));
+        }
+        if (options.referenceDbPath.trimmed().isEmpty()) {
+            return finishFail(543, QStringLiteral("missing_required_arg_--reference-db-path"));
+        }
+        if (options.referenceQuery.trimmed().isEmpty()) {
+            return finishFail(544, QStringLiteral("missing_required_arg_--reference-query"));
+        }
+
+        log.writeLine(QStringLiteral("mode=reference_query_smoke"));
+        log.writeLine(QStringLiteral("startup_banner=REFERENCE_QUERY_SMOKE_BEGIN"));
+        log.writeLine(QStringLiteral("exe_path=%1").arg(QDir::toNativeSeparators(exePath)));
+        log.writeLine(QStringLiteral("cwd=%1").arg(QDir::toNativeSeparators(cwd)));
+        log.writeLine(QStringLiteral("args_received=%1").arg(options.argsReceived.join(QStringLiteral(" | "))));
+        log.writeLine(QStringLiteral("reference_query=%1").arg(options.referenceQuery));
+        log.writeLine(QStringLiteral("query_execution_source=stored_reference_edges_only"));
+        log.writeLine(QStringLiteral("timestamp_utc=%1").arg(QDateTime::currentDateTimeUtc().toString(Qt::ISODate)));
+
+        const QString normalizedParentRoot = QDir::fromNativeSeparators(
+            QDir::cleanPath(QFileInfo(options.referenceRoot).absoluteFilePath()));
+        if (!QDir().mkpath(normalizedParentRoot)) {
+            return finishFail(545, QStringLiteral("unable_to_create_reference_root"));
+        }
+
+        const QString sampleRoot = QDir(normalizedParentRoot).filePath(QStringLiteral("sample_ref_root"));
+        QDir sampleRootDir(sampleRoot);
+        if (sampleRootDir.exists() && !sampleRootDir.removeRecursively()) {
+            return finishFail(546, QStringLiteral("cleanup_existing_sample_root_failed"));
+        }
+        if (!QDir().mkpath(sampleRoot)) {
+            return finishFail(547, QStringLiteral("sample_root_create_failed"));
+        }
+
+        QString writeError;
+        if (!writeTextFile(QDir(sampleRoot).filePath(QStringLiteral("src/parser.h")),
+                           QStringLiteral("#pragma once\nint parse_value();\n"),
+                           &writeError)
+            || !writeTextFile(QDir(sampleRoot).filePath(QStringLiteral("src/main.cpp")),
+                              QStringLiteral("#include \"parser.h\"\nint main(){return 0;}\n"),
+                              &writeError)
+            || !writeTextFile(QDir(sampleRoot).filePath(QStringLiteral("src/parser.cpp")),
+                              QStringLiteral("#include \"parser.h\"\nint parse_value(){return 1;}\n"),
+                              &writeError)
+            || !writeTextFile(QDir(sampleRoot).filePath(QStringLiteral("src/config.json")),
+                              QStringLiteral("{\"logo\":\"../assets/logo.png\"}\n"),
+                              &writeError)
+            || !writeTextFile(QDir(sampleRoot).filePath(QStringLiteral("assets/logo.png")),
+                              QStringLiteral("png-placeholder\n"),
+                              &writeError)
+            || !writeTextFile(QDir(sampleRoot).filePath(QStringLiteral("scripts/build.py")),
+                              QStringLiteral("CONFIG = \"../src/config.json\"\n"),
+                              &writeError)
+            || !writeTextFile(QDir(sampleRoot).filePath(QStringLiteral("web/util.js")),
+                              QStringLiteral("module.exports = { ok: true };\n"),
+                              &writeError)
+            || !writeTextFile(QDir(sampleRoot).filePath(QStringLiteral("web/app.js")),
+                              QStringLiteral("const util = require(\"./util.js\");\nconsole.log(util);\n"),
+                              &writeError)) {
+            return finishFail(548, QStringLiteral("sample_write_failed:%1").arg(writeError));
+        }
+        log.writeLine(QStringLiteral("sample_root=%1").arg(QDir::toNativeSeparators(sampleRoot)));
+
+        MetaStore store;
+        QString errorText;
+        QString migrationLog;
+        if (!store.initialize(options.referenceDbPath, &errorText, &migrationLog)) {
+            return finishFail(549, QStringLiteral("db_init_failure:%1").arg(errorText));
+        }
+        if (!migrationLog.isEmpty()) {
+            log.writeLine(QStringLiteral("migration_log_begin"));
+            log.writeLine(migrationLog.trimmed());
+            log.writeLine(QStringLiteral("migration_log_end"));
+        }
+
+        const QString normalizedSampleRoot = QDir::fromNativeSeparators(QDir::cleanPath(sampleRoot));
+
+        IndexRootRecord indexRoot;
+        indexRoot.rootPath = normalizedSampleRoot;
+        indexRoot.status = QStringLiteral("active");
+        indexRoot.createdUtc = SqlHelpers::utcNowIso();
+        indexRoot.updatedUtc = indexRoot.createdUtc;
+        if (!store.upsertIndexRoot(indexRoot, nullptr, &errorText)) {
+            store.shutdown();
+            return finishFail(550, QStringLiteral("upsert_index_root_failed:%1").arg(errorText));
+        }
+
+        VolumeRecord volume;
+        volume.volumeKey = QStringLiteral("reference_query_smoke:%1").arg(normalizedSampleRoot.toLower());
+        volume.rootPath = normalizedSampleRoot;
+        volume.displayName = QFileInfo(normalizedSampleRoot).fileName();
+        volume.fsType = QStringLiteral("native");
+        volume.serialNumber = QStringLiteral("reference_query_smoke");
+        qint64 volumeId = 0;
+        if (!store.upsertVolume(volume, &volumeId, &errorText)) {
+            store.shutdown();
+            return finishFail(551, QStringLiteral("upsert_volume_failed:%1").arg(errorText));
+        }
+
+        IndexSmokePassResult indexPass;
+        if (!runSynchronousIndexPass(store, volumeId, normalizedSampleRoot, 1, &indexPass, &errorText)) {
+            store.shutdown();
+            return finishFail(552, QStringLiteral("index_pass_failed:%1").arg(errorText));
+        }
+
+        ReferenceGraph::ReferenceGraphEngine referenceEngine(store);
+        qint64 storedEdges = 0;
+        if (!referenceEngine.scanReferencesUnderRoot(normalizedSampleRoot, &storedEdges, &errorText)) {
+            store.shutdown();
+            return finishFail(553, QStringLiteral("reference_scan_failed:%1").arg(errorText));
+        }
+        log.writeLine(QStringLiteral("stored_reference_edges=%1").arg(storedEdges));
+
+        QueryParser parser;
+        const QueryParseResult parseResult = parser.parse(options.referenceQuery);
+        log.writeLine(QStringLiteral("parse_ok=%1").arg(parseResult.ok ? QStringLiteral("true") : QStringLiteral("false")));
+        if (!parseResult.ok) {
+            log.writeLine(QStringLiteral("parse_error=%1").arg(parseResult.errorMessage));
+            store.shutdown();
+            return finishFail(554, QStringLiteral("query_parse_failed:%1").arg(parseResult.errorMessage));
+        }
+
+        const QueryPlan plan = parseResult.plan;
+        if (plan.graphMode == QueryGraphMode::None) {
+            store.shutdown();
+            return finishFail(555, QStringLiteral("not_graph_query"));
+        }
+
+        auto matchPathsByHint = [](const QStringList& candidates,
+                                   const QString& sourceRoot,
+                                   const QString& rawHint) {
+            const QString hint = QDir::fromNativeSeparators(QDir::cleanPath(rawHint));
+            if (hint.trimmed().isEmpty()) {
+                return QStringList{};
+            }
+
+            QStringList exactMatches;
+            QStringList suffixMatches;
+            QStringList basenameMatches;
+
+            QStringList exactCandidates;
+            exactCandidates.push_back(hint);
+            if (!QFileInfo(hint).isAbsolute()) {
+                exactCandidates.push_back(QDir::fromNativeSeparators(QDir::cleanPath(QDir(sourceRoot).filePath(hint))));
+            }
+
+            const QString basenameNeedle = QFileInfo(hint).fileName().toLower();
+            for (const QString& candidateRaw : candidates) {
+                const QString candidate = QDir::fromNativeSeparators(QDir::cleanPath(candidateRaw));
+
+                bool exact = false;
+                for (const QString& exactCandidate : exactCandidates) {
+                    if (candidate.compare(exactCandidate, Qt::CaseInsensitive) == 0) {
+                        exact = true;
+                        break;
+                    }
+                }
+                if (exact) {
+                    if (!exactMatches.contains(candidate, Qt::CaseInsensitive)) {
+                        exactMatches.push_back(candidate);
+                    }
+                    continue;
+                }
+
+                if (hint.contains('/')) {
+                    const QString suffixToken = QStringLiteral("/") + hint;
+                    if (candidate.endsWith(hint, Qt::CaseInsensitive)
+                        || candidate.endsWith(suffixToken, Qt::CaseInsensitive)) {
+                        if (!suffixMatches.contains(candidate, Qt::CaseInsensitive)) {
+                            suffixMatches.push_back(candidate);
+                        }
+                        continue;
+                    }
+                }
+
+                if (!basenameNeedle.isEmpty() && QFileInfo(candidate).fileName().toLower() == basenameNeedle) {
+                    if (!basenameMatches.contains(candidate, Qt::CaseInsensitive)) {
+                        basenameMatches.push_back(candidate);
+                    }
+                }
+            }
+
+            if (!exactMatches.isEmpty()) {
+                return exactMatches;
+            }
+            if (!suffixMatches.isEmpty()) {
+                return suffixMatches;
+            }
+            return basenameMatches;
+        };
+
+        QVector<ReferenceGraph::ReferenceEdge> rootEdges;
+        if (!referenceEngine.listReferencesUnderRoot(normalizedSampleRoot, &rootEdges, &errorText)) {
+            store.shutdown();
+            return finishFail(556, QStringLiteral("list_root_edges_failed:%1").arg(errorText));
+        }
+
+        QStringList candidates;
+        for (const ReferenceGraph::ReferenceEdge& edge : rootEdges) {
+            const QString candidate = (plan.graphMode == QueryGraphMode::References) ? edge.sourcePath : edge.targetPath;
+            if (!candidate.trimmed().isEmpty() && !candidates.contains(candidate, Qt::CaseInsensitive)) {
+                candidates.push_back(candidate);
+            }
+        }
+        const QStringList matchedPaths = matchPathsByHint(candidates, normalizedSampleRoot, plan.graphTarget);
+
+        QVector<ReferenceGraph::ReferenceEdge> matchedEdges;
+        for (const QString& matchedPath : matchedPaths) {
+            QVector<ReferenceGraph::ReferenceEdge> perPath;
+            const bool ok = (plan.graphMode == QueryGraphMode::References)
+                ? referenceEngine.listOutgoingReferences(matchedPath, &perPath, &errorText)
+                : referenceEngine.listIncomingReferences(matchedPath, &perPath, &errorText);
+            if (!ok) {
+                store.shutdown();
+                return finishFail(557, QStringLiteral("graph_edge_query_failed:%1").arg(errorText));
+            }
+            matchedEdges += perPath;
+        }
+
+        const bool queryOk = true;
+        const qint64 queryCount = matchedEdges.size();
+        log.writeLine(QStringLiteral("graph_mode=%1").arg(plan.graphMode == QueryGraphMode::References
+                                ? QStringLiteral("references")
+                                : QStringLiteral("usedby")));
+        log.writeLine(QStringLiteral("graph_target=%1").arg(plan.graphTarget));
+        log.writeLine(QStringLiteral("graph_match_precedence=%1").arg(plan.graphMatchPrecedence));
+        log.writeLine(QStringLiteral("query_ok=%1").arg(queryOk ? QStringLiteral("true") : QStringLiteral("false")));
+        log.writeLine(QStringLiteral("query_total_count=%1").arg(queryCount));
+
+        const int sampleCount = qMin(20, matchedEdges.size());
+        for (int i = 0; i < sampleCount; ++i) {
+            const ReferenceGraph::ReferenceEdge& row = matchedEdges.at(i);
+            log.writeLine(QStringLiteral("row_%1 source_path=%2 target_path=%3 reference_type=%4 resolved_flag=%5 confidence=%6 source_line=%7")
+                              .arg(i)
+                              .arg(QDir::toNativeSeparators(row.sourcePath))
+                              .arg(QDir::toNativeSeparators(row.targetPath))
+                              .arg(row.referenceType)
+                              .arg(row.resolvedFlag ? QStringLiteral("true") : QStringLiteral("false"))
+                              .arg(row.confidence)
+                              .arg(row.sourceLine));
+        }
+
+        if (!queryOk) {
+            store.shutdown();
+            return finishFail(558, QStringLiteral("query_execution_failed"));
+        }
+
+        store.shutdown();
+        log.writeLine(QStringLiteral("final_status=PASS"));
+        log.writeLine(QStringLiteral("exit_code=0"));
+        log.writeLine(QStringLiteral("failure_reason="));
+        log.writeLine(QStringLiteral("timestamp_utc_end=%1").arg(QDateTime::currentDateTimeUtc().toString(Qt::ISODate)));
+        return 0;
+    } catch (const std::exception& ex) {
+        return finishFail(559, QStringLiteral("unexpected_exception:%1").arg(QString::fromLocal8Bit(ex.what())));
+    } catch (...) {
+        return finishFail(560, QStringLiteral("unexpected_error"));
+    }
+}
+
 int runQueryLangSmokeCli(int argc, char* argv[])
 {
     QCoreApplication cliApp(argc, argv);
@@ -1708,9 +2115,15 @@ int runQueryLangSmokeCli(int argc, char* argv[])
 
         QueryCore queryCore(store);
         const QueryOptions queryOptions = plan.toQueryOptions(normalizedRoot);
-        const QueryResult result = queryCore.querySearch(executionRoot, queryOptions);
+        const QueryResult result = (plan.graphMode == QueryGraphMode::None)
+            ? queryCore.querySearch(executionRoot, queryOptions)
+            : queryCore.queryGraph(executionRoot, plan.graphMode, plan.graphTarget, queryOptions);
         log.writeLine(QStringLiteral("query_ok=%1").arg(result.ok ? QStringLiteral("true") : QStringLiteral("false")));
         log.writeLine(QStringLiteral("query_total_count=%1").arg(result.totalCount));
+        log.writeLine(QStringLiteral("plan_graph_mode=%1").arg(plan.graphMode == QueryGraphMode::References
+                                    ? QStringLiteral("references")
+                                    : (plan.graphMode == QueryGraphMode::UsedBy ? QStringLiteral("usedby") : QStringLiteral("none"))));
+        log.writeLine(QStringLiteral("plan_graph_target=%1").arg(plan.graphTarget));
         if (!result.errorText.isEmpty()) {
             log.writeLine(QStringLiteral("query_error=%1").arg(result.errorText));
         }
@@ -1726,6 +2139,15 @@ int runQueryLangSmokeCli(int argc, char* argv[])
                               .arg(r.hasSizeBytes ? QString::number(r.sizeBytes) : QStringLiteral("NULL"))
                               .arg(r.modifiedUtc)
                               .arg(QDir::toNativeSeparators(r.path)));
+            if (r.hasGraphEdge) {
+                log.writeLine(QStringLiteral("graph_row source=%1 target=%2 type=%3 resolved=%4 confidence=%5 source_line=%6")
+                                  .arg(QDir::toNativeSeparators(r.graphSourcePath))
+                                  .arg(QDir::toNativeSeparators(r.graphTargetPath))
+                                  .arg(r.graphReferenceType)
+                                  .arg(r.graphResolvedFlag ? QStringLiteral("true") : QStringLiteral("false"))
+                                  .arg(r.graphConfidence)
+                                  .arg(r.graphSourceLine));
+            }
         }
 
         if (!result.ok) {
@@ -1868,7 +2290,12 @@ int runQueryBarSmokeCli(int argc, char* argv[])
                     optionsForQuery.maxDepth = 64;
                 }
 
-                if (mode == ViewModeController::UiViewMode::Standard) {
+                if (plan.graphMode != QueryGraphMode::None) {
+                    out.queryResult = queryCore.queryGraph(out.executionRoot,
+                                                           plan.graphMode,
+                                                           plan.graphTarget,
+                                                           optionsForQuery);
+                } else if (mode == ViewModeController::UiViewMode::Standard) {
                     out.queryResult = queryCore.queryChildren(out.executionRoot, optionsForQuery);
                 } else if (mode == ViewModeController::UiViewMode::Hierarchy) {
                     out.queryResult = queryCore.querySubtree(out.executionRoot, optionsForQuery);
@@ -3854,6 +4281,10 @@ bool writeLogFile(const QString& logPath, const QStringList& lines)
 
 int main(int argc, char* argv[])
 {
+    if (hasReferenceQuerySmokeFlag(argc, argv)) {
+        return runReferenceQuerySmokeCli(argc, argv);
+    }
+
     if (hasReferenceSmokeFlag(argc, argv)) {
         return runReferenceSmokeCli(argc, argv);
     }
