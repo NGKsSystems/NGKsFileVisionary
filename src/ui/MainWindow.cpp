@@ -39,6 +39,7 @@
 #include <QSpinBox>
 #include <QSplitter>
 #include <QStandardPaths>
+#include <QShortcut>
 #include <QTextStream>
 #include <QThread>
 #include <QToolBar>
@@ -53,6 +54,8 @@
 #include "TreeSnapshotPreviewDialog.h"
 #include "model/DirectoryModel.h"
 #include "model/QueryResultAdapter.h"
+#include "query/QueryBarWidget.h"
+#include "query/QueryController.h"
 #include "core/services/RefreshTypes.h"
 #include "../util/PathUtils.h"
 
@@ -96,6 +99,7 @@ MainWindow::MainWindow(bool testMode,
     setupTestSurface();
     setupScanner();
     m_directoryModel = new DirectoryModel();
+    m_queryController = new QueryController(m_directoryModel);
     m_viewModeController.setModeFromIndex(m_viewModeCombo ? m_viewModeCombo->currentIndex() : 0);
     m_viewMode = m_viewModeController.toFileViewMode();
     m_uiDbPath = resolveUiDbPath();
@@ -133,6 +137,9 @@ MainWindow::~MainWindow()
     }
     m_scannerThread.quit();
     m_scannerThread.wait();
+
+    delete m_queryController;
+    m_queryController = nullptr;
 
     delete m_directoryModel;
     m_directoryModel = nullptr;
@@ -184,6 +191,8 @@ void MainWindow::setupUi()
     m_extensionFilterEdit->setPlaceholderText(QStringLiteral(".png;.mp3;"));
     m_searchEdit = new QLineEdit(central);
     m_searchEdit->setPlaceholderText(QStringLiteral("Search substring..."));
+    m_queryBarWidget = new QueryBarWidget(central);
+    m_queryBarWidget->setObjectName(QStringLiteral("queryBarWidget"));
     row2->addWidget(m_showHiddenCheck);
     row2->addWidget(m_showSystemCheck);
     row2->addWidget(new QLabel(QStringLiteral("Ext Filter:"), central));
@@ -215,6 +224,7 @@ void MainWindow::setupUi()
 
     rootLayout->addLayout(row1);
     rootLayout->addLayout(row2);
+    rootLayout->addWidget(m_queryBarWidget);
     rootLayout->addWidget(splitter, 1);
     rootLayout->addWidget(m_statusLabel);
     setCentralWidget(central);
@@ -224,6 +234,8 @@ void MainWindow::setupUi()
     connect(m_cancelButton, &QPushButton::clicked, this, &MainWindow::onCancelScan);
     connect(m_pinCurrentButton, &QPushButton::clicked, this, &MainWindow::onPinCurrentFolder);
     connect(m_searchEdit, &QLineEdit::textChanged, this, &MainWindow::onSearchChanged);
+    connect(m_queryBarWidget, &QueryBarWidget::querySubmitted, this, &MainWindow::onQuerySubmitted);
+    connect(m_queryBarWidget, &QueryBarWidget::queryCleared, this, &MainWindow::onQueryCleared);
     connect(m_viewModeCombo, &QComboBox::currentIndexChanged, this, &MainWindow::onViewModeChanged);
     connect(m_backButton, &QPushButton::clicked, this, &MainWindow::onNavigateBack);
     connect(m_forwardButton, &QPushButton::clicked, this, &MainWindow::onNavigateForward);
@@ -232,6 +244,12 @@ void MainWindow::setupUi()
     connect(m_treeView, &QTreeView::activated, this, &MainWindow::onTreeActivated);
     connect(m_sidebarTree, &QTreeWidget::itemActivated, this, &MainWindow::onSidebarItemActivated);
     connect(m_sidebarTree, &QWidget::customContextMenuRequested, this, &MainWindow::onSidebarContextMenu);
+
+    auto* focusQueryShortcutL = new QShortcut(QKeySequence(QStringLiteral("Ctrl+L")), this);
+    connect(focusQueryShortcutL, &QShortcut::activated, this, &MainWindow::onFocusQueryBar);
+
+    auto* focusQueryShortcutF = new QShortcut(QKeySequence(QStringLiteral("Ctrl+F")), this);
+    connect(focusQueryShortcutF, &QShortcut::activated, this, &MainWindow::onFocusQueryBar);
 
     loadFavorites();
     rebuildSidebar();
@@ -698,6 +716,42 @@ void MainWindow::onSearchChanged(const QString& text)
 {
     appendRuntimeLog(QStringLiteral("search_changed text=%1").arg(text));
     onRescan();
+}
+
+void MainWindow::onQuerySubmitted(const QString& text)
+{
+    const QString query = text.trimmed();
+    if (query.isEmpty()) {
+        onQueryCleared();
+        return;
+    }
+
+    m_activeQueryString = query;
+    m_queryModeActive = true;
+
+    appendRuntimeLog(QStringLiteral("querybar_submit query=%1").arg(query));
+    m_statusLabel->setText(QStringLiteral("Query: parsing and executing..."));
+    onRescan();
+}
+
+void MainWindow::onQueryCleared()
+{
+    const bool wasActive = m_queryModeActive || !m_activeQueryString.isEmpty();
+    m_queryModeActive = false;
+    m_activeQueryString.clear();
+
+    appendRuntimeLog(QStringLiteral("querybar_cleared restore_normal_view=true"));
+    if (wasActive) {
+        m_statusLabel->setText(QStringLiteral("Query cleared. Restoring directory view..."));
+        onRescan();
+    }
+}
+
+void MainWindow::onFocusQueryBar()
+{
+    if (m_queryBarWidget) {
+        m_queryBarWidget->focusInput();
+    }
 }
 
 void MainWindow::onTreeContextMenu(const QPoint& pos)
@@ -2090,8 +2144,6 @@ void MainWindow::startScanNow()
     const QStringList extensions = PathUtils::splitExtensionsFilter(m_extensionFilterEdit->text());
     const QString search = m_searchEdit->text().trimmed();
 
-    m_fileModel.setViewMode(m_viewModeController.toFileViewMode(), root);
-
     if (!ensureDirectoryModelReady()) {
         m_statusLabel->setText(QStringLiteral("Error: db_not_ready"));
         appendRuntimeLog(QStringLiteral("ui_query_error db_not_ready path=%1").arg(m_uiDbPath));
@@ -2106,36 +2158,90 @@ void MainWindow::startScanNow()
     m_statusLabel->setText(QStringLiteral("Enumerating..."));
     m_treeView->setSortingEnabled(false);
 
-    appendRuntimeLog(QStringLiteral("ui_query_begin scan_id=%1 root=%2 mode=%3 db=%4 showHidden=%5 showSystem=%6 ext=%7 search=%8")
-                         .arg(m_activeScanId)
-                         .arg(root)
-                         .arg(static_cast<int>(m_viewModeController.mode()))
-                         .arg(m_uiDbPath)
-                         .arg(m_showHiddenCheck->isChecked() ? QStringLiteral("true") : QStringLiteral("false"))
-                         .arg(m_showSystemCheck->isChecked() ? QStringLiteral("true") : QStringLiteral("false"))
-                         .arg(extensions.join(';'))
-                         .arg(search));
+    QueryResult result;
+    QString effectiveRoot = root;
+    const bool queryActive = m_queryModeActive && !m_activeQueryString.trimmed().isEmpty();
+    if (queryActive) {
+        appendRuntimeLog(QStringLiteral("ui_querybar_begin scan_id=%1 root=%2 mode=%3 db=%4 query=%5")
+                             .arg(m_activeScanId)
+                             .arg(root)
+                             .arg(static_cast<int>(m_viewModeController.mode()))
+                             .arg(m_uiDbPath)
+                             .arg(m_activeQueryString));
 
-    DirectoryModel::Request request;
-    request.rootPath = root;
-    request.mode = m_viewModeController.mode();
-    request.includeHidden = m_showHiddenCheck->isChecked();
-    request.includeSystem = m_showSystemCheck->isChecked();
-    request.foldersFirst = true;
-    request.extensionFilter = extensions.join(';');
-    request.substringFilter = search;
-    request.sortField = currentQuerySortField();
-    request.ascending = m_treeView->header()->sortIndicatorOrder() == Qt::AscendingOrder;
-    request.maxDepth = request.mode == ViewModeController::UiViewMode::Hierarchy ? 64 : -1;
-    request.filesOnly = request.mode == ViewModeController::UiViewMode::Flat;
+        if (!m_queryController) {
+            m_scanInProgress = false;
+            m_statusLabel->setText(QStringLiteral("Error: query_controller_not_ready"));
+            appendRuntimeLog(QStringLiteral("ui_querybar_failed error=query_controller_not_ready"));
+            return;
+        }
 
-    const QueryResult result = m_directoryModel->query(request);
+        const QueryController::ExecutionResult queryExec = m_queryController->execute(
+            m_activeQueryString,
+            root,
+            m_viewModeController.mode(),
+            m_showHiddenCheck->isChecked(),
+            m_showSystemCheck->isChecked(),
+            currentQuerySortField(),
+            m_treeView->header()->sortIndicatorOrder() == Qt::AscendingOrder);
+
+        appendRuntimeLog(QStringLiteral("ui_querybar_parse parse_ok=%1 parse_error=%2 duplicate_policy=%3")
+                             .arg(queryExec.parseOk ? QStringLiteral("true") : QStringLiteral("false"))
+                             .arg(queryExec.parseError)
+                             .arg(queryExec.parseResult.duplicatePolicy));
+
+        if (!queryExec.parseOk) {
+            m_scanInProgress = false;
+            m_treeView->setSortingEnabled(true);
+            m_statusLabel->setText(QStringLiteral("Query parse error: %1").arg(queryExec.parseError));
+            appendRuntimeLog(QStringLiteral("ui_querybar_failed phase=parse error=%1").arg(queryExec.parseError));
+            return;
+        }
+
+        effectiveRoot = queryExec.executionRoot;
+        result = queryExec.queryResult;
+        appendRuntimeLog(QStringLiteral("ui_querybar_execution query_ok=%1 rows=%2 execution_root=%3 query_execution_source=indexed_db_querycore_only")
+                             .arg(result.ok ? QStringLiteral("true") : QStringLiteral("false"))
+                             .arg(result.totalCount)
+                             .arg(effectiveRoot));
+    } else {
+        appendRuntimeLog(QStringLiteral("ui_query_begin scan_id=%1 root=%2 mode=%3 db=%4 showHidden=%5 showSystem=%6 ext=%7 search=%8")
+                             .arg(m_activeScanId)
+                             .arg(root)
+                             .arg(static_cast<int>(m_viewModeController.mode()))
+                             .arg(m_uiDbPath)
+                             .arg(m_showHiddenCheck->isChecked() ? QStringLiteral("true") : QStringLiteral("false"))
+                             .arg(m_showSystemCheck->isChecked() ? QStringLiteral("true") : QStringLiteral("false"))
+                             .arg(extensions.join(';'))
+                             .arg(search));
+
+        DirectoryModel::Request request;
+        request.rootPath = root;
+        request.mode = m_viewModeController.mode();
+        request.includeHidden = m_showHiddenCheck->isChecked();
+        request.includeSystem = m_showSystemCheck->isChecked();
+        request.foldersFirst = true;
+        request.extensionFilter = extensions.join(';');
+        request.substringFilter = search;
+        request.sortField = currentQuerySortField();
+        request.ascending = m_treeView->header()->sortIndicatorOrder() == Qt::AscendingOrder;
+        request.maxDepth = request.mode == ViewModeController::UiViewMode::Hierarchy ? 64 : -1;
+        request.filesOnly = request.mode == ViewModeController::UiViewMode::Flat;
+
+        result = m_directoryModel->query(request);
+    }
+
     if (!result.ok) {
         m_scanInProgress = false;
+        m_treeView->setSortingEnabled(true);
         m_statusLabel->setText(QStringLiteral("Error: %1").arg(result.errorText));
-        appendRuntimeLog(QStringLiteral("ui_query_failed error=%1").arg(result.errorText));
+        appendRuntimeLog(QStringLiteral("ui_query_failed error=%1 query_mode=%2")
+                             .arg(result.errorText)
+                             .arg(queryActive ? QStringLiteral("true") : QStringLiteral("false")));
         return;
     }
+
+    m_fileModel.setViewMode(m_viewModeController.toFileViewMode(), effectiveRoot);
 
     const QVector<FileEntry> rows = QueryResultAdapter::toFileEntries(result);
     m_publishQueue = rows;
@@ -2149,8 +2255,12 @@ void MainWindow::startScanNow()
         m_treeView->setSortingEnabled(true);
     }
 
-    m_statusLabel->setText(QStringLiteral("Complete: %1 items").arg(rows.size()));
-    appendRuntimeLog(QStringLiteral("ui_query_complete rows=%1").arg(rows.size()));
+    m_statusLabel->setText(queryActive
+                               ? QStringLiteral("Query complete: %1 items").arg(rows.size())
+                               : QStringLiteral("Complete: %1 items").arg(rows.size()));
+    appendRuntimeLog(QStringLiteral("ui_query_complete rows=%1 query_mode=%2")
+                         .arg(rows.size())
+                         .arg(queryActive ? QStringLiteral("true") : QStringLiteral("false")));
 
     if (m_viewModeController.mode() == ViewModeController::UiViewMode::Hierarchy) {
         m_treeView->expandAll();

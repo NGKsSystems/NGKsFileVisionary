@@ -31,6 +31,8 @@ class QProcess;
 class QProgressDialog;
 class QTreeWidgetItem;
 class DirectoryModel;
+class QueryBarWidget;
+class QueryController;
 
 class MainWindow : public QMainWindow
 {
@@ -53,6 +55,9 @@ private slots:
     void onScanProgress(quint64 scanId, const QString& stage, quint64 enumerated, quint64 matched);
     void onScanFinished(quint64 scanId, bool canceled, quint64 enumerated, quint64 matched, const QString& error);
     void onSearchChanged(const QString& text);
+    void onQuerySubmitted(const QString& text);
+    void onQueryCleared();
+    void onFocusQueryBar();
     void onTreeContextMenu(const QPoint& pos);
     void onTreeActivated(const QModelIndex& index);
     void onSidebarItemActivated(QTreeWidgetItem* item, int column);
@@ -154,6 +159,7 @@ private:
     QCheckBox* m_showSystemCheck = nullptr;
     QLineEdit* m_extensionFilterEdit = nullptr;
     QLineEdit* m_searchEdit = nullptr;
+    QueryBarWidget* m_queryBarWidget = nullptr;
     QLabel* m_statusLabel = nullptr;
     QToolBar* m_viewToolbar = nullptr;
     QComboBox* m_viewModeCombo = nullptr;
@@ -198,6 +204,9 @@ private:
     QString m_startupRoot;
     QString m_actionTracePath;
     QString m_testScriptPath;
+    QueryController* m_queryController = nullptr;
+    QString m_activeQueryString;
+    bool m_queryModeActive = false;
     QStringList m_actionContextPaths;
     QString m_actionContextType;
     QDateTime m_lastRefreshRequeryAt;

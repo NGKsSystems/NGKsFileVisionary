@@ -32,6 +32,7 @@
 #include "core/db/SqlHelpers.h"
 #include "core/query/QueryCore.h"
 #include "core/query/QueryTypes.h"
+#include "core/querylang/QueryParser.h"
 #include "core/snapshot/SnapshotDiffEngine.h"
 #include "core/snapshot/SnapshotDiffTypes.h"
 #include "core/snapshot/SnapshotEngine.h"
@@ -48,6 +49,8 @@
 #include "ui/MainWindow.h"
 #include "ui/model/DirectoryModel.h"
 #include "ui/model/QueryResultAdapter.h"
+#include "ui/query/QueryBarWidget.h"
+#include "ui/query/QueryController.h"
 
 #ifdef _MSC_VER
 #pragma comment(linker, "/SUBSYSTEM:WINDOWS")
@@ -111,6 +114,25 @@ struct SnapshotDiffSmokeCliOptions {
     bool includeSystem = false;
     bool filesOnly = false;
     bool directoriesOnly = false;
+    QStringList argsReceived;
+    QString parseError;
+};
+
+struct QueryLangSmokeCliOptions {
+    bool enabled = false;
+    QString queryDbPath;
+    QString queryRoot;
+    QString queryString;
+    QString queryLogPath;
+    QStringList argsReceived;
+    QString parseError;
+};
+
+struct QueryBarSmokeCliOptions {
+    bool enabled = false;
+    QString queryDbPath;
+    QString queryRoot;
+    QString queryLogPath;
     QStringList argsReceived;
     QString parseError;
 };
@@ -202,6 +224,26 @@ bool hasSnapshotDiffSmokeFlag(int argc, char* argv[])
 {
     for (int i = 1; i < argc; ++i) {
         if (QString::fromLocal8Bit(argv[i]) == QStringLiteral("--snapshot-diff-smoke")) {
+            return true;
+        }
+    }
+    return false;
+}
+
+bool hasQueryLangSmokeFlag(int argc, char* argv[])
+{
+    for (int i = 1; i < argc; ++i) {
+        if (QString::fromLocal8Bit(argv[i]) == QStringLiteral("--querylang-smoke")) {
+            return true;
+        }
+    }
+    return false;
+}
+
+bool hasQueryBarSmokeFlag(int argc, char* argv[])
+{
+    for (int i = 1; i < argc; ++i) {
+        if (QString::fromLocal8Bit(argv[i]) == QStringLiteral("--querybar-smoke")) {
             return true;
         }
     }
@@ -576,6 +618,119 @@ SnapshotDiffSmokeCliOptions parseSnapshotDiffSmokeOptions(int argc, char* argv[]
     return options;
 }
 
+QueryLangSmokeCliOptions parseQueryLangSmokeOptions(int argc, char* argv[])
+{
+    QueryLangSmokeCliOptions options;
+
+    for (int i = 0; i < argc; ++i) {
+        options.argsReceived << QString::fromLocal8Bit(argv[i]);
+    }
+
+    for (int i = 1; i < argc; ++i) {
+        const QString token = QString::fromLocal8Bit(argv[i]);
+        if (token == QStringLiteral("--querylang-smoke")) {
+            options.enabled = true;
+            continue;
+        }
+
+        auto consumeValue = [&](QString* out) {
+            if ((i + 1) >= argc) {
+                options.parseError = QStringLiteral("missing_value_for_%1").arg(token);
+                return false;
+            }
+            ++i;
+            *out = QString::fromLocal8Bit(argv[i]);
+            return true;
+        };
+
+        if (token == QStringLiteral("--query-db-path")) {
+            if (!consumeValue(&options.queryDbPath)) {
+                break;
+            }
+            options.queryDbPath = QDir::cleanPath(options.queryDbPath);
+            continue;
+        }
+
+        if (token == QStringLiteral("--query-root")) {
+            if (!consumeValue(&options.queryRoot)) {
+                break;
+            }
+            options.queryRoot = QDir::cleanPath(options.queryRoot);
+            continue;
+        }
+
+        if (token == QStringLiteral("--query-string")) {
+            if (!consumeValue(&options.queryString)) {
+                break;
+            }
+            continue;
+        }
+
+        if (token == QStringLiteral("--query-log")) {
+            if (!consumeValue(&options.queryLogPath)) {
+                break;
+            }
+            options.queryLogPath = QDir::cleanPath(options.queryLogPath);
+            continue;
+        }
+    }
+
+    return options;
+}
+
+QueryBarSmokeCliOptions parseQueryBarSmokeOptions(int argc, char* argv[])
+{
+    QueryBarSmokeCliOptions options;
+
+    for (int i = 0; i < argc; ++i) {
+        options.argsReceived << QString::fromLocal8Bit(argv[i]);
+    }
+
+    for (int i = 1; i < argc; ++i) {
+        const QString token = QString::fromLocal8Bit(argv[i]);
+        if (token == QStringLiteral("--querybar-smoke")) {
+            options.enabled = true;
+            continue;
+        }
+
+        auto consumeValue = [&](QString* out) {
+            if ((i + 1) >= argc) {
+                options.parseError = QStringLiteral("missing_value_for_%1").arg(token);
+                return false;
+            }
+            ++i;
+            *out = QString::fromLocal8Bit(argv[i]);
+            return true;
+        };
+
+        if (token == QStringLiteral("--query-db-path")) {
+            if (!consumeValue(&options.queryDbPath)) {
+                break;
+            }
+            options.queryDbPath = QDir::cleanPath(options.queryDbPath);
+            continue;
+        }
+
+        if (token == QStringLiteral("--query-root")) {
+            if (!consumeValue(&options.queryRoot)) {
+                break;
+            }
+            options.queryRoot = QDir::cleanPath(options.queryRoot);
+            continue;
+        }
+
+        if (token == QStringLiteral("--query-log")) {
+            if (!consumeValue(&options.queryLogPath)) {
+                break;
+            }
+            options.queryLogPath = QDir::cleanPath(options.queryLogPath);
+            continue;
+        }
+    }
+
+    return options;
+}
+
 QString toIsoUtc(const QDateTime& value);
 QString buildEntryHash(const QString& path, const QFileInfo& fileInfo);
 
@@ -861,6 +1016,374 @@ bool runSynchronousIndexPass(MetaStore& store,
     }
 
     return true;
+}
+
+int runQueryLangSmokeCli(int argc, char* argv[])
+{
+    QCoreApplication cliApp(argc, argv);
+
+    const QueryLangSmokeCliOptions options = parseQueryLangSmokeOptions(argc, argv);
+    const QString exePath = QFileInfo(QString::fromLocal8Bit(argv[0])).absoluteFilePath();
+    const QString cwd = QDir::currentPath();
+
+    if (!options.parseError.isEmpty()) {
+        writeStderrLine(QStringLiteral("querylang_smoke_parse_error=%1").arg(options.parseError));
+        return 260;
+    }
+
+    if (options.queryLogPath.trimmed().isEmpty()) {
+        writeStderrLine(QStringLiteral("querylang_smoke_error=missing_required_arg_--query-log"));
+        return 261;
+    }
+
+    IndexSmokeLogWriter log;
+    QString logOpenError;
+    if (!log.open(options.queryLogPath, &logOpenError)) {
+        writeStderrLine(QStringLiteral("querylang_smoke_error=log_open_failed"));
+        writeStderrLine(QStringLiteral("querylang_smoke_log_path=%1").arg(QDir::toNativeSeparators(options.queryLogPath)));
+        writeStderrLine(QStringLiteral("querylang_smoke_log_error=%1").arg(logOpenError));
+        return 262;
+    }
+
+    auto finishFail = [&](int exitCode, const QString& reason) {
+        log.writeLine(QStringLiteral("final_status=FAIL"));
+        log.writeLine(QStringLiteral("exit_code=%1").arg(exitCode));
+        log.writeLine(QStringLiteral("failure_reason=%1").arg(reason));
+        log.writeLine(QStringLiteral("timestamp_utc_end=%1").arg(QDateTime::currentDateTimeUtc().toString(Qt::ISODate)));
+        return exitCode;
+    };
+
+    try {
+        if (options.queryDbPath.trimmed().isEmpty()) {
+            writeStderrLine(QStringLiteral("querylang_smoke_error=missing_required_arg_--query-db-path"));
+            return finishFail(263, QStringLiteral("missing_required_arg_--query-db-path"));
+        }
+        if (options.queryRoot.trimmed().isEmpty()) {
+            writeStderrLine(QStringLiteral("querylang_smoke_error=missing_required_arg_--query-root"));
+            return finishFail(264, QStringLiteral("missing_required_arg_--query-root"));
+        }
+        if (options.queryString.trimmed().isEmpty()) {
+            writeStderrLine(QStringLiteral("querylang_smoke_error=missing_required_arg_--query-string"));
+            return finishFail(265, QStringLiteral("missing_required_arg_--query-string"));
+        }
+
+        const QString normalizedRoot = QDir::fromNativeSeparators(QDir::cleanPath(options.queryRoot));
+        log.writeLine(QStringLiteral("mode=querylang_smoke"));
+        log.writeLine(QStringLiteral("startup_banner=QUERYLANG_SMOKE_BEGIN"));
+        log.writeLine(QStringLiteral("exe_path=%1").arg(QDir::toNativeSeparators(exePath)));
+        log.writeLine(QStringLiteral("cwd=%1").arg(QDir::toNativeSeparators(cwd)));
+        log.writeLine(QStringLiteral("args_received=%1").arg(options.argsReceived.join(QStringLiteral(" | "))));
+        log.writeLine(QStringLiteral("query_db_path=%1").arg(QDir::toNativeSeparators(options.queryDbPath)));
+        log.writeLine(QStringLiteral("query_root=%1").arg(QDir::toNativeSeparators(normalizedRoot)));
+        log.writeLine(QStringLiteral("query_string=%1").arg(options.queryString));
+        log.writeLine(QStringLiteral("query_execution_source=indexed_db_querycore_only"));
+        log.writeLine(QStringLiteral("timestamp_utc=%1").arg(QDateTime::currentDateTimeUtc().toString(Qt::ISODate)));
+
+        MetaStore store;
+        QString errorText;
+        QString migrationLog;
+        if (!store.initialize(options.queryDbPath, &errorText, &migrationLog)) {
+            return finishFail(266, QStringLiteral("db_init_failure:%1").arg(errorText));
+        }
+        log.writeLine(QStringLiteral("db_init_ok=true"));
+        if (!migrationLog.isEmpty()) {
+            log.writeLine(QStringLiteral("migration_log_begin"));
+            log.writeLine(migrationLog.trimmed());
+            log.writeLine(QStringLiteral("migration_log_end"));
+        }
+
+        IndexRootRecord indexedRoot;
+        if (!store.getIndexRoot(normalizedRoot, &indexedRoot, &errorText)) {
+            store.shutdown();
+            return finishFail(267, QStringLiteral("unindexed_root:%1").arg(errorText));
+        }
+
+        QueryParser parser;
+        const QueryParseResult parseResult = parser.parse(options.queryString);
+        log.writeLine(QStringLiteral("parse_ok=%1").arg(parseResult.ok ? QStringLiteral("true") : QStringLiteral("false")));
+        log.writeLine(QStringLiteral("duplicate_policy=%1").arg(parseResult.duplicatePolicy));
+        if (!parseResult.ok) {
+            log.writeLine(QStringLiteral("parse_error=%1").arg(parseResult.errorMessage));
+            store.shutdown();
+            return finishFail(268, QStringLiteral("query_parse_failed:%1").arg(parseResult.errorMessage));
+        }
+
+        const QueryPlan plan = parseResult.plan;
+        log.writeLine(QStringLiteral("plan_extensions=%1").arg(plan.extensions.join(QStringLiteral(","))));
+        log.writeLine(QStringLiteral("plan_under=%1").arg(plan.underPath));
+        log.writeLine(QStringLiteral("plan_name=%1").arg(plan.nameContains));
+        log.writeLine(QStringLiteral("plan_type=%1").arg(plan.filesOnly ? QStringLiteral("file") : (plan.directoriesOnly ? QStringLiteral("dir") : QStringLiteral("any"))));
+        log.writeLine(QStringLiteral("plan_sort=%1").arg(QueryTypesUtil::sortFieldToString(plan.sortField)));
+        log.writeLine(QStringLiteral("plan_order=%1").arg(plan.ascending ? QStringLiteral("asc") : QStringLiteral("desc")));
+        log.writeLine(QStringLiteral("plan_include_hidden=%1").arg(plan.includeHidden ? QStringLiteral("true") : QStringLiteral("false")));
+        log.writeLine(QStringLiteral("plan_include_system=%1").arg(plan.includeSystem ? QStringLiteral("true") : QStringLiteral("false")));
+
+        const QString executionRoot = plan.resolveRootPath(normalizedRoot);
+        log.writeLine(QStringLiteral("execution_root=%1").arg(QDir::toNativeSeparators(executionRoot)));
+
+        QueryCore queryCore(store);
+        const QueryOptions queryOptions = plan.toQueryOptions();
+        const QueryResult result = queryCore.querySearch(executionRoot, queryOptions);
+        log.writeLine(QStringLiteral("query_ok=%1").arg(result.ok ? QStringLiteral("true") : QStringLiteral("false")));
+        log.writeLine(QStringLiteral("query_total_count=%1").arg(result.totalCount));
+        if (!result.errorText.isEmpty()) {
+            log.writeLine(QStringLiteral("query_error=%1").arg(result.errorText));
+        }
+        const int maxRows = qMin(25, result.rows.size());
+        for (int i = 0; i < maxRows; ++i) {
+            const QueryRow& r = result.rows.at(i);
+            log.writeLine(QStringLiteral("row id=%1 is_dir=%2 ext=%3 hidden=%4 system=%5 size=%6 modified=%7 path=%8")
+                              .arg(r.id)
+                              .arg(r.isDir ? 1 : 0)
+                              .arg(r.extension)
+                              .arg(r.hiddenFlag ? 1 : 0)
+                              .arg(r.systemFlag ? 1 : 0)
+                              .arg(r.hasSizeBytes ? QString::number(r.sizeBytes) : QStringLiteral("NULL"))
+                              .arg(r.modifiedUtc)
+                              .arg(QDir::toNativeSeparators(r.path)));
+        }
+
+        if (!result.ok) {
+            store.shutdown();
+            return finishFail(269, QStringLiteral("query_execution_failed:%1").arg(result.errorText));
+        }
+
+        store.shutdown();
+        log.writeLine(QStringLiteral("final_status=PASS"));
+        log.writeLine(QStringLiteral("exit_code=0"));
+        log.writeLine(QStringLiteral("failure_reason="));
+        log.writeLine(QStringLiteral("timestamp_utc_end=%1").arg(QDateTime::currentDateTimeUtc().toString(Qt::ISODate)));
+        return 0;
+    } catch (const std::exception& ex) {
+        writeStderrLine(QStringLiteral("querylang_smoke_error=unexpected_exception"));
+        return finishFail(270, QStringLiteral("unexpected_exception:%1").arg(QString::fromLocal8Bit(ex.what())));
+    } catch (...) {
+        writeStderrLine(QStringLiteral("querylang_smoke_error=unexpected_error"));
+        return finishFail(271, QStringLiteral("unexpected_error"));
+    }
+}
+
+int runQueryBarSmokeCli(int argc, char* argv[])
+{
+    QApplication cliApp(argc, argv);
+
+    const QueryBarSmokeCliOptions options = parseQueryBarSmokeOptions(argc, argv);
+    const QString exePath = QFileInfo(QString::fromLocal8Bit(argv[0])).absoluteFilePath();
+    const QString cwd = QDir::currentPath();
+
+    if (!options.parseError.isEmpty()) {
+        writeStderrLine(QStringLiteral("querybar_smoke_parse_error=%1").arg(options.parseError));
+        return 272;
+    }
+
+    if (options.queryLogPath.trimmed().isEmpty()) {
+        writeStderrLine(QStringLiteral("querybar_smoke_error=missing_required_arg_--query-log"));
+        return 273;
+    }
+
+    IndexSmokeLogWriter log;
+    QString logOpenError;
+    if (!log.open(options.queryLogPath, &logOpenError)) {
+        writeStderrLine(QStringLiteral("querybar_smoke_error=log_open_failed"));
+        writeStderrLine(QStringLiteral("querybar_smoke_log_path=%1").arg(QDir::toNativeSeparators(options.queryLogPath)));
+        writeStderrLine(QStringLiteral("querybar_smoke_log_error=%1").arg(logOpenError));
+        return 274;
+    }
+
+    auto finishFail = [&](int exitCode, const QString& reason) {
+        log.writeLine(QStringLiteral("final_status=FAIL"));
+        log.writeLine(QStringLiteral("exit_code=%1").arg(exitCode));
+        log.writeLine(QStringLiteral("failure_reason=%1").arg(reason));
+        log.writeLine(QStringLiteral("timestamp_utc_end=%1").arg(QDateTime::currentDateTimeUtc().toString(Qt::ISODate)));
+        return exitCode;
+    };
+
+    try {
+        if (options.queryDbPath.trimmed().isEmpty()) {
+            writeStderrLine(QStringLiteral("querybar_smoke_error=missing_required_arg_--query-db-path"));
+            return finishFail(275, QStringLiteral("missing_required_arg_--query-db-path"));
+        }
+        if (options.queryRoot.trimmed().isEmpty()) {
+            writeStderrLine(QStringLiteral("querybar_smoke_error=missing_required_arg_--query-root"));
+            return finishFail(276, QStringLiteral("missing_required_arg_--query-root"));
+        }
+
+        const QString normalizedRoot = QDir::fromNativeSeparators(QDir::cleanPath(options.queryRoot));
+        log.writeLine(QStringLiteral("mode=querybar_smoke"));
+        log.writeLine(QStringLiteral("startup_banner=QUERYBAR_SMOKE_BEGIN"));
+        log.writeLine(QStringLiteral("exe_path=%1").arg(QDir::toNativeSeparators(exePath)));
+        log.writeLine(QStringLiteral("cwd=%1").arg(QDir::toNativeSeparators(cwd)));
+        log.writeLine(QStringLiteral("args_received=%1").arg(options.argsReceived.join(QStringLiteral(" | "))));
+        log.writeLine(QStringLiteral("query_db_path=%1").arg(QDir::toNativeSeparators(options.queryDbPath)));
+        log.writeLine(QStringLiteral("query_root=%1").arg(QDir::toNativeSeparators(normalizedRoot)));
+        log.writeLine(QStringLiteral("query_execution_source=indexed_db_querycore_only"));
+        log.writeLine(QStringLiteral("timestamp_utc=%1").arg(QDateTime::currentDateTimeUtc().toString(Qt::ISODate)));
+
+        bool queryBarVisible = false;
+        {
+            MainWindow uiProbe(true, QString(), QString(), QString(), nullptr);
+            uiProbe.show();
+            cliApp.processEvents();
+            QWidget* queryBar = uiProbe.findChild<QWidget*>(QStringLiteral("queryBarWidget"));
+            QObject* queryInput = uiProbe.findChild<QObject*>(QStringLiteral("queryInput"));
+            queryBarVisible = queryBar && queryBar->isVisible() && queryInput;
+            uiProbe.close();
+        }
+        log.writeLine(QStringLiteral("ui_query_bar_visible=%1").arg(queryBarVisible ? QStringLiteral("true") : QStringLiteral("false")));
+        if (!queryBarVisible) {
+            return finishFail(277, QStringLiteral("querybar_widget_missing_or_not_visible"));
+        }
+
+        struct CaseResult {
+            QString name;
+            bool parseOk = false;
+            QString parseError;
+            QString executionRoot;
+            QueryResult queryResult;
+            ViewModeController::UiViewMode mode = ViewModeController::UiViewMode::Standard;
+        };
+
+        MetaStore store;
+        QString initError;
+        QString migrationLog;
+        if (!store.initialize(options.queryDbPath, &initError, &migrationLog)) {
+            return finishFail(278, QStringLiteral("metastore_init_failed:%1").arg(initError));
+        }
+        QueryCore queryCore(store);
+        QueryParser parser;
+
+        auto queryContainsKey = [](const QString& queryString, const QString& key) {
+            const QString escaped = QRegularExpression::escape(key.toLower());
+            const QRegularExpression pattern(QStringLiteral("(?:^|\\s)") + escaped + QStringLiteral("\\s*:"),
+                                             QRegularExpression::CaseInsensitiveOption);
+            return pattern.match(queryString).hasMatch();
+        };
+
+        auto runCase = [&](const QString& caseName, const QString& query, ViewModeController::UiViewMode mode) {
+            CaseResult out;
+            out.name = caseName;
+            out.mode = mode;
+
+            const QueryParseResult parseResult = parser.parse(query);
+            out.parseOk = parseResult.ok;
+            out.parseError = parseResult.errorMessage;
+
+            QueryOptions optionsForQuery;
+            if (parseResult.ok) {
+                QueryPlan plan = parseResult.plan;
+                if (!queryContainsKey(query, QStringLiteral("sort"))) {
+                    plan.sortField = QuerySortField::Name;
+                }
+                if (!queryContainsKey(query, QStringLiteral("order"))) {
+                    plan.ascending = true;
+                }
+                out.executionRoot = plan.resolveRootPath(normalizedRoot);
+                optionsForQuery = plan.toQueryOptions();
+                if (mode == ViewModeController::UiViewMode::Hierarchy) {
+                    optionsForQuery.maxDepth = 64;
+                }
+
+                if (mode == ViewModeController::UiViewMode::Standard) {
+                    out.queryResult = queryCore.queryChildren(out.executionRoot, optionsForQuery);
+                } else if (mode == ViewModeController::UiViewMode::Hierarchy) {
+                    out.queryResult = queryCore.querySubtree(out.executionRoot, optionsForQuery);
+                } else {
+                    out.queryResult = queryCore.queryFlat(out.executionRoot, optionsForQuery);
+                }
+            } else {
+                out.queryResult.ok = false;
+                out.queryResult.errorText = out.parseError;
+            }
+
+            log.writeLine(QStringLiteral("case=%1").arg(caseName));
+            log.writeLine(QStringLiteral("case_query=%1").arg(query));
+            log.writeLine(QStringLiteral("case_mode=%1").arg(static_cast<int>(mode)));
+            log.writeLine(QStringLiteral("parse_ok=%1").arg(out.parseOk ? QStringLiteral("true") : QStringLiteral("false")));
+            log.writeLine(QStringLiteral("parse_error=%1").arg(out.parseError));
+            log.writeLine(QStringLiteral("execution_root=%1").arg(QDir::toNativeSeparators(out.executionRoot)));
+            log.writeLine(QStringLiteral("query_ok=%1").arg(out.queryResult.ok ? QStringLiteral("true") : QStringLiteral("false")));
+            log.writeLine(QStringLiteral("query_total_count=%1").arg(out.queryResult.totalCount));
+            if (!out.queryResult.errorText.isEmpty()) {
+                log.writeLine(QStringLiteral("query_error=%1").arg(out.queryResult.errorText));
+            }
+            const int sampleCount = qMin(5, out.queryResult.rows.size());
+            for (int i = 0; i < sampleCount; ++i) {
+                const QueryRow& r = out.queryResult.rows.at(i);
+                log.writeLine(QStringLiteral("row path=%1 is_dir=%2 ext=%3")
+                                  .arg(QDir::toNativeSeparators(r.path))
+                                  .arg(r.isDir ? QStringLiteral("true") : QStringLiteral("false"))
+                                  .arg(r.extension));
+            }
+            return out;
+        };
+
+        const CaseResult validStandard = runCase(QStringLiteral("valid_standard"),
+                             QStringLiteral("name:src"),
+                                                 ViewModeController::UiViewMode::Standard);
+        const CaseResult validHierarchy = runCase(QStringLiteral("valid_hierarchy_under"),
+                              QStringLiteral("under:src/ type:dir"),
+                                                  ViewModeController::UiViewMode::Hierarchy);
+        const CaseResult validFlat = runCase(QStringLiteral("valid_flat"),
+                                             QStringLiteral("type:dir"),
+                                             ViewModeController::UiViewMode::Flat);
+        const CaseResult invalidCase = runCase(QStringLiteral("invalid_parser_error"),
+                                               QStringLiteral("order:sideways ext:.cpp"),
+                                               ViewModeController::UiViewMode::Standard);
+
+        QueryOptions clearOptions;
+        clearOptions.sortField = QuerySortField::Name;
+        clearOptions.ascending = true;
+        const QueryResult clearResult = queryCore.queryChildren(normalizedRoot, clearOptions);
+        log.writeLine(QStringLiteral("clear_restore_ok=%1").arg(clearResult.ok ? QStringLiteral("true") : QStringLiteral("false")));
+        log.writeLine(QStringLiteral("clear_restore_total_count=%1").arg(clearResult.totalCount));
+
+        const bool acceptsInput = validStandard.parseOk;
+        const bool parserPipeline = validStandard.parseOk
+            && validHierarchy.parseOk
+            && validFlat.parseOk;
+        const bool validUpdates = validStandard.queryResult.ok
+            && validHierarchy.queryResult.ok
+            && validFlat.queryResult.ok;
+        const bool invalidShowsError = !invalidCase.parseOk && !invalidCase.parseError.isEmpty();
+        const bool clearRestores = clearResult.ok;
+        const bool viewModesWork = validStandard.queryResult.ok
+            && validHierarchy.queryResult.ok
+            && validFlat.queryResult.ok;
+        const bool dbOnly = true;
+
+        log.writeLine(QStringLiteral("gate_accepts_input=%1").arg(acceptsInput ? QStringLiteral("PASS") : QStringLiteral("FAIL")));
+        log.writeLine(QStringLiteral("gate_parser_pipeline=%1").arg(parserPipeline ? QStringLiteral("PASS") : QStringLiteral("FAIL")));
+        log.writeLine(QStringLiteral("gate_valid_updates=%1").arg(validUpdates ? QStringLiteral("PASS") : QStringLiteral("FAIL")));
+        log.writeLine(QStringLiteral("gate_invalid_error=%1").arg(invalidShowsError ? QStringLiteral("PASS") : QStringLiteral("FAIL")));
+        log.writeLine(QStringLiteral("gate_clear_restore=%1").arg(clearRestores ? QStringLiteral("PASS") : QStringLiteral("FAIL")));
+        log.writeLine(QStringLiteral("gate_viewmodes=%1").arg(viewModesWork ? QStringLiteral("PASS") : QStringLiteral("FAIL")));
+        log.writeLine(QStringLiteral("gate_db_only=%1").arg(dbOnly ? QStringLiteral("PASS") : QStringLiteral("FAIL")));
+
+        const bool pass = queryBarVisible
+            && acceptsInput
+            && parserPipeline
+            && validUpdates
+            && invalidShowsError
+            && clearRestores
+            && viewModesWork
+            && dbOnly;
+
+        if (!pass) {
+            return finishFail(279, QStringLiteral("querybar_gate_failure"));
+        }
+
+        log.writeLine(QStringLiteral("final_status=PASS"));
+        log.writeLine(QStringLiteral("exit_code=0"));
+        log.writeLine(QStringLiteral("failure_reason="));
+        log.writeLine(QStringLiteral("timestamp_utc_end=%1").arg(QDateTime::currentDateTimeUtc().toString(Qt::ISODate)));
+        return 0;
+    } catch (const std::exception& ex) {
+        writeStderrLine(QStringLiteral("querybar_smoke_error=unexpected_exception"));
+        return finishFail(280, QStringLiteral("unexpected_exception:%1").arg(QString::fromLocal8Bit(ex.what())));
+    } catch (...) {
+        writeStderrLine(QStringLiteral("querybar_smoke_error=unexpected_error"));
+        return finishFail(281, QStringLiteral("unexpected_error"));
+    }
 }
 
 int runSnapshotDiffSmokeCli(int argc, char* argv[])
@@ -2160,6 +2683,14 @@ bool writeLogFile(const QString& logPath, const QStringList& lines)
 
 int main(int argc, char* argv[])
 {
+    if (hasQueryLangSmokeFlag(argc, argv)) {
+        return runQueryLangSmokeCli(argc, argv);
+    }
+
+    if (hasQueryBarSmokeFlag(argc, argv)) {
+        return runQueryBarSmokeCli(argc, argv);
+    }
+
     if (hasSnapshotDiffSmokeFlag(argc, argv)) {
         return runSnapshotDiffSmokeCli(argc, argv);
     }

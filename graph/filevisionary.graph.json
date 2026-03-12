@@ -8,6 +8,8 @@
       "sources": [
         "src/main.cpp",
         "src/ui/MainWindow.cpp",
+        "src/ui/query/QueryBarWidget.cpp",
+        "src/ui/query/QueryController.cpp",
         "src/ui/TreeSnapshotDialog.cpp",
         "src/ui/TreeSnapshotPreviewDialog.cpp",
         "src/ui/ArchiveExplorer.cpp",
@@ -38,6 +40,9 @@
         "src/core/snapshot/SnapshotEngine.cpp",
         "src/core/snapshot/SnapshotDiffTypes.cpp",
         "src/core/snapshot/SnapshotDiffEngine.cpp",
+        "src/core/querylang/QueryPlan.cpp",
+        "src/core/querylang/QueryParseResult.cpp",
+        "src/core/querylang/QueryParser.cpp",
         "src/util/PathUtils.cpp"
       ],
       "include_dirs": [
