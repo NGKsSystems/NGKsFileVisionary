@@ -1,6 +1,48 @@
 #include "QueryTypes.h"
 
 #include <algorithm>
+#include <QDateTime>
+#include <QDir>
+
+namespace {
+bool compareNumeric(QueryComparator comparator, qint64 left, qint64 right)
+{
+    switch (comparator) {
+    case QueryComparator::None:
+        return true;
+    case QueryComparator::Less:
+        return left < right;
+    case QueryComparator::LessEqual:
+        return left <= right;
+    case QueryComparator::Greater:
+        return left > right;
+    case QueryComparator::GreaterEqual:
+        return left >= right;
+    }
+    return false;
+}
+
+QString normalizedPathLike(const QString& value)
+{
+    return QDir::fromNativeSeparators(value).toLower();
+}
+
+bool containsAnySubstring(const QString& haystackName,
+                          const QString& haystackPath,
+                          const QStringList& needles)
+{
+    for (const QString& needleRaw : needles) {
+        const QString needle = needleRaw.trimmed().toLower();
+        if (needle.isEmpty()) {
+            continue;
+        }
+        if (haystackName.contains(needle) || haystackPath.contains(needle)) {
+            return true;
+        }
+    }
+    return false;
+}
+}
 
 namespace {
 QString normalizedSubstring(const QString& value)
@@ -11,7 +53,8 @@ QString normalizedSubstring(const QString& value)
 bool rowPassesFilters(const QueryRow& row,
                       const QueryOptions& options,
                       const QString& substring,
-                      const QStringList& extSet)
+                      const QStringList& extSet,
+                      const QStringList& excludedExtSet)
 {
     if (!options.includeHidden && row.hiddenFlag) {
         return false;
@@ -34,8 +77,63 @@ bool rowPassesFilters(const QueryRow& row,
         }
     }
 
+    if (!options.substringAlternatives.isEmpty()) {
+        const QString hayName = row.normalizedName.toLower();
+        const QString hayPath = row.path.toLower();
+        if (!containsAnySubstring(hayName, hayPath, options.substringAlternatives)) {
+            return false;
+        }
+    }
+
     if (!extSet.isEmpty() && !row.isDir) {
         if (!extSet.contains(row.extension.toLower())) {
+            return false;
+        }
+    }
+
+    if (!excludedExtSet.isEmpty() && !row.isDir) {
+        if (excludedExtSet.contains(row.extension.toLower())) {
+            return false;
+        }
+    }
+
+    if (!options.excludedSubstrings.isEmpty()) {
+        const QString hayName = row.normalizedName.toLower();
+        const QString hayPath = row.path.toLower();
+        if (containsAnySubstring(hayName, hayPath, options.excludedSubstrings)) {
+            return false;
+        }
+    }
+
+    if (!options.excludedPathPrefixes.isEmpty()) {
+        const QString rowPath = normalizedPathLike(row.path);
+        for (QString prefix : options.excludedPathPrefixes) {
+            prefix = normalizedPathLike(prefix);
+            if (prefix.isEmpty()) {
+                continue;
+            }
+            if (rowPath == prefix || rowPath.startsWith(prefix + QStringLiteral("/"))) {
+                return false;
+            }
+        }
+    }
+
+    if (options.sizeComparator != QueryComparator::None) {
+        if (!row.hasSizeBytes || row.isDir) {
+            return false;
+        }
+        if (!compareNumeric(options.sizeComparator, row.sizeBytes, options.sizeBytes)) {
+            return false;
+        }
+    }
+
+    if (options.modifiedAgeComparator != QueryComparator::None) {
+        const QDateTime modified = QDateTime::fromString(row.modifiedUtc, Qt::ISODate);
+        if (!modified.isValid()) {
+            return false;
+        }
+        const qint64 ageSeconds = modified.secsTo(QDateTime::currentDateTimeUtc());
+        if (!compareNumeric(options.modifiedAgeComparator, ageSeconds, options.modifiedAgeSeconds)) {
             return false;
         }
     }
@@ -118,6 +216,32 @@ bool parseSortField(const QString& value, QuerySortField* out)
     return false;
 }
 
+bool parseComparator(const QString& value, QueryComparator* out)
+{
+    if (!out) {
+        return false;
+    }
+
+    const QString normalized = value.trimmed();
+    if (normalized == QStringLiteral("<")) {
+        *out = QueryComparator::Less;
+        return true;
+    }
+    if (normalized == QStringLiteral("<=")) {
+        *out = QueryComparator::LessEqual;
+        return true;
+    }
+    if (normalized == QStringLiteral(">")) {
+        *out = QueryComparator::Greater;
+        return true;
+    }
+    if (normalized == QStringLiteral(">=")) {
+        *out = QueryComparator::GreaterEqual;
+        return true;
+    }
+    return false;
+}
+
 QString sortFieldToString(QuerySortField value)
 {
     switch (value) {
@@ -131,6 +255,23 @@ QString sortFieldToString(QuerySortField value)
         return QStringLiteral("path");
     }
     return QStringLiteral("name");
+}
+
+QString comparatorToString(QueryComparator value)
+{
+    switch (value) {
+    case QueryComparator::None:
+        return QStringLiteral("none");
+    case QueryComparator::Less:
+        return QStringLiteral("<");
+    case QueryComparator::LessEqual:
+        return QStringLiteral("<=");
+    case QueryComparator::Greater:
+        return QStringLiteral(">");
+    case QueryComparator::GreaterEqual:
+        return QStringLiteral(">=");
+    }
+    return QStringLiteral("none");
 }
 
 QStringList normalizedExtensionSet(const QString& extensionFilter)
@@ -170,11 +311,12 @@ bool applyFiltersAndSort(const QueryOptions& options, QVector<QueryRow>* rows, Q
 
     const QString substring = normalizedSubstring(options.substringFilter);
     const QStringList extSet = normalizedExtensionSet(options.extensionFilter);
+    const QStringList excludedExtSet = normalizedExtensionSet(options.excludedExtensions.join(QStringLiteral(";")));
 
     QVector<QueryRow> filtered;
     filtered.reserve(rows->size());
     for (const QueryRow& row : *rows) {
-        if (rowPassesFilters(row, options, substring, extSet)) {
+        if (rowPassesFilters(row, options, substring, extSet, excludedExtSet)) {
             filtered.push_back(row);
         }
     }

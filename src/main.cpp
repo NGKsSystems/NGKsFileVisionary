@@ -258,6 +258,16 @@ bool hasQueryLangSmokeFlag(int argc, char* argv[])
     return false;
 }
 
+bool hasQueryLangAdvancedSmokeFlag(int argc, char* argv[])
+{
+    for (int i = 1; i < argc; ++i) {
+        if (QString::fromLocal8Bit(argv[i]) == QStringLiteral("--querylang-advanced-smoke")) {
+            return true;
+        }
+    }
+    return false;
+}
+
 bool hasQueryBarSmokeFlag(int argc, char* argv[])
 {
     for (int i = 1; i < argc; ++i) {
@@ -666,7 +676,8 @@ QueryLangSmokeCliOptions parseQueryLangSmokeOptions(int argc, char* argv[])
 
     for (int i = 1; i < argc; ++i) {
         const QString token = QString::fromLocal8Bit(argv[i]);
-        if (token == QStringLiteral("--querylang-smoke")) {
+        if (token == QStringLiteral("--querylang-smoke")
+            || token == QStringLiteral("--querylang-advanced-smoke")) {
             options.enabled = true;
             continue;
         }
@@ -1151,6 +1162,7 @@ int runQueryLangSmokeCli(int argc, char* argv[])
     QCoreApplication cliApp(argc, argv);
 
     const QueryLangSmokeCliOptions options = parseQueryLangSmokeOptions(argc, argv);
+    const bool advancedMode = hasQueryLangAdvancedSmokeFlag(argc, argv);
     const QString exePath = QFileInfo(QString::fromLocal8Bit(argv[0])).absoluteFilePath();
     const QString cwd = QDir::currentPath();
 
@@ -1196,8 +1208,12 @@ int runQueryLangSmokeCli(int argc, char* argv[])
         }
 
         const QString normalizedRoot = QDir::fromNativeSeparators(QDir::cleanPath(options.queryRoot));
-        log.writeLine(QStringLiteral("mode=querylang_smoke"));
-        log.writeLine(QStringLiteral("startup_banner=QUERYLANG_SMOKE_BEGIN"));
+        log.writeLine(QStringLiteral("mode=%1").arg(advancedMode
+                                ? QStringLiteral("querylang_advanced_smoke")
+                                : QStringLiteral("querylang_smoke")));
+        log.writeLine(QStringLiteral("startup_banner=%1").arg(advancedMode
+                                       ? QStringLiteral("QUERYLANG_ADVANCED_SMOKE_BEGIN")
+                                       : QStringLiteral("QUERYLANG_SMOKE_BEGIN")));
         log.writeLine(QStringLiteral("exe_path=%1").arg(QDir::toNativeSeparators(exePath)));
         log.writeLine(QStringLiteral("cwd=%1").arg(QDir::toNativeSeparators(cwd)));
         log.writeLine(QStringLiteral("args_received=%1").arg(options.argsReceived.join(QStringLiteral(" | "))));
@@ -1238,19 +1254,28 @@ int runQueryLangSmokeCli(int argc, char* argv[])
 
         const QueryPlan plan = parseResult.plan;
         log.writeLine(QStringLiteral("plan_extensions=%1").arg(plan.extensions.join(QStringLiteral(","))));
+        log.writeLine(QStringLiteral("plan_excluded_extensions=%1").arg(plan.excludedExtensions.join(QStringLiteral(","))));
         log.writeLine(QStringLiteral("plan_under=%1").arg(plan.underPath));
+        log.writeLine(QStringLiteral("plan_excluded_under=%1").arg(plan.excludedUnderPaths.join(QStringLiteral(","))));
         log.writeLine(QStringLiteral("plan_name=%1").arg(plan.nameContains));
+        log.writeLine(QStringLiteral("plan_name_any=%1").arg(plan.nameContainsAny.join(QStringLiteral("|"))));
+        log.writeLine(QStringLiteral("plan_excluded_name=%1").arg(plan.excludedNameContains.join(QStringLiteral("|"))));
         log.writeLine(QStringLiteral("plan_type=%1").arg(plan.filesOnly ? QStringLiteral("file") : (plan.directoriesOnly ? QStringLiteral("dir") : QStringLiteral("any"))));
         log.writeLine(QStringLiteral("plan_sort=%1").arg(QueryTypesUtil::sortFieldToString(plan.sortField)));
         log.writeLine(QStringLiteral("plan_order=%1").arg(plan.ascending ? QStringLiteral("asc") : QStringLiteral("desc")));
         log.writeLine(QStringLiteral("plan_include_hidden=%1").arg(plan.includeHidden ? QStringLiteral("true") : QStringLiteral("false")));
         log.writeLine(QStringLiteral("plan_include_system=%1").arg(plan.includeSystem ? QStringLiteral("true") : QStringLiteral("false")));
+        log.writeLine(QStringLiteral("plan_size_comparator=%1").arg(QueryTypesUtil::comparatorToString(plan.sizeComparator)));
+        log.writeLine(QStringLiteral("plan_size_bytes=%1").arg(plan.sizeBytes));
+        log.writeLine(QStringLiteral("plan_modified_age_comparator=%1").arg(QueryTypesUtil::comparatorToString(plan.modifiedAgeComparator)));
+        log.writeLine(QStringLiteral("plan_modified_age_seconds=%1").arg(plan.modifiedAgeSeconds));
+        log.writeLine(QStringLiteral("plan_supported_or=%1").arg(plan.supportedOrSyntax));
 
         const QString executionRoot = plan.resolveRootPath(normalizedRoot);
         log.writeLine(QStringLiteral("execution_root=%1").arg(QDir::toNativeSeparators(executionRoot)));
 
         QueryCore queryCore(store);
-        const QueryOptions queryOptions = plan.toQueryOptions();
+        const QueryOptions queryOptions = plan.toQueryOptions(normalizedRoot);
         const QueryResult result = queryCore.querySearch(executionRoot, queryOptions);
         log.writeLine(QStringLiteral("query_ok=%1").arg(result.ok ? QStringLiteral("true") : QStringLiteral("false")));
         log.writeLine(QStringLiteral("query_total_count=%1").arg(result.totalCount));
@@ -1406,7 +1431,7 @@ int runQueryBarSmokeCli(int argc, char* argv[])
                     plan.ascending = true;
                 }
                 out.executionRoot = plan.resolveRootPath(normalizedRoot);
-                optionsForQuery = plan.toQueryOptions();
+                optionsForQuery = plan.toQueryOptions(normalizedRoot);
                 if (mode == ViewModeController::UiViewMode::Hierarchy) {
                     optionsForQuery.maxDepth = 64;
                 }
@@ -1694,7 +1719,7 @@ int runArchiveSmokeCli(int argc, char* argv[])
         log.writeLine(QStringLiteral("query_parse_error=%1").arg(parseResult.errorMessage));
         QueryResult queryResult;
         if (parseResult.ok) {
-            QueryOptions queryOptions = parseResult.plan.toQueryOptions();
+            QueryOptions queryOptions = parseResult.plan.toQueryOptions(normalizedRoot);
             queryResult = provider.query(zipPath, ViewModeController::UiViewMode::Standard, queryOptions, nullptr);
         }
         log.writeLine(QStringLiteral("query_inside_archive_ok=%1").arg(queryResult.ok ? QStringLiteral("true") : QStringLiteral("false")));
@@ -3403,6 +3428,10 @@ int main(int argc, char* argv[])
 
     if (hasArchiveSmokeFlag(argc, argv)) {
         return runArchiveSmokeCli(argc, argv);
+    }
+
+    if (hasQueryLangAdvancedSmokeFlag(argc, argv)) {
+        return runQueryLangSmokeCli(argc, argv);
     }
 
     if (hasQueryLangSmokeFlag(argc, argv)) {

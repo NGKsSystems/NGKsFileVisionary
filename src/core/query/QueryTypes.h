@@ -12,6 +12,15 @@ enum class QuerySortField
     Path = 3,
 };
 
+enum class QueryComparator
+{
+    None = 0,
+    Less = 1,
+    LessEqual = 2,
+    Greater = 3,
+    GreaterEqual = 4,
+};
+
 struct QueryOptions
 {
     bool includeHidden = false;
@@ -29,6 +38,17 @@ struct QueryOptions
 
     bool filesOnly = false;
     bool directoriesOnly = false;
+
+    QueryComparator sizeComparator = QueryComparator::None;
+    qint64 sizeBytes = 0;
+
+    QueryComparator modifiedAgeComparator = QueryComparator::None;
+    qint64 modifiedAgeSeconds = 0;
+
+    QStringList excludedExtensions;
+    QStringList excludedPathPrefixes;
+    QStringList excludedSubstrings;
+    QStringList substringAlternatives;
 };
 
 struct QueryRow
@@ -66,7 +86,9 @@ struct QueryResult
 namespace QueryTypesUtil
 {
 bool parseSortField(const QString& value, QuerySortField* out);
+bool parseComparator(const QString& value, QueryComparator* out);
 QString sortFieldToString(QuerySortField value);
+QString comparatorToString(QueryComparator value);
 QStringList normalizedExtensionSet(const QString& extensionFilter);
 bool applyFiltersAndSort(const QueryOptions& options, QVector<QueryRow>* rows, QString* errorText = nullptr);
 }

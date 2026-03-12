@@ -52,7 +52,7 @@ QueryController::ExecutionResult QueryController::execute(const QString& querySt
 
     out.executionRoot = plan.resolveRootPath(runtimeRoot);
 
-    const QueryOptions options = plan.toQueryOptions();
+    const QueryOptions options = plan.toQueryOptions(runtimeRoot);
 
     DirectoryModel::Request request;
     request.rootPath = out.executionRoot;

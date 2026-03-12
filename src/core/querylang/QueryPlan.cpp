@@ -46,7 +46,7 @@ bool splitArchiveScopedPath(const QString& normalizedPath, QString* archivePath,
 }
 }
 
-QueryOptions QueryPlan::toQueryOptions() const
+QueryOptions QueryPlan::toQueryOptions(const QString& runtimeRoot) const
 {
     QueryOptions options;
     options.includeHidden = includeHidden;
@@ -56,8 +56,36 @@ QueryOptions QueryPlan::toQueryOptions() const
     options.sortField = sortField;
     options.ascending = ascending;
     options.substringFilter = nameContains.trimmed();
+    options.substringAlternatives = nameContainsAny;
+    options.excludedSubstrings = excludedNameContains;
+    options.excludedExtensions = excludedExtensions;
+    options.sizeComparator = sizeComparator;
+    options.sizeBytes = sizeBytes;
+    options.modifiedAgeComparator = modifiedAgeComparator;
+    options.modifiedAgeSeconds = modifiedAgeSeconds;
     if (!extensions.isEmpty()) {
         options.extensionFilter = extensions.join(QStringLiteral(";"));
+    }
+
+    const QString normalizedRuntime = QDir::fromNativeSeparators(QDir::cleanPath(runtimeRoot));
+    for (const QString& rawUnder : excludedUnderPaths) {
+        const QString normalizedUnder = QDir::fromNativeSeparators(QDir::cleanPath(rawUnder));
+        if (normalizedUnder.trimmed().isEmpty()) {
+            continue;
+        }
+
+        QString resolvedPath = normalizedUnder;
+        if (!QFileInfo(normalizedUnder).isAbsolute()) {
+            resolvedPath = QDir::fromNativeSeparators(QDir::cleanPath(QDir(normalizedRuntime).filePath(normalizedUnder)));
+        }
+
+        QString archivePath;
+        QString internalPath;
+        if (splitArchiveScopedPath(resolvedPath, &archivePath, &internalPath)) {
+            options.excludedPathPrefixes.push_back(PathUtils::buildArchiveVirtualPath(archivePath, internalPath));
+        } else {
+            options.excludedPathPrefixes.push_back(resolvedPath);
+        }
     }
     return options;
 }
