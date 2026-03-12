@@ -277,6 +277,22 @@ bool MetaStore::listSomeEntries(int limit, QVector<EntryRecord>* out, QString* e
     return m_entries->listSomeEntries(limit, out, errorText);
 }
 
+QSqlDatabase MetaStore::database() const
+{
+    if (!m_connection || !m_connection->isOpen()) {
+        return QSqlDatabase();
+    }
+    return m_connection->database();
+}
+
+QString MetaStore::databasePath() const
+{
+    if (!m_connection || !m_connection->isOpen()) {
+        return QString();
+    }
+    return m_connection->databasePath();
+}
+
 bool MetaStore::beginTransaction(QString* errorText)
 {
     if (!m_connection || !m_connection->isOpen()) {

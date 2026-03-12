@@ -33,6 +33,9 @@
         "src/core/watch/ChangeEvent.cpp",
         "src/core/watch/WatchSession.cpp",
         "src/core/watch/WatchBridge.cpp",
+        "src/core/snapshot/SnapshotTypes.cpp",
+        "src/core/snapshot/SnapshotRepository.cpp",
+        "src/core/snapshot/SnapshotEngine.cpp",
         "src/util/PathUtils.cpp"
       ],
       "include_dirs": [

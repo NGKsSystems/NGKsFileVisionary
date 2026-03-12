@@ -93,6 +93,13 @@ bool DbMigrations::migrate(DbConnection& connection, QString* migrationLog)
         }
     }
 
+    if (ok && current < 3) {
+        ok = applyV3(connection, &errorText);
+        if (migrationLog) {
+            migrationLog->append(ok ? QStringLiteral("applied_v3=true\n") : QStringLiteral("applied_v3=false\n"));
+        }
+    }
+
     if (!ok) {
         connection.rollback();
         if (migrationLog) {
@@ -317,4 +324,46 @@ bool DbMigrations::applyV2(DbConnection& connection, QString* errorText)
     };
 
     return execBatch(db, indexes, errorText);
+}
+
+bool DbMigrations::applyV3(DbConnection& connection, QString* errorText)
+{
+    const QStringList statements = {
+        QStringLiteral("CREATE TABLE IF NOT EXISTS snapshots(" \
+                       "id INTEGER PRIMARY KEY AUTOINCREMENT," \
+                       "root_path TEXT NOT NULL," \
+                       "snapshot_name TEXT NOT NULL," \
+                       "snapshot_type TEXT NOT NULL," \
+                       "created_utc TEXT NOT NULL," \
+                       "options_json TEXT," \
+                       "item_count INTEGER NOT NULL DEFAULT 0," \
+                       "source_scan_session_id INTEGER," \
+                       "note_text TEXT" \
+                       ");"),
+        QStringLiteral("CREATE TABLE IF NOT EXISTS snapshot_entries(" \
+                       "id INTEGER PRIMARY KEY AUTOINCREMENT," \
+                       "snapshot_id INTEGER NOT NULL," \
+                       "entry_path TEXT NOT NULL," \
+                       "parent_path TEXT," \
+                       "name TEXT NOT NULL," \
+                       "normalized_name TEXT NOT NULL," \
+                       "extension TEXT," \
+                       "is_dir INTEGER NOT NULL," \
+                       "size_bytes INTEGER," \
+                       "modified_utc TEXT," \
+                       "hidden_flag INTEGER NOT NULL DEFAULT 0," \
+                       "system_flag INTEGER NOT NULL DEFAULT 0," \
+                       "archive_flag INTEGER NOT NULL DEFAULT 0," \
+                       "exists_flag INTEGER NOT NULL DEFAULT 1," \
+                       "FOREIGN KEY(snapshot_id) REFERENCES snapshots(id)" \
+                       ");"),
+        QStringLiteral("CREATE INDEX IF NOT EXISTS idx_snapshot_entries_snapshot_id ON snapshot_entries(snapshot_id);"),
+        QStringLiteral("CREATE INDEX IF NOT EXISTS idx_snapshot_entries_path ON snapshot_entries(entry_path);"),
+        QStringLiteral("CREATE INDEX IF NOT EXISTS idx_snapshot_entries_parent_path ON snapshot_entries(parent_path);"),
+        QStringLiteral("CREATE INDEX IF NOT EXISTS idx_snapshot_entries_name ON snapshot_entries(name);"),
+        QStringLiteral("CREATE INDEX IF NOT EXISTS idx_snapshots_root_path ON snapshots(root_path);"),
+        QStringLiteral("CREATE INDEX IF NOT EXISTS idx_snapshots_name ON snapshots(snapshot_name);")
+    };
+
+    return execBatch(connection.database(), statements, errorText);
 }

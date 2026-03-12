@@ -1,5 +1,6 @@
 #pragma once
 
+#include <QSqlDatabase>
 #include <QString>
 #include <QVector>
 
@@ -100,6 +101,9 @@ public:
 
     bool listVolumes(QVector<VolumeRecord>* out, QString* errorText = nullptr);
     bool listFavorites(QVector<FavoriteRecord>* out, QString* errorText = nullptr);
+
+    QSqlDatabase database() const;
+    QString databasePath() const;
 
 private:
     DbConnection* m_connection;
