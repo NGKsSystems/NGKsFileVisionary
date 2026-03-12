@@ -21,7 +21,7 @@ QueryController::ExecutionResult QueryController::execute(const QString& querySt
     ExecutionResult out;
     out.queryString = queryString.trimmed();
 
-    if (!m_directoryModel || !m_directoryModel->isReady()) {
+    if (!m_directoryModel) {
         out.parseError = QStringLiteral("directory_model_not_ready");
         return out;
     }

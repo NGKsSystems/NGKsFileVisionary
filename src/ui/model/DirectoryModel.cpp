@@ -1,18 +1,18 @@
 #include "DirectoryModel.h"
 
-#include "core/archive/ArchiveProvider.h"
+#include "core/archive/ArchiveQueryAdapter.h"
 #include "core/services/VisionIndexService.h"
 
 DirectoryModel::DirectoryModel()
     : m_visionService(new VisionIndexService())
-    , m_archiveProvider(new ArchiveNav::ArchiveProvider())
+    , m_archiveQueryAdapter(new ArchiveNav::ArchiveQueryAdapter())
 {
 }
 
 DirectoryModel::~DirectoryModel()
 {
-    delete m_archiveProvider;
-    m_archiveProvider = nullptr;
+    delete m_archiveQueryAdapter;
+    m_archiveQueryAdapter = nullptr;
 
     delete m_visionService;
     m_visionService = nullptr;
@@ -56,8 +56,8 @@ QueryResult DirectoryModel::query(const Request& request)
     options.filesOnly = request.filesOnly;
     options.directoriesOnly = request.directoriesOnly;
 
-    if (m_archiveProvider && m_archiveProvider->canHandlePath(request.rootPath)) {
-        return m_archiveProvider->query(request.rootPath, request.mode, options, nullptr);
+    if (m_archiveQueryAdapter && m_archiveQueryAdapter->canHandlePath(request.rootPath)) {
+        return m_archiveQueryAdapter->query(request.rootPath, request.mode, options, nullptr);
     }
 
     QueryResult result;

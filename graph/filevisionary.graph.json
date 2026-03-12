@@ -43,8 +43,10 @@
         "src/core/querylang/QueryPlan.cpp",
         "src/core/querylang/QueryParseResult.cpp",
         "src/core/querylang/QueryParser.cpp",
+        "src/core/archive/ArchiveQueryAdapter.cpp",
         "src/core/archive/ArchiveProvider.cpp",
         "src/core/archive/ArchiveReader.cpp",
+        "src/core/archive/ArchiveSnapshotAdapter.cpp",
         "src/util/PathUtils.cpp"
       ],
       "include_dirs": [

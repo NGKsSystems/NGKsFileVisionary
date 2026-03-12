@@ -1,14 +1,17 @@
 #include "SnapshotEngine.h"
 
+#include <QCryptographicHash>
 #include <QDateTime>
 #include <QDir>
 #include <QFileInfo>
 
+#include "core/archive/ArchiveSnapshotAdapter.h"
 #include "SnapshotRepository.h"
 #include "core/db/MetaStore.h"
 #include "core/db/SqlHelpers.h"
 #include "core/query/QueryCore.h"
 #include "core/query/QueryTypes.h"
+#include "util/PathUtils.h"
 
 namespace {
 QString parentPathFor(const QString& absolutePath)
@@ -21,6 +24,7 @@ SnapshotEntryRecord toSnapshotEntry(qint64 snapshotId, const QueryRow& row)
 {
     SnapshotEntryRecord out;
     out.snapshotId = snapshotId;
+    out.virtualPath = QDir::fromNativeSeparators(row.path);
     out.entryPath = QDir::fromNativeSeparators(QDir::cleanPath(row.path));
     out.parentPath = parentPathFor(out.entryPath);
     out.name = row.name;
@@ -34,6 +38,16 @@ SnapshotEntryRecord toSnapshotEntry(qint64 snapshotId, const QueryRow& row)
     out.systemFlag = row.systemFlag;
     out.archiveFlag = row.archiveFlag;
     out.existsFlag = row.existsFlag;
+    if (PathUtils::isArchiveVirtualPath(out.virtualPath)) {
+        PathUtils::splitArchiveVirtualPath(out.virtualPath, &out.archiveSource, &out.archiveEntryPath);
+    }
+    const QString hashPayload = QStringLiteral("%1|%2|%3|%4")
+                                    .arg(out.virtualPath)
+                                    .arg(out.hasSizeBytes ? QString::number(out.sizeBytes) : QStringLiteral("null"))
+                                    .arg(out.modifiedUtc)
+                                    .arg(out.archiveEntryPath);
+    out.entryHash = QString::fromLatin1(QCryptographicHash::hash(hashPayload.toUtf8(), QCryptographicHash::Sha256).toHex());
+    out.hasEntryHash = !out.entryHash.isEmpty();
     return out;
 }
 }
@@ -76,20 +90,6 @@ SnapshotCreateResult SnapshotEngine::createSnapshot(const QString& rootPath,
         return result;
     }
 
-    QString errorText;
-    IndexRootRecord indexedRoot;
-    if (!m_store.getIndexRoot(result.rootPath, &indexedRoot, &errorText)) {
-        result.errorText = QStringLiteral("unindexed_root:%1").arg(errorText);
-        return result;
-    }
-
-    EntryRecord rootEntry;
-    if (!m_store.getEntryByPath(result.rootPath, &rootEntry, &errorText)) {
-        result.errorText = QStringLiteral("indexed_root_missing_entry:%1").arg(errorText);
-        return result;
-    }
-
-    QueryCore queryCore(m_store);
     QueryOptions queryOptions;
     queryOptions.includeHidden = options.includeHidden;
     queryOptions.includeSystem = options.includeSystem;
@@ -99,19 +99,42 @@ SnapshotCreateResult SnapshotEngine::createSnapshot(const QString& rootPath,
     queryOptions.sortField = QuerySortField::Path;
     queryOptions.ascending = true;
 
-    const QueryResult queryResult = queryCore.querySubtree(result.rootPath, queryOptions);
-    if (!queryResult.ok) {
-        result.errorText = QStringLiteral("query_subtree_failed:%1").arg(queryResult.errorText);
-        return result;
-    }
-
     QVector<SnapshotEntryRecord> entries;
-    entries.reserve(queryResult.rows.size());
-    for (const QueryRow& row : queryResult.rows) {
-        if (!row.existsFlag) {
-            continue;
+    QString errorText;
+
+    ArchiveNav::ArchiveSnapshotAdapter archiveAdapter;
+    if (archiveAdapter.canHandlePath(result.rootPath)) {
+        if (!archiveAdapter.collectSnapshotEntries(result.rootPath, queryOptions, &entries, &errorText, nullptr)) {
+            result.errorText = QStringLiteral("archive_snapshot_collect_failed:%1").arg(errorText);
+            return result;
         }
-        entries.push_back(toSnapshotEntry(0, row));
+    } else {
+        IndexRootRecord indexedRoot;
+        if (!m_store.getIndexRoot(result.rootPath, &indexedRoot, &errorText)) {
+            result.errorText = QStringLiteral("unindexed_root:%1").arg(errorText);
+            return result;
+        }
+
+        EntryRecord rootEntry;
+        if (!m_store.getEntryByPath(result.rootPath, &rootEntry, &errorText)) {
+            result.errorText = QStringLiteral("indexed_root_missing_entry:%1").arg(errorText);
+            return result;
+        }
+
+        QueryCore queryCore(m_store);
+        const QueryResult queryResult = queryCore.querySubtree(result.rootPath, queryOptions);
+        if (!queryResult.ok) {
+            result.errorText = QStringLiteral("query_subtree_failed:%1").arg(queryResult.errorText);
+            return result;
+        }
+
+        entries.reserve(queryResult.rows.size());
+        for (const QueryRow& row : queryResult.rows) {
+            if (!row.existsFlag) {
+                continue;
+            }
+            entries.push_back(toSnapshotEntry(0, row));
+        }
     }
 
     SnapshotRecord snapshot;
@@ -217,6 +240,9 @@ bool SnapshotEngine::exportSnapshotSummary(qint64 snapshotId, QString* summaryOu
     qint64 fileCount = 0;
     qint64 hiddenCount = 0;
     qint64 systemCount = 0;
+    qint64 archiveCount = 0;
+    qint64 archiveSourcedCount = 0;
+    qint64 hashCount = 0;
     for (const SnapshotEntryRecord& entry : entries) {
         if (entry.isDir) {
             ++dirCount;
@@ -228,6 +254,15 @@ bool SnapshotEngine::exportSnapshotSummary(qint64 snapshotId, QString* summaryOu
         }
         if (entry.systemFlag) {
             ++systemCount;
+        }
+        if (entry.archiveFlag) {
+            ++archiveCount;
+        }
+        if (!entry.archiveSource.isEmpty()) {
+            ++archiveSourcedCount;
+        }
+        if (entry.hasEntryHash && !entry.entryHash.isEmpty()) {
+            ++hashCount;
         }
     }
 
@@ -243,6 +278,9 @@ bool SnapshotEngine::exportSnapshotSummary(qint64 snapshotId, QString* summaryOu
     lines << QStringLiteral("file_count=%1").arg(fileCount);
     lines << QStringLiteral("hidden_count=%1").arg(hiddenCount);
     lines << QStringLiteral("system_count=%1").arg(systemCount);
+    lines << QStringLiteral("archive_count=%1").arg(archiveCount);
+    lines << QStringLiteral("archive_sourced_count=%1").arg(archiveSourcedCount);
+    lines << QStringLiteral("hash_count=%1").arg(hashCount);
     lines << QStringLiteral("options_json=%1").arg(snapshot.optionsJson);
 
     *summaryOut = lines.join(QStringLiteral("\n"));

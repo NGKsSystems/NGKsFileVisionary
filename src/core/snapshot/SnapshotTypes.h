@@ -32,6 +32,7 @@ struct SnapshotEntryRecord
 {
     qint64 id = 0;
     qint64 snapshotId = 0;
+    QString virtualPath;
     QString entryPath;
     QString parentPath;
     QString name;
@@ -45,6 +46,10 @@ struct SnapshotEntryRecord
     bool systemFlag = false;
     bool archiveFlag = false;
     bool existsFlag = true;
+    QString archiveSource;
+    QString archiveEntryPath;
+    QString entryHash;
+    bool hasEntryHash = false;
 };
 
 struct SnapshotCreateResult

@@ -4,6 +4,7 @@
 #include <QSqlError>
 #include <QSqlQuery>
 #include <QVariant>
+#include <QVector>
 
 #include "DbConnection.h"
 #include "SqlHelpers.h"
@@ -97,6 +98,13 @@ bool DbMigrations::migrate(DbConnection& connection, QString* migrationLog)
         ok = applyV3(connection, &errorText);
         if (migrationLog) {
             migrationLog->append(ok ? QStringLiteral("applied_v3=true\n") : QStringLiteral("applied_v3=false\n"));
+        }
+    }
+
+    if (ok && current < 4) {
+        ok = applyV4(connection, &errorText);
+        if (migrationLog) {
+            migrationLog->append(ok ? QStringLiteral("applied_v4=true\n") : QStringLiteral("applied_v4=false\n"));
         }
     }
 
@@ -344,6 +352,7 @@ bool DbMigrations::applyV3(DbConnection& connection, QString* errorText)
                        "id INTEGER PRIMARY KEY AUTOINCREMENT," \
                        "snapshot_id INTEGER NOT NULL," \
                        "entry_path TEXT NOT NULL," \
+                       "virtual_path TEXT," \
                        "parent_path TEXT," \
                        "name TEXT NOT NULL," \
                        "normalized_name TEXT NOT NULL," \
@@ -355,10 +364,16 @@ bool DbMigrations::applyV3(DbConnection& connection, QString* errorText)
                        "system_flag INTEGER NOT NULL DEFAULT 0," \
                        "archive_flag INTEGER NOT NULL DEFAULT 0," \
                        "exists_flag INTEGER NOT NULL DEFAULT 1," \
+                       "archive_source TEXT," \
+                       "archive_entry_path TEXT," \
+                       "entry_hash TEXT," \
                        "FOREIGN KEY(snapshot_id) REFERENCES snapshots(id)" \
                        ");"),
         QStringLiteral("CREATE INDEX IF NOT EXISTS idx_snapshot_entries_snapshot_id ON snapshot_entries(snapshot_id);"),
         QStringLiteral("CREATE INDEX IF NOT EXISTS idx_snapshot_entries_path ON snapshot_entries(entry_path);"),
+        QStringLiteral("CREATE INDEX IF NOT EXISTS idx_snapshot_entries_virtual_path ON snapshot_entries(virtual_path);"),
+        QStringLiteral("CREATE INDEX IF NOT EXISTS idx_snapshot_entries_archive_source ON snapshot_entries(archive_source);"),
+        QStringLiteral("CREATE INDEX IF NOT EXISTS idx_snapshot_entries_archive_entry_path ON snapshot_entries(archive_entry_path);"),
         QStringLiteral("CREATE INDEX IF NOT EXISTS idx_snapshot_entries_parent_path ON snapshot_entries(parent_path);"),
         QStringLiteral("CREATE INDEX IF NOT EXISTS idx_snapshot_entries_name ON snapshot_entries(name);"),
         QStringLiteral("CREATE INDEX IF NOT EXISTS idx_snapshots_root_path ON snapshots(root_path);"),
@@ -366,4 +381,49 @@ bool DbMigrations::applyV3(DbConnection& connection, QString* errorText)
     };
 
     return execBatch(connection.database(), statements, errorText);
+}
+
+bool DbMigrations::applyV4(DbConnection& connection, QString* errorText)
+{
+    QSqlDatabase db = connection.database();
+
+    struct ColumnDef
+    {
+        QString name;
+        QString typeSql;
+    };
+
+    const QVector<ColumnDef> newColumns = {
+        {QStringLiteral("virtual_path"), QStringLiteral("TEXT")},
+        {QStringLiteral("archive_source"), QStringLiteral("TEXT")},
+        {QStringLiteral("archive_entry_path"), QStringLiteral("TEXT")},
+        {QStringLiteral("entry_hash"), QStringLiteral("TEXT")}
+    };
+
+    for (const ColumnDef& col : newColumns) {
+        const bool exists = columnExists(db, QStringLiteral("snapshot_entries"), col.name, errorText);
+        if (!exists && errorText && !errorText->isEmpty()) {
+            return false;
+        }
+        if (exists) {
+            continue;
+        }
+
+        QSqlQuery alter(db);
+        const QString sql = QStringLiteral("ALTER TABLE snapshot_entries ADD COLUMN %1 %2;").arg(col.name, col.typeSql);
+        if (!alter.exec(sql)) {
+            if (errorText) {
+                *errorText = alter.lastError().text();
+            }
+            return false;
+        }
+    }
+
+    const QStringList statements = {
+        QStringLiteral("UPDATE snapshot_entries SET virtual_path=entry_path WHERE virtual_path IS NULL OR TRIM(virtual_path)='';"),
+        QStringLiteral("CREATE INDEX IF NOT EXISTS idx_snapshot_entries_virtual_path ON snapshot_entries(virtual_path);"),
+        QStringLiteral("CREATE INDEX IF NOT EXISTS idx_snapshot_entries_archive_source ON snapshot_entries(archive_source);"),
+        QStringLiteral("CREATE INDEX IF NOT EXISTS idx_snapshot_entries_archive_entry_path ON snapshot_entries(archive_entry_path);")
+    };
+    return execBatch(db, statements, errorText);
 }

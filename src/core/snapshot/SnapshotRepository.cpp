@@ -30,18 +30,26 @@ SnapshotEntryRecord snapshotEntryFromQuery(const QSqlQuery& q)
     r.id = q.value(0).toLongLong();
     r.snapshotId = q.value(1).toLongLong();
     r.entryPath = q.value(2).toString();
-    r.parentPath = q.value(3).toString();
-    r.name = q.value(4).toString();
-    r.normalizedName = q.value(5).toString();
-    r.extension = q.value(6).toString();
-    r.isDir = q.value(7).toInt() != 0;
-    r.sizeBytes = q.value(8).toLongLong();
-    r.hasSizeBytes = !q.value(8).isNull();
-    r.modifiedUtc = q.value(9).toString();
-    r.hiddenFlag = q.value(10).toInt() != 0;
-    r.systemFlag = q.value(11).toInt() != 0;
-    r.archiveFlag = q.value(12).toInt() != 0;
-    r.existsFlag = q.value(13).toInt() != 0;
+    r.virtualPath = q.value(3).toString();
+    if (r.virtualPath.isEmpty()) {
+        r.virtualPath = r.entryPath;
+    }
+    r.parentPath = q.value(4).toString();
+    r.name = q.value(5).toString();
+    r.normalizedName = q.value(6).toString();
+    r.extension = q.value(7).toString();
+    r.isDir = q.value(8).toInt() != 0;
+    r.sizeBytes = q.value(9).toLongLong();
+    r.hasSizeBytes = !q.value(9).isNull();
+    r.modifiedUtc = q.value(10).toString();
+    r.hiddenFlag = q.value(11).toInt() != 0;
+    r.systemFlag = q.value(12).toInt() != 0;
+    r.archiveFlag = q.value(13).toInt() != 0;
+    r.existsFlag = q.value(14).toInt() != 0;
+    r.archiveSource = q.value(15).toString();
+    r.archiveEntryPath = q.value(16).toString();
+    r.entryHash = q.value(17).toString();
+    r.hasEntryHash = !q.value(17).isNull() && !r.entryHash.isEmpty();
     return r;
 }
 }
@@ -124,23 +132,28 @@ bool SnapshotRepository::insertSnapshotEntries(qint64 snapshotId,
 
     QSqlQuery q(db);
     q.prepare(QStringLiteral(
-        "INSERT INTO snapshot_entries(snapshot_id, entry_path, parent_path, name, normalized_name, extension, is_dir, size_bytes, modified_utc, hidden_flag, system_flag, archive_flag, exists_flag) "
-        "VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);"));
+        "INSERT INTO snapshot_entries(snapshot_id, entry_path, virtual_path, parent_path, name, normalized_name, extension, is_dir, size_bytes, modified_utc, hidden_flag, system_flag, archive_flag, exists_flag, archive_source, archive_entry_path, entry_hash) "
+        "VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);"));
 
     for (const SnapshotEntryRecord& entry : entries) {
+        const QString effectiveVirtualPath = entry.virtualPath.isEmpty() ? entry.entryPath : entry.virtualPath;
         q.bindValue(0, snapshotId);
         q.bindValue(1, entry.entryPath);
-        q.bindValue(2, entry.parentPath);
-        q.bindValue(3, entry.name);
-        q.bindValue(4, entry.normalizedName);
-        q.bindValue(5, entry.extension);
-        q.bindValue(6, SqlHelpers::boolToInt(entry.isDir));
-        q.bindValue(7, SqlHelpers::nullableInt64(entry.hasSizeBytes, entry.sizeBytes));
-        q.bindValue(8, entry.modifiedUtc);
-        q.bindValue(9, SqlHelpers::boolToInt(entry.hiddenFlag));
-        q.bindValue(10, SqlHelpers::boolToInt(entry.systemFlag));
-        q.bindValue(11, SqlHelpers::boolToInt(entry.archiveFlag));
-        q.bindValue(12, SqlHelpers::boolToInt(entry.existsFlag));
+        q.bindValue(2, effectiveVirtualPath);
+        q.bindValue(3, entry.parentPath);
+        q.bindValue(4, entry.name);
+        q.bindValue(5, entry.normalizedName);
+        q.bindValue(6, entry.extension);
+        q.bindValue(7, SqlHelpers::boolToInt(entry.isDir));
+        q.bindValue(8, SqlHelpers::nullableInt64(entry.hasSizeBytes, entry.sizeBytes));
+        q.bindValue(9, entry.modifiedUtc);
+        q.bindValue(10, SqlHelpers::boolToInt(entry.hiddenFlag));
+        q.bindValue(11, SqlHelpers::boolToInt(entry.systemFlag));
+        q.bindValue(12, SqlHelpers::boolToInt(entry.archiveFlag));
+        q.bindValue(13, SqlHelpers::boolToInt(entry.existsFlag));
+        q.bindValue(14, entry.archiveSource);
+        q.bindValue(15, entry.archiveEntryPath);
+        q.bindValue(16, entry.hasEntryHash ? QVariant(entry.entryHash) : QVariant(QVariant::String));
 
         if (!q.exec()) {
             if (errorText) {
@@ -306,7 +319,7 @@ bool SnapshotRepository::listSnapshotEntries(qint64 snapshotId,
     out->clear();
     QSqlQuery q(db);
     q.prepare(QStringLiteral(
-        "SELECT id, snapshot_id, entry_path, parent_path, name, normalized_name, extension, is_dir, size_bytes, modified_utc, hidden_flag, system_flag, archive_flag, exists_flag "
+        "SELECT id, snapshot_id, entry_path, virtual_path, parent_path, name, normalized_name, extension, is_dir, size_bytes, modified_utc, hidden_flag, system_flag, archive_flag, exists_flag, archive_source, archive_entry_path, entry_hash "
         "FROM snapshot_entries WHERE snapshot_id=? ORDER BY is_dir DESC, normalized_name ASC, entry_path ASC;"));
     q.addBindValue(snapshotId);
 

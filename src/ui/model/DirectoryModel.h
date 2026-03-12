@@ -9,7 +9,7 @@
 
 class VisionIndexService;
 namespace ArchiveNav {
-class ArchiveProvider;
+class ArchiveQueryAdapter;
 }
 
 class DirectoryModel
@@ -50,6 +50,6 @@ public:
 
 private:
     VisionIndexService* m_visionService;
-    ArchiveNav::ArchiveProvider* m_archiveProvider;
+    ArchiveNav::ArchiveQueryAdapter* m_archiveQueryAdapter;
     QString m_dbPath;
 };
