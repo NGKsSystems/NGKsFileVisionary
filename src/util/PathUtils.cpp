@@ -1,5 +1,6 @@
 #include "PathUtils.h"
 
+#include <QDir>
 #include <QFileInfo>
 
 namespace
@@ -7,6 +8,8 @@ namespace
 const QStringList kArchiveExtensions = {
     ".7z", ".zip", ".tar", ".tar.gz", ".tar.xz", ".tgz", ".gz", ".xz"
 };
+
+const QString kArchiveVirtualSeparator = QStringLiteral("::");
 }
 
 namespace PathUtils
@@ -33,6 +36,59 @@ bool isArchivePath(const QString& path)
         }
     }
     return false;
+}
+
+bool isArchiveVirtualPath(const QString& path)
+{
+    return path.contains(kArchiveVirtualSeparator);
+}
+
+QString buildArchiveVirtualPath(const QString& archivePath, const QString& internalPath)
+{
+    const QString archive = QDir::cleanPath(archivePath);
+    const QString internal = normalizeInternalPath(internalPath);
+    if (internal.isEmpty()) {
+        return archive;
+    }
+    return archive + kArchiveVirtualSeparator + internal;
+}
+
+bool splitArchiveVirtualPath(const QString& path, QString* archivePath, QString* internalPath)
+{
+    const int sep = path.indexOf(kArchiveVirtualSeparator);
+    if (sep <= 0) {
+        return false;
+    }
+
+    const QString archive = QDir::cleanPath(path.left(sep));
+    const QString internal = normalizeInternalPath(path.mid(sep + kArchiveVirtualSeparator.size()));
+    if (archivePath) {
+        *archivePath = archive;
+    }
+    if (internalPath) {
+        *internalPath = internal;
+    }
+    return true;
+}
+
+QString archiveVirtualParentPath(const QString& path)
+{
+    QString archivePath;
+    QString internalPath;
+    if (!splitArchiveVirtualPath(path, &archivePath, &internalPath)) {
+        return QString();
+    }
+
+    if (internalPath.isEmpty()) {
+        return QFileInfo(archivePath).absolutePath();
+    }
+
+    const int slash = internalPath.lastIndexOf('/');
+    if (slash < 0) {
+        return archivePath;
+    }
+
+    return buildArchiveVirtualPath(archivePath, internalPath.left(slash));
 }
 
 QStringList splitExtensionsFilter(const QString& rawFilter)

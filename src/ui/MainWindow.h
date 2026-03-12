@@ -96,6 +96,7 @@ private:
     void appendRuntimeLog(const QString& message) const;
     void startScanNow();
     bool isInternalNavigableDirectory(const QFileInfo& fileInfo) const;
+    bool isNavigablePath(const QString& path) const;
     void navigateToDirectory(const QString& path, bool pushHistory = true);
     void updateNavigationButtons();
     void rebuildSidebar();

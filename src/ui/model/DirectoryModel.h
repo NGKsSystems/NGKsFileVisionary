@@ -8,6 +8,9 @@
 #include "core/query/QueryTypes.h"
 
 class VisionIndexService;
+namespace ArchiveNav {
+class ArchiveProvider;
+}
 
 class DirectoryModel
 {
@@ -47,5 +50,6 @@ public:
 
 private:
     VisionIndexService* m_visionService;
+    ArchiveNav::ArchiveProvider* m_archiveProvider;
     QString m_dbPath;
 };

@@ -23,6 +23,7 @@
 #include <thread>
 
 #include "core/db/MetaStore.h"
+#include "core/archive/ArchiveProvider.h"
 #include "core/perf/BatchCoordinator.h"
 #include "core/perf/LargeTreeHarness.h"
 #include "core/perf/PerfMetrics.h"
@@ -51,6 +52,7 @@
 #include "ui/model/QueryResultAdapter.h"
 #include "ui/query/QueryBarWidget.h"
 #include "ui/query/QueryController.h"
+#include "util/PathUtils.h"
 
 #ifdef _MSC_VER
 #pragma comment(linker, "/SUBSYSTEM:WINDOWS")
@@ -133,6 +135,14 @@ struct QueryBarSmokeCliOptions {
     QString queryDbPath;
     QString queryRoot;
     QString queryLogPath;
+    QStringList argsReceived;
+    QString parseError;
+};
+
+struct ArchiveSmokeCliOptions {
+    bool enabled = false;
+    QString archiveRoot;
+    QString archiveLogPath;
     QStringList argsReceived;
     QString parseError;
 };
@@ -244,6 +254,16 @@ bool hasQueryBarSmokeFlag(int argc, char* argv[])
 {
     for (int i = 1; i < argc; ++i) {
         if (QString::fromLocal8Bit(argv[i]) == QStringLiteral("--querybar-smoke")) {
+            return true;
+        }
+    }
+    return false;
+}
+
+bool hasArchiveSmokeFlag(int argc, char* argv[])
+{
+    for (int i = 1; i < argc; ++i) {
+        if (QString::fromLocal8Bit(argv[i]) == QStringLiteral("--archive-smoke")) {
             return true;
         }
     }
@@ -724,6 +744,51 @@ QueryBarSmokeCliOptions parseQueryBarSmokeOptions(int argc, char* argv[])
                 break;
             }
             options.queryLogPath = QDir::cleanPath(options.queryLogPath);
+            continue;
+        }
+    }
+
+    return options;
+}
+
+ArchiveSmokeCliOptions parseArchiveSmokeOptions(int argc, char* argv[])
+{
+    ArchiveSmokeCliOptions options;
+
+    for (int i = 0; i < argc; ++i) {
+        options.argsReceived << QString::fromLocal8Bit(argv[i]);
+    }
+
+    for (int i = 1; i < argc; ++i) {
+        const QString token = QString::fromLocal8Bit(argv[i]);
+        if (token == QStringLiteral("--archive-smoke")) {
+            options.enabled = true;
+            continue;
+        }
+
+        auto consumeValue = [&](QString* out) {
+            if ((i + 1) >= argc) {
+                options.parseError = QStringLiteral("missing_value_for_%1").arg(token);
+                return false;
+            }
+            ++i;
+            *out = QString::fromLocal8Bit(argv[i]);
+            return true;
+        };
+
+        if (token == QStringLiteral("--archive-root")) {
+            if (!consumeValue(&options.archiveRoot)) {
+                break;
+            }
+            options.archiveRoot = QDir::cleanPath(options.archiveRoot);
+            continue;
+        }
+
+        if (token == QStringLiteral("--archive-log")) {
+            if (!consumeValue(&options.archiveLogPath)) {
+                break;
+            }
+            options.archiveLogPath = QDir::cleanPath(options.archiveLogPath);
             continue;
         }
     }
@@ -1383,6 +1448,223 @@ int runQueryBarSmokeCli(int argc, char* argv[])
     } catch (...) {
         writeStderrLine(QStringLiteral("querybar_smoke_error=unexpected_error"));
         return finishFail(281, QStringLiteral("unexpected_error"));
+    }
+}
+
+int runArchiveSmokeCli(int argc, char* argv[])
+{
+    QCoreApplication cliApp(argc, argv);
+
+    const ArchiveSmokeCliOptions options = parseArchiveSmokeOptions(argc, argv);
+    const QString exePath = QFileInfo(QString::fromLocal8Bit(argv[0])).absoluteFilePath();
+    const QString cwd = QDir::currentPath();
+
+    if (!options.parseError.isEmpty()) {
+        writeStderrLine(QStringLiteral("archive_smoke_parse_error=%1").arg(options.parseError));
+        return 282;
+    }
+
+    if (options.archiveLogPath.trimmed().isEmpty()) {
+        writeStderrLine(QStringLiteral("archive_smoke_error=missing_required_arg_--archive-log"));
+        return 283;
+    }
+
+    IndexSmokeLogWriter log;
+    QString logOpenError;
+    if (!log.open(options.archiveLogPath, &logOpenError)) {
+        writeStderrLine(QStringLiteral("archive_smoke_error=log_open_failed"));
+        writeStderrLine(QStringLiteral("archive_smoke_log_path=%1").arg(QDir::toNativeSeparators(options.archiveLogPath)));
+        writeStderrLine(QStringLiteral("archive_smoke_log_error=%1").arg(logOpenError));
+        return 284;
+    }
+
+    auto finishFail = [&](int exitCode, const QString& reason) {
+        log.writeLine(QStringLiteral("final_status=FAIL"));
+        log.writeLine(QStringLiteral("exit_code=%1").arg(exitCode));
+        log.writeLine(QStringLiteral("failure_reason=%1").arg(reason));
+        log.writeLine(QStringLiteral("timestamp_utc_end=%1").arg(QDateTime::currentDateTimeUtc().toString(Qt::ISODate)));
+        return exitCode;
+    };
+
+    try {
+        if (options.archiveRoot.trimmed().isEmpty()) {
+            writeStderrLine(QStringLiteral("archive_smoke_error=missing_required_arg_--archive-root"));
+            return finishFail(285, QStringLiteral("missing_required_arg_--archive-root"));
+        }
+
+        const QString normalizedRoot = QDir::fromNativeSeparators(QDir::cleanPath(options.archiveRoot));
+        if (!QDir().mkpath(normalizedRoot)) {
+            return finishFail(286, QStringLiteral("unable_to_create_archive_root"));
+        }
+
+        log.writeLine(QStringLiteral("mode=archive_smoke"));
+        log.writeLine(QStringLiteral("startup_banner=ARCHIVE_SMOKE_BEGIN"));
+        log.writeLine(QStringLiteral("exe_path=%1").arg(QDir::toNativeSeparators(exePath)));
+        log.writeLine(QStringLiteral("cwd=%1").arg(QDir::toNativeSeparators(cwd)));
+        log.writeLine(QStringLiteral("args_received=%1").arg(options.argsReceived.join(QStringLiteral(" | "))));
+        log.writeLine(QStringLiteral("archive_root=%1").arg(QDir::toNativeSeparators(normalizedRoot)));
+        log.writeLine(QStringLiteral("timestamp_utc=%1").arg(QDateTime::currentDateTimeUtc().toString(Qt::ISODate)));
+
+        const QString seedRoot = QDir(normalizedRoot).filePath(QStringLiteral("archive_seed"));
+        const QString srcDir = QDir(seedRoot).filePath(QStringLiteral("src"));
+        const QString docsDir = QDir(seedRoot).filePath(QStringLiteral("docs"));
+        QDir().mkpath(srcDir);
+        QDir().mkpath(docsDir);
+
+        {
+            QFile f(QDir(srcDir).filePath(QStringLiteral("main.cpp")));
+            if (!f.open(QIODevice::WriteOnly | QIODevice::Text | QIODevice::Truncate)) {
+                return finishFail(287, QStringLiteral("unable_to_write_seed_main_cpp"));
+            }
+            QTextStream out(&f);
+            out << "int main(){return 0;}\n";
+        }
+        {
+            QFile f(QDir(srcDir).filePath(QStringLiteral("util.cpp")));
+            if (!f.open(QIODevice::WriteOnly | QIODevice::Text | QIODevice::Truncate)) {
+                return finishFail(288, QStringLiteral("unable_to_write_seed_util_cpp"));
+            }
+            QTextStream out(&f);
+            out << "int util(){return 1;}\n";
+        }
+        {
+            QFile f(QDir(docsDir).filePath(QStringLiteral("readme.md")));
+            if (!f.open(QIODevice::WriteOnly | QIODevice::Text | QIODevice::Truncate)) {
+                return finishFail(289, QStringLiteral("unable_to_write_seed_readme_md"));
+            }
+            QTextStream out(&f);
+            out << "readme\n";
+        }
+
+        auto resolve7zaPath = [&]() {
+            const QString appDir = QCoreApplication::applicationDirPath();
+            const QStringList candidates = {
+                QDir(appDir).filePath(QStringLiteral("../third_party/7zip/7za.exe")),
+                QDir(appDir).filePath(QStringLiteral("../../third_party/7zip/7za.exe")),
+                QDir(appDir).filePath(QStringLiteral("../../../third_party/7zip/7za.exe")),
+                QDir::current().filePath(QStringLiteral("third_party/7zip/7za.exe")),
+            };
+            for (const QString& candidate : candidates) {
+                if (QFileInfo::exists(candidate)) {
+                    return candidate;
+                }
+            }
+            return candidates.first();
+        };
+
+        const QString sevenZip = resolve7zaPath();
+        if (!QFileInfo::exists(sevenZip)) {
+            return finishFail(290, QStringLiteral("missing_7za"));
+        }
+
+        auto run7za = [&](const QStringList& args, const QString& workingDir, const QString& opName) {
+            QProcess proc;
+            if (!workingDir.isEmpty()) {
+                proc.setWorkingDirectory(workingDir);
+            }
+            proc.start(sevenZip, args);
+            if (!proc.waitForStarted(5000)) {
+                return false;
+            }
+            if (!proc.waitForFinished(120000)) {
+                proc.kill();
+                return false;
+            }
+            log.writeLine(QStringLiteral("7za_%1_exit=%2").arg(opName).arg(proc.exitCode()));
+            return proc.exitStatus() == QProcess::NormalExit && proc.exitCode() == 0;
+        };
+
+        const QString zipPath = QDir(normalizedRoot).filePath(QStringLiteral("archive_test.zip"));
+        const QString tarPath = QDir(normalizedRoot).filePath(QStringLiteral("archive_test.tar"));
+        const QString tarGzPath = QDir(normalizedRoot).filePath(QStringLiteral("archive_test.tar.gz"));
+
+        QFile::remove(zipPath);
+        QFile::remove(tarPath);
+        QFile::remove(tarGzPath);
+
+        if (!run7za({QStringLiteral("a"), zipPath, QStringLiteral("src"), QStringLiteral("docs"), QStringLiteral("-y")}, seedRoot, QStringLiteral("zip_create"))) {
+            return finishFail(291, QStringLiteral("zip_create_failed"));
+        }
+        if (!run7za({QStringLiteral("a"), QStringLiteral("-ttar"), tarPath, QStringLiteral("src"), QStringLiteral("docs"), QStringLiteral("-y")}, seedRoot, QStringLiteral("tar_create"))) {
+            return finishFail(292, QStringLiteral("tar_create_failed"));
+        }
+        if (!run7za({QStringLiteral("a"), QStringLiteral("-tgzip"), tarGzPath, QFileInfo(tarPath).fileName(), QStringLiteral("-y")}, normalizedRoot, QStringLiteral("targz_create"))) {
+            return finishFail(293, QStringLiteral("targz_create_failed"));
+        }
+
+        ArchiveNav::ArchiveProvider provider;
+        const bool detectZip = provider.canHandlePath(zipPath);
+        const bool detectTar = provider.canHandlePath(tarPath);
+        const bool detectTarGz = provider.canHandlePath(tarGzPath);
+        log.writeLine(QStringLiteral("detect_zip=%1").arg(detectZip ? QStringLiteral("true") : QStringLiteral("false")));
+        log.writeLine(QStringLiteral("detect_tar=%1").arg(detectTar ? QStringLiteral("true") : QStringLiteral("false")));
+        log.writeLine(QStringLiteral("detect_targz=%1").arg(detectTarGz ? QStringLiteral("true") : QStringLiteral("false")));
+
+        QueryOptions options;
+        options.sortField = QuerySortField::Name;
+        options.ascending = true;
+
+        QString readerLog;
+        const QueryResult rootListing = provider.query(zipPath, ViewModeController::UiViewMode::Standard, options, &readerLog);
+        log.writeLine(QStringLiteral("root_listing_ok=%1").arg(rootListing.ok ? QStringLiteral("true") : QStringLiteral("false")));
+        log.writeLine(QStringLiteral("root_listing_count=%1").arg(rootListing.totalCount));
+        log.writeLine(QStringLiteral("archive_reader_log_begin"));
+        log.writeLine(readerLog.left(4000));
+        log.writeLine(QStringLiteral("archive_reader_log_end"));
+
+        const QString srcVirtual = PathUtils::buildArchiveVirtualPath(zipPath, QStringLiteral("src"));
+        const QueryResult nestedListing = provider.query(srcVirtual, ViewModeController::UiViewMode::Standard, options, nullptr);
+        log.writeLine(QStringLiteral("nested_listing_ok=%1").arg(nestedListing.ok ? QStringLiteral("true") : QStringLiteral("false")));
+        log.writeLine(QStringLiteral("nested_listing_count=%1").arg(nestedListing.totalCount));
+
+        const QString nestedFileVirtual = PathUtils::buildArchiveVirtualPath(zipPath, QStringLiteral("src/main.cpp"));
+        const QString nestedParent = PathUtils::archiveVirtualParentPath(nestedFileVirtual);
+        const QString archiveParent = PathUtils::archiveVirtualParentPath(srcVirtual);
+        const bool parentNavigationOk = (nestedParent == srcVirtual) && (archiveParent == zipPath);
+        log.writeLine(QStringLiteral("nested_parent=%1").arg(QDir::toNativeSeparators(nestedParent)));
+        log.writeLine(QStringLiteral("archive_parent=%1").arg(QDir::toNativeSeparators(archiveParent)));
+        log.writeLine(QStringLiteral("parent_navigation_ok=%1").arg(parentNavigationOk ? QStringLiteral("true") : QStringLiteral("false")));
+
+        QueryParser parser;
+        const QueryParseResult parseResult = parser.parse(QStringLiteral("ext:.cpp"));
+        log.writeLine(QStringLiteral("query_parse_ok=%1").arg(parseResult.ok ? QStringLiteral("true") : QStringLiteral("false")));
+        log.writeLine(QStringLiteral("query_parse_error=%1").arg(parseResult.errorMessage));
+        QueryResult queryResult;
+        if (parseResult.ok) {
+            QueryOptions queryOptions = parseResult.plan.toQueryOptions();
+            queryResult = provider.query(zipPath, ViewModeController::UiViewMode::Standard, queryOptions, nullptr);
+        }
+        log.writeLine(QStringLiteral("query_inside_archive_ok=%1").arg(queryResult.ok ? QStringLiteral("true") : QStringLiteral("false")));
+        log.writeLine(QStringLiteral("query_inside_archive_count=%1").arg(queryResult.totalCount));
+        for (int i = 0; i < qMin(10, queryResult.rows.size()); ++i) {
+            const QueryRow& row = queryResult.rows.at(i);
+            log.writeLine(QStringLiteral("query_row path=%1 ext=%2 is_dir=%3")
+                              .arg(QDir::toNativeSeparators(row.path))
+                              .arg(row.extension)
+                              .arg(row.isDir ? QStringLiteral("true") : QStringLiteral("false")));
+        }
+
+        const bool listingOk = rootListing.ok && rootListing.totalCount >= 2;
+        const bool nestedOk = nestedListing.ok && nestedListing.totalCount >= 2;
+        const bool queryOk = parseResult.ok && queryResult.ok && queryResult.totalCount >= 2;
+        const bool detectOk = detectZip && detectTar && detectTarGz;
+
+        const bool pass = detectOk && listingOk && nestedOk && parentNavigationOk && queryOk;
+        if (!pass) {
+            return finishFail(294, QStringLiteral("archive_smoke_gate_failure"));
+        }
+
+        log.writeLine(QStringLiteral("final_status=PASS"));
+        log.writeLine(QStringLiteral("exit_code=0"));
+        log.writeLine(QStringLiteral("failure_reason="));
+        log.writeLine(QStringLiteral("timestamp_utc_end=%1").arg(QDateTime::currentDateTimeUtc().toString(Qt::ISODate)));
+        return 0;
+    } catch (const std::exception& ex) {
+        writeStderrLine(QStringLiteral("archive_smoke_error=unexpected_exception"));
+        return finishFail(295, QStringLiteral("unexpected_exception:%1").arg(QString::fromLocal8Bit(ex.what())));
+    } catch (...) {
+        writeStderrLine(QStringLiteral("archive_smoke_error=unexpected_error"));
+        return finishFail(296, QStringLiteral("unexpected_error"));
     }
 }
 
@@ -2683,6 +2965,10 @@ bool writeLogFile(const QString& logPath, const QStringList& lines)
 
 int main(int argc, char* argv[])
 {
+    if (hasArchiveSmokeFlag(argc, argv)) {
+        return runArchiveSmokeCli(argc, argv);
+    }
+
     if (hasQueryLangSmokeFlag(argc, argv)) {
         return runQueryLangSmokeCli(argc, argv);
     }

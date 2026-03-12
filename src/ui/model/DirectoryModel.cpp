@@ -1,14 +1,19 @@
 #include "DirectoryModel.h"
 
+#include "core/archive/ArchiveProvider.h"
 #include "core/services/VisionIndexService.h"
 
 DirectoryModel::DirectoryModel()
     : m_visionService(new VisionIndexService())
+    , m_archiveProvider(new ArchiveNav::ArchiveProvider())
 {
 }
 
 DirectoryModel::~DirectoryModel()
 {
+    delete m_archiveProvider;
+    m_archiveProvider = nullptr;
+
     delete m_visionService;
     m_visionService = nullptr;
 }
@@ -37,13 +42,6 @@ bool DirectoryModel::isReady() const
 
 QueryResult DirectoryModel::query(const Request& request)
 {
-    QueryResult result;
-    if (!isReady()) {
-        result.ok = false;
-        result.errorText = QStringLiteral("directory_model_not_ready");
-        return result;
-    }
-
     QueryOptions options;
     options.includeHidden = request.includeHidden;
     options.includeSystem = request.includeSystem;
@@ -57,6 +55,17 @@ QueryResult DirectoryModel::query(const Request& request)
     options.pageOffset = request.pageOffset;
     options.filesOnly = request.filesOnly;
     options.directoriesOnly = request.directoriesOnly;
+
+    if (m_archiveProvider && m_archiveProvider->canHandlePath(request.rootPath)) {
+        return m_archiveProvider->query(request.rootPath, request.mode, options, nullptr);
+    }
+
+    QueryResult result;
+    if (!isReady()) {
+        result.ok = false;
+        result.errorText = QStringLiteral("directory_model_not_ready");
+        return result;
+    }
 
     switch (request.mode) {
     case ViewModeController::UiViewMode::Standard:

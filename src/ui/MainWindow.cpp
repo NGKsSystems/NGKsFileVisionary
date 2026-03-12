@@ -975,9 +975,7 @@ void MainWindow::onTreeContextMenu(const QPoint& pos)
 
     if (chosen == openAction) {
         if (isArchive) {
-            auto* explorer = new ArchiveExplorer(this);
-            explorer->openArchive(firstPath);
-            explorer->show();
+            navigateToDirectory(firstPath);
         } else if (isFolder) {
             navigateToDirectory(firstPath);
         } else {
@@ -1062,18 +1060,27 @@ void MainWindow::onTreeActivated(const QModelIndex& index)
 {
     const QModelIndex sourceIndex = m_proxyModel.mapToSource(index);
     const QString path = selectedPath(sourceIndex);
+    const QString type = m_fileModel.data(m_fileModel.index(sourceIndex.row(), 1, sourceIndex.parent()), Qt::DisplayRole).toString();
+    const bool modelSaysFolder = QString::compare(type, QStringLiteral("Folder"), Qt::CaseInsensitive) == 0;
     const QFileInfo fileInfo(path);
 
-    if (isInternalNavigableDirectory(fileInfo)) {
-        appendRuntimeLog(QStringLiteral("tree_activated_internal_dir path=%1").arg(path));
-        navigateToDirectory(path);
+    if (PathUtils::isArchiveVirtualPath(path)) {
+        if (modelSaysFolder) {
+            appendRuntimeLog(QStringLiteral("tree_activated_archive_virtual_dir path=%1").arg(path));
+            navigateToDirectory(path);
+        }
         return;
     }
 
     if (PathUtils::isArchivePath(path)) {
-        auto* explorer = new ArchiveExplorer(this);
-        explorer->openArchive(path);
-        explorer->show();
+        appendRuntimeLog(QStringLiteral("tree_activated_archive_file path=%1").arg(path));
+        navigateToDirectory(path);
+        return;
+    }
+
+    if (isInternalNavigableDirectory(fileInfo)) {
+        appendRuntimeLog(QStringLiteral("tree_activated_internal_dir path=%1").arg(path));
+        navigateToDirectory(path);
         return;
     }
 
@@ -1330,6 +1337,23 @@ void MainWindow::onNavigateUp()
     if (current.isEmpty()) {
         return;
     }
+
+    if (PathUtils::isArchiveVirtualPath(current)) {
+        const QString parentPath = PathUtils::archiveVirtualParentPath(current);
+        if (!parentPath.isEmpty()) {
+            navigateToDirectory(parentPath);
+        }
+        return;
+    }
+
+    if (PathUtils::isArchivePath(current)) {
+        const QString parentPath = QFileInfo(current).absolutePath();
+        if (!parentPath.isEmpty()) {
+            navigateToDirectory(parentPath);
+        }
+        return;
+    }
+
     QDir dir(current);
     if (!dir.cdUp()) {
         return;
@@ -2141,10 +2165,11 @@ void MainWindow::startScanNow()
     m_publishQueue.clear();
     m_publishTimer.stop();
     const QString root = m_rootEdit->text().trimmed();
+    const bool archiveRoot = PathUtils::isArchivePath(root) || PathUtils::isArchiveVirtualPath(root);
     const QStringList extensions = PathUtils::splitExtensionsFilter(m_extensionFilterEdit->text());
     const QString search = m_searchEdit->text().trimmed();
 
-    if (!ensureDirectoryModelReady()) {
+    if (!archiveRoot && !ensureDirectoryModelReady()) {
         m_statusLabel->setText(QStringLiteral("Error: db_not_ready"));
         appendRuntimeLog(QStringLiteral("ui_query_error db_not_ready path=%1").arg(m_uiDbPath));
         return;
@@ -2241,7 +2266,7 @@ void MainWindow::startScanNow()
         return;
     }
 
-    m_fileModel.setViewMode(m_viewModeController.toFileViewMode(), effectiveRoot);
+    m_fileModel.setViewMode(m_viewModeController.toFileViewMode(), archiveRoot ? root : effectiveRoot);
 
     const QVector<FileEntry> rows = QueryResultAdapter::toFileEntries(result);
     m_publishQueue = rows;
@@ -2360,10 +2385,24 @@ bool MainWindow::isInternalNavigableDirectory(const QFileInfo& fileInfo) const
     return true;
 }
 
+bool MainWindow::isNavigablePath(const QString& path) const
+{
+    if (PathUtils::isArchiveVirtualPath(path)) {
+        return true;
+    }
+
+    if (PathUtils::isArchivePath(path)) {
+        const QFileInfo archiveInfo(path);
+        return archiveInfo.exists() && archiveInfo.isFile();
+    }
+
+    return isInternalNavigableDirectory(QFileInfo(path));
+}
+
 void MainWindow::navigateToDirectory(const QString& path, bool pushHistory)
 {
     const QFileInfo fileInfo(path);
-    if (!isInternalNavigableDirectory(fileInfo)) {
+    if (!isNavigablePath(path)) {
         appendRuntimeLog(QStringLiteral("navigate_rejected path=%1 exists=%2 is_dir=%3 is_link=%4")
                              .arg(path)
                              .arg(fileInfo.exists() ? QStringLiteral("true") : QStringLiteral("false"))
@@ -2372,7 +2411,20 @@ void MainWindow::navigateToDirectory(const QString& path, bool pushHistory)
         return;
     }
 
-    const QString normalizedPath = fileInfo.absoluteFilePath();
+    QString normalizedPath;
+    if (PathUtils::isArchiveVirtualPath(path)) {
+        QString archivePath;
+        QString internalPath;
+        if (PathUtils::splitArchiveVirtualPath(path, &archivePath, &internalPath)) {
+            normalizedPath = PathUtils::buildArchiveVirtualPath(archivePath, internalPath);
+        } else {
+            normalizedPath = path;
+        }
+    } else if (PathUtils::isArchivePath(path)) {
+        normalizedPath = fileInfo.absoluteFilePath();
+    } else {
+        normalizedPath = fileInfo.absoluteFilePath();
+    }
     m_rootEdit->setText(normalizedPath);
 
     if (pushHistory) {
@@ -2402,8 +2454,16 @@ void MainWindow::updateNavigationButtons()
     }
 
     if (m_upButton && m_rootEdit) {
-        QDir dir(m_rootEdit->text().trimmed());
-        const bool canGoUp = dir.exists() && dir.cdUp();
+        const QString current = m_rootEdit->text().trimmed();
+        bool canGoUp = false;
+        if (PathUtils::isArchiveVirtualPath(current)) {
+            canGoUp = !PathUtils::archiveVirtualParentPath(current).isEmpty();
+        } else if (PathUtils::isArchivePath(current)) {
+            canGoUp = !QFileInfo(current).absolutePath().isEmpty();
+        } else {
+            QDir dir(current);
+            canGoUp = dir.exists() && dir.cdUp();
+        }
         m_upButton->setEnabled(canGoUp);
     }
 }
