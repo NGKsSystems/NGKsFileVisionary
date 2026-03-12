@@ -36,6 +36,8 @@
         "src/core/snapshot/SnapshotTypes.cpp",
         "src/core/snapshot/SnapshotRepository.cpp",
         "src/core/snapshot/SnapshotEngine.cpp",
+        "src/core/snapshot/SnapshotDiffTypes.cpp",
+        "src/core/snapshot/SnapshotDiffEngine.cpp",
         "src/util/PathUtils.cpp"
       ],
       "include_dirs": [

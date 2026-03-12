@@ -32,7 +32,10 @@
 #include "core/db/SqlHelpers.h"
 #include "core/query/QueryCore.h"
 #include "core/query/QueryTypes.h"
+#include "core/snapshot/SnapshotDiffEngine.h"
+#include "core/snapshot/SnapshotDiffTypes.h"
 #include "core/snapshot/SnapshotEngine.h"
+#include "core/snapshot/SnapshotRepository.h"
 #include "core/snapshot/SnapshotTypes.h"
 #include "core/index/VisionIndexService.h"
 #include "core/scan/ScanCoordinator.h"
@@ -92,6 +95,22 @@ struct SnapshotSmokeCliOptions {
     bool filesOnly = false;
     bool directoriesOnly = false;
     QString snapshotType = QStringLiteral("structural_full");
+    QStringList argsReceived;
+    QString parseError;
+};
+
+struct SnapshotDiffSmokeCliOptions {
+    bool enabled = false;
+    QString snapshotRoot;
+    QString snapshotDbPath;
+    QString oldSnapshotName;
+    QString newSnapshotName;
+    QString snapshotDiffLogPath;
+    bool includeUnchanged = true;
+    bool includeHidden = false;
+    bool includeSystem = false;
+    bool filesOnly = false;
+    bool directoriesOnly = false;
     QStringList argsReceived;
     QString parseError;
 };
@@ -173,6 +192,16 @@ bool hasSnapshotSmokeFlag(int argc, char* argv[])
 {
     for (int i = 1; i < argc; ++i) {
         if (QString::fromLocal8Bit(argv[i]) == QStringLiteral("--snapshot-smoke")) {
+            return true;
+        }
+    }
+    return false;
+}
+
+bool hasSnapshotDiffSmokeFlag(int argc, char* argv[])
+{
+    for (int i = 1; i < argc; ++i) {
+        if (QString::fromLocal8Bit(argv[i]) == QStringLiteral("--snapshot-diff-smoke")) {
             return true;
         }
     }
@@ -451,6 +480,95 @@ SnapshotSmokeCliOptions parseSnapshotSmokeOptions(int argc, char* argv[])
 
         if (token == QStringLiteral("--snapshot-directories-only")) {
             options.directoriesOnly = true;
+            continue;
+        }
+    }
+
+    return options;
+}
+
+SnapshotDiffSmokeCliOptions parseSnapshotDiffSmokeOptions(int argc, char* argv[])
+{
+    SnapshotDiffSmokeCliOptions options;
+
+    for (int i = 0; i < argc; ++i) {
+        options.argsReceived << QString::fromLocal8Bit(argv[i]);
+    }
+
+    for (int i = 1; i < argc; ++i) {
+        const QString token = QString::fromLocal8Bit(argv[i]);
+        if (token == QStringLiteral("--snapshot-diff-smoke")) {
+            options.enabled = true;
+            continue;
+        }
+
+        auto consumeValue = [&](QString* out) {
+            if ((i + 1) >= argc) {
+                options.parseError = QStringLiteral("missing_value_for_%1").arg(token);
+                return false;
+            }
+            ++i;
+            *out = QDir::cleanPath(QString::fromLocal8Bit(argv[i]));
+            return true;
+        };
+
+        if (token == QStringLiteral("--snapshot-db-path")) {
+            if (!consumeValue(&options.snapshotDbPath)) {
+                break;
+            }
+            continue;
+        }
+
+        if (token == QStringLiteral("--snapshot-root")) {
+            if (!consumeValue(&options.snapshotRoot)) {
+                break;
+            }
+            continue;
+        }
+
+        if (token == QStringLiteral("--snapshot-old-name")) {
+            if (!consumeValue(&options.oldSnapshotName)) {
+                break;
+            }
+            continue;
+        }
+
+        if (token == QStringLiteral("--snapshot-new-name")) {
+            if (!consumeValue(&options.newSnapshotName)) {
+                break;
+            }
+            continue;
+        }
+
+        if (token == QStringLiteral("--snapshot-diff-log")) {
+            if (!consumeValue(&options.snapshotDiffLogPath)) {
+                break;
+            }
+            continue;
+        }
+
+        if (token == QStringLiteral("--snapshot-diff-include-hidden")) {
+            options.includeHidden = true;
+            continue;
+        }
+
+        if (token == QStringLiteral("--snapshot-diff-include-system")) {
+            options.includeSystem = true;
+            continue;
+        }
+
+        if (token == QStringLiteral("--snapshot-diff-files-only")) {
+            options.filesOnly = true;
+            continue;
+        }
+
+        if (token == QStringLiteral("--snapshot-diff-directories-only")) {
+            options.directoriesOnly = true;
+            continue;
+        }
+
+        if (token == QStringLiteral("--snapshot-diff-exclude-unchanged")) {
+            options.includeUnchanged = false;
             continue;
         }
     }
@@ -743,6 +861,313 @@ bool runSynchronousIndexPass(MetaStore& store,
     }
 
     return true;
+}
+
+int runSnapshotDiffSmokeCli(int argc, char* argv[])
+{
+    QCoreApplication cliApp(argc, argv);
+
+    const SnapshotDiffSmokeCliOptions options = parseSnapshotDiffSmokeOptions(argc, argv);
+    const QString exePath = QFileInfo(QString::fromLocal8Bit(argv[0])).absoluteFilePath();
+    const QString cwd = QDir::currentPath();
+
+    if (!options.parseError.isEmpty()) {
+        writeStderrLine(QStringLiteral("snapshot_diff_smoke_parse_error=%1").arg(options.parseError));
+        return 230;
+    }
+
+    if (options.snapshotDiffLogPath.trimmed().isEmpty()) {
+        writeStderrLine(QStringLiteral("snapshot_diff_smoke_error=missing_required_arg_--snapshot-diff-log"));
+        return 231;
+    }
+
+    IndexSmokeLogWriter log;
+    QString logOpenError;
+    if (!log.open(options.snapshotDiffLogPath, &logOpenError)) {
+        writeStderrLine(QStringLiteral("snapshot_diff_smoke_error=log_open_failed"));
+        writeStderrLine(QStringLiteral("snapshot_diff_smoke_log_path=%1").arg(QDir::toNativeSeparators(options.snapshotDiffLogPath)));
+        writeStderrLine(QStringLiteral("snapshot_diff_smoke_log_error=%1").arg(logOpenError));
+        return 232;
+    }
+
+    auto finishFail = [&](int exitCode, const QString& reason) {
+        log.writeLine(QStringLiteral("final_status=FAIL"));
+        log.writeLine(QStringLiteral("exit_code=%1").arg(exitCode));
+        log.writeLine(QStringLiteral("failure_reason=%1").arg(reason));
+        log.writeLine(QStringLiteral("timestamp_utc_end=%1").arg(QDateTime::currentDateTimeUtc().toString(Qt::ISODate)));
+        return exitCode;
+    };
+
+    try {
+        if (options.snapshotDbPath.trimmed().isEmpty()) {
+            writeStderrLine(QStringLiteral("snapshot_diff_smoke_error=missing_required_arg_--snapshot-db-path"));
+            return finishFail(233, QStringLiteral("missing_required_arg_--snapshot-db-path"));
+        }
+        if (options.snapshotRoot.trimmed().isEmpty()) {
+            writeStderrLine(QStringLiteral("snapshot_diff_smoke_error=missing_required_arg_--snapshot-root"));
+            return finishFail(234, QStringLiteral("missing_required_arg_--snapshot-root"));
+        }
+        if (options.oldSnapshotName.trimmed().isEmpty()) {
+            writeStderrLine(QStringLiteral("snapshot_diff_smoke_error=missing_required_arg_--snapshot-old-name"));
+            return finishFail(235, QStringLiteral("missing_required_arg_--snapshot-old-name"));
+        }
+        if (options.newSnapshotName.trimmed().isEmpty()) {
+            writeStderrLine(QStringLiteral("snapshot_diff_smoke_error=missing_required_arg_--snapshot-new-name"));
+            return finishFail(236, QStringLiteral("missing_required_arg_--snapshot-new-name"));
+        }
+
+        const QString normalizedRoot = QDir::fromNativeSeparators(QDir::cleanPath(options.snapshotRoot));
+        QDir().mkpath(QDir(normalizedRoot).filePath(QStringLiteral("src")));
+        QDir().mkpath(QDir(normalizedRoot).filePath(QStringLiteral("docs")));
+
+        log.writeLine(QStringLiteral("mode=snapshot_diff_smoke"));
+        log.writeLine(QStringLiteral("startup_banner=SNAPSHOT_DIFF_SMOKE_BEGIN"));
+        log.writeLine(QStringLiteral("exe_path=%1").arg(QDir::toNativeSeparators(exePath)));
+        log.writeLine(QStringLiteral("cwd=%1").arg(QDir::toNativeSeparators(cwd)));
+        log.writeLine(QStringLiteral("args_received=%1").arg(options.argsReceived.join(QStringLiteral(" | "))));
+        log.writeLine(QStringLiteral("snapshot_root=%1").arg(QDir::toNativeSeparators(normalizedRoot)));
+        log.writeLine(QStringLiteral("snapshot_db_path=%1").arg(QDir::toNativeSeparators(options.snapshotDbPath)));
+        log.writeLine(QStringLiteral("snapshot_old_name=%1").arg(options.oldSnapshotName));
+        log.writeLine(QStringLiteral("snapshot_new_name=%1").arg(options.newSnapshotName));
+        log.writeLine(QStringLiteral("snapshot_diff_log=%1").arg(QDir::toNativeSeparators(options.snapshotDiffLogPath)));
+        log.writeLine(QStringLiteral("diff_data_source=snapshot_tables_only"));
+        log.writeLine(QStringLiteral("timestamp_utc=%1").arg(QDateTime::currentDateTimeUtc().toString(Qt::ISODate)));
+
+        QFile fileMain(QDir(normalizedRoot).filePath(QStringLiteral("src/main.cpp")));
+        if (!fileMain.open(QIODevice::WriteOnly | QIODevice::Text | QIODevice::Truncate)) {
+            return finishFail(237, QStringLiteral("seed_file_write_failed:src/main.cpp"));
+        }
+        QTextStream mainOut(&fileMain);
+        mainOut << "int main(){return 1;}\n";
+        fileMain.close();
+
+        QFile fileUtil(QDir(normalizedRoot).filePath(QStringLiteral("src/util.h")));
+        if (!fileUtil.open(QIODevice::WriteOnly | QIODevice::Text | QIODevice::Truncate)) {
+            return finishFail(238, QStringLiteral("seed_file_write_failed:src/util.h"));
+        }
+        QTextStream utilOut(&fileUtil);
+        utilOut << "#pragma once\n";
+        fileUtil.close();
+
+        QFile fileReadme(QDir(normalizedRoot).filePath(QStringLiteral("docs/readme.md")));
+        if (!fileReadme.open(QIODevice::WriteOnly | QIODevice::Text | QIODevice::Truncate)) {
+            return finishFail(239, QStringLiteral("seed_file_write_failed:docs/readme.md"));
+        }
+        QTextStream readmeOut(&fileReadme);
+        readmeOut << "v1\n";
+        fileReadme.close();
+
+        MetaStore store;
+        QString errorText;
+        QString migrationLog;
+        if (!store.initialize(options.snapshotDbPath, &errorText, &migrationLog)) {
+            return finishFail(240, QStringLiteral("db_init_failure:%1").arg(errorText));
+        }
+        log.writeLine(QStringLiteral("db_init_ok=true"));
+        if (!migrationLog.isEmpty()) {
+            log.writeLine(QStringLiteral("migration_log_begin"));
+            log.writeLine(migrationLog.trimmed());
+            log.writeLine(QStringLiteral("migration_log_end"));
+        }
+
+        IndexRootRecord indexRoot;
+        indexRoot.rootPath = normalizedRoot;
+        indexRoot.status = QStringLiteral("active");
+        indexRoot.createdUtc = SqlHelpers::utcNowIso();
+        indexRoot.updatedUtc = indexRoot.createdUtc;
+        if (!store.upsertIndexRoot(indexRoot, nullptr, &errorText)) {
+            store.shutdown();
+            return finishFail(241, QStringLiteral("index_root_upsert_failed:%1").arg(errorText));
+        }
+
+        VolumeRecord volume;
+        volume.volumeKey = QStringLiteral("snapshot_diff_smoke:%1").arg(normalizedRoot.toLower());
+        volume.rootPath = normalizedRoot;
+        volume.displayName = QFileInfo(normalizedRoot).fileName();
+        volume.fsType = QStringLiteral("native");
+        volume.serialNumber = QStringLiteral("snapshot_diff_smoke");
+        qint64 volumeId = 0;
+        if (!store.upsertVolume(volume, &volumeId, &errorText)) {
+            store.shutdown();
+            return finishFail(242, QStringLiteral("volume_upsert_failed:%1").arg(errorText));
+        }
+
+        IndexSmokePassResult firstIndex;
+        if (!runSynchronousIndexPass(store, volumeId, normalizedRoot, 1, &firstIndex, &errorText)) {
+            store.shutdown();
+            return finishFail(243, QStringLiteral("first_index_failed:%1").arg(errorText));
+        }
+        log.writeLine(QStringLiteral("first_index_ok=true"));
+        log.writeLine(QStringLiteral("first_index_seen=%1").arg(firstIndex.seen));
+
+        SnapshotEngine snapshotEngine(store);
+        SnapshotCreateOptions snapshotOptions;
+        snapshotOptions.snapshotType = QStringLiteral("structural_full");
+        snapshotOptions.noteText = QStringLiteral("VIE-P10 snapshot A");
+
+        const SnapshotCreateResult oldSnapshot = snapshotEngine.createSnapshot(normalizedRoot,
+                                                                               options.oldSnapshotName,
+                                                                               snapshotOptions);
+        if (!oldSnapshot.ok) {
+            store.shutdown();
+            return finishFail(244, QStringLiteral("create_snapshot_a_failed:%1").arg(oldSnapshot.errorText));
+        }
+        log.writeLine(QStringLiteral("snapshot_a_id=%1").arg(oldSnapshot.snapshotId));
+        log.writeLine(QStringLiteral("snapshot_a_item_count=%1").arg(oldSnapshot.itemCount));
+
+        QFile modifiedMain(QDir(normalizedRoot).filePath(QStringLiteral("src/main.cpp")));
+        if (!modifiedMain.open(QIODevice::WriteOnly | QIODevice::Text | QIODevice::Truncate)) {
+            store.shutdown();
+            return finishFail(245, QStringLiteral("modify_file_failed:src/main.cpp"));
+        }
+        QTextStream modifiedMainOut(&modifiedMain);
+        modifiedMainOut << "int main(){\n";
+        modifiedMainOut << "    int value = 2;\n";
+        modifiedMainOut << "    value += 100;\n";
+        modifiedMainOut << "    return value;\n";
+        modifiedMainOut << "}\n";
+        modifiedMain.close();
+
+        // Ensure modified_utc can diverge in second-resolution file systems.
+        std::this_thread::sleep_for(std::chrono::milliseconds(1200));
+
+        QFile addedFile(QDir(normalizedRoot).filePath(QStringLiteral("src/added.txt")));
+        if (!addedFile.open(QIODevice::WriteOnly | QIODevice::Text | QIODevice::Truncate)) {
+            store.shutdown();
+            return finishFail(246, QStringLiteral("add_file_failed:src/added.txt"));
+        }
+        QTextStream addedOut(&addedFile);
+        addedOut << "added\n";
+        addedFile.close();
+
+        const QString removedPath = QDir(normalizedRoot).filePath(QStringLiteral("docs/readme.md"));
+        if (!QFile::remove(removedPath)) {
+            store.shutdown();
+            return finishFail(247, QStringLiteral("remove_file_failed:docs/readme.md"));
+        }
+
+        IndexSmokePassResult secondIndex;
+        if (!runSynchronousIndexPass(store, volumeId, normalizedRoot, 2, &secondIndex, &errorText)) {
+            store.shutdown();
+            return finishFail(248, QStringLiteral("second_index_failed:%1").arg(errorText));
+        }
+        log.writeLine(QStringLiteral("second_index_ok=true"));
+        log.writeLine(QStringLiteral("second_index_seen=%1").arg(secondIndex.seen));
+
+        const QString modifiedPath = QDir(normalizedRoot).filePath(QStringLiteral("src/main.cpp"));
+        if (!upsertPathFromFilesystem(store, volumeId, normalizedRoot, modifiedPath, 3, &errorText)) {
+            store.shutdown();
+            return finishFail(248, QStringLiteral("second_index_modify_upsert_failed:%1").arg(errorText));
+        }
+
+        const QString addedPath = QDir(normalizedRoot).filePath(QStringLiteral("src/added.txt"));
+        if (!upsertPathFromFilesystem(store, volumeId, normalizedRoot, addedPath, 3, &errorText)) {
+            store.shutdown();
+            return finishFail(248, QStringLiteral("second_index_added_upsert_failed:%1").arg(errorText));
+        }
+
+        if (!markPathDeleted(store,
+                             QDir::fromNativeSeparators(QDir::cleanPath(removedPath)),
+                             3,
+                             &errorText)) {
+            store.shutdown();
+            return finishFail(248, QStringLiteral("second_index_mark_deleted_failed:%1").arg(errorText));
+        }
+
+        snapshotOptions.noteText = QStringLiteral("VIE-P10 snapshot B");
+        const SnapshotCreateResult newSnapshot = snapshotEngine.createSnapshot(normalizedRoot,
+                                                                               options.newSnapshotName,
+                                                                               snapshotOptions);
+        if (!newSnapshot.ok) {
+            store.shutdown();
+            return finishFail(249, QStringLiteral("create_snapshot_b_failed:%1").arg(newSnapshot.errorText));
+        }
+        log.writeLine(QStringLiteral("snapshot_b_id=%1").arg(newSnapshot.snapshotId));
+        log.writeLine(QStringLiteral("snapshot_b_item_count=%1").arg(newSnapshot.itemCount));
+
+        SnapshotRepository repo(store);
+        SnapshotDiffEngine diffEngine(repo);
+        SnapshotDiffOptions diffOptions;
+        diffOptions.includeUnchanged = options.includeUnchanged;
+        diffOptions.includeHidden = options.includeHidden;
+        diffOptions.includeSystem = options.includeSystem;
+        diffOptions.filesOnly = options.filesOnly;
+        diffOptions.directoriesOnly = options.directoriesOnly;
+
+        const SnapshotDiffResult diff = diffEngine.compareSnapshots(oldSnapshot.snapshotId,
+                                                                    newSnapshot.snapshotId,
+                                                                    diffOptions);
+        if (!diff.ok) {
+            store.shutdown();
+            return finishFail(250, QStringLiteral("compare_snapshots_failed:%1").arg(diff.errorText));
+        }
+
+        log.writeLine(QStringLiteral("diff_ok=true"));
+        log.writeLine(QStringLiteral("diff_summary added=%1 removed=%2 changed=%3 unchanged=%4 total=%5")
+                          .arg(diff.summary.added)
+                          .arg(diff.summary.removed)
+                          .arg(diff.summary.changed)
+                          .arg(diff.summary.unchanged)
+                          .arg(diff.summary.totalRows));
+
+        int samplesAdded = 0;
+        int samplesRemoved = 0;
+        int samplesChanged = 0;
+        int samplesUnchanged = 0;
+        for (const SnapshotDiffRow& row : diff.rows) {
+            const QString line = QStringLiteral("diff_row status=%1 path=%2 old_size=%3 new_size=%4 old_modified=%5 new_modified=%6 old_is_dir=%7 new_is_dir=%8")
+                                     .arg(SnapshotDiffTypesUtil::statusToString(row.status))
+                                     .arg(QDir::toNativeSeparators(row.path))
+                                     .arg(row.oldHasSizeBytes ? QString::number(row.oldSizeBytes) : QStringLiteral("null"))
+                                     .arg(row.newHasSizeBytes ? QString::number(row.newSizeBytes) : QStringLiteral("null"))
+                                     .arg(row.oldModifiedUtc)
+                                     .arg(row.newModifiedUtc)
+                                     .arg(row.oldIsDir ? QStringLiteral("true") : QStringLiteral("false"))
+                                     .arg(row.newIsDir ? QStringLiteral("true") : QStringLiteral("false"));
+
+            if (row.status == SnapshotDiffStatus::Added && samplesAdded < 12) {
+                log.writeLine(line);
+                ++samplesAdded;
+            } else if (row.status == SnapshotDiffStatus::Removed && samplesRemoved < 12) {
+                log.writeLine(line);
+                ++samplesRemoved;
+            } else if (row.status == SnapshotDiffStatus::Changed && samplesChanged < 12) {
+                log.writeLine(line);
+                ++samplesChanged;
+            } else if (row.status == SnapshotDiffStatus::Unchanged && samplesUnchanged < 12) {
+                log.writeLine(line);
+                ++samplesUnchanged;
+            }
+        }
+
+        SnapshotDiffResult badDiff = diffEngine.compareSnapshots(9999999, newSnapshot.snapshotId, diffOptions);
+        log.writeLine(QStringLiteral("bad_snapshot_case_ok=%1").arg(!badDiff.ok ? QStringLiteral("true") : QStringLiteral("false")));
+        if (!badDiff.ok) {
+            log.writeLine(QStringLiteral("bad_snapshot_error=%1").arg(badDiff.errorText));
+        }
+
+        const bool gateChecks = diff.summary.added > 0
+            && diff.summary.removed > 0
+            && diff.summary.changed > 0
+            && !badDiff.ok;
+        if (!gateChecks) {
+            store.shutdown();
+            return finishFail(251, QStringLiteral("diff_gate_checks_failed"));
+        }
+
+        store.shutdown();
+        log.writeLine(QStringLiteral("final_status=PASS"));
+        log.writeLine(QStringLiteral("exit_code=0"));
+        log.writeLine(QStringLiteral("failure_reason="));
+        log.writeLine(QStringLiteral("timestamp_utc_end=%1").arg(QDateTime::currentDateTimeUtc().toString(Qt::ISODate)));
+        return 0;
+    } catch (const std::exception& ex) {
+        writeStderrLine(QStringLiteral("snapshot_diff_smoke_error=unexpected_exception"));
+        return finishFail(252, QStringLiteral("unexpected_exception:%1").arg(QString::fromLocal8Bit(ex.what())));
+    } catch (...) {
+        writeStderrLine(QStringLiteral("snapshot_diff_smoke_error=unexpected_error"));
+        return finishFail(253, QStringLiteral("unexpected_error"));
+    }
 }
 
 int runSnapshotSmokeCli(int argc, char* argv[])
@@ -1735,6 +2160,10 @@ bool writeLogFile(const QString& logPath, const QStringList& lines)
 
 int main(int argc, char* argv[])
 {
+    if (hasSnapshotDiffSmokeFlag(argc, argv)) {
+        return runSnapshotDiffSmokeCli(argc, argv);
+    }
+
     if (hasSnapshotSmokeFlag(argc, argv)) {
         return runSnapshotSmokeCli(argc, argv);
     }
