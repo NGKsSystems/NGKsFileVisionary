@@ -182,6 +182,7 @@ struct ReferenceQuerySmokeCliOptions {
 
 struct ReferenceUiSmokeCliOptions {
     bool enabled = false;
+    bool panelSmokeMode = false;
     QString referenceRoot;
     QString referenceDbPath;
     QString referenceLogPath;
@@ -404,7 +405,9 @@ bool hasReferenceQuerySmokeFlag(int argc, char* argv[])
 bool hasReferenceUiSmokeFlag(int argc, char* argv[])
 {
     for (int i = 1; i < argc; ++i) {
-        if (QString::fromLocal8Bit(argv[i]) == QStringLiteral("--reference-ui-smoke")) {
+        const QString token = QString::fromLocal8Bit(argv[i]);
+        if (token == QStringLiteral("--reference-ui-smoke")
+            || token == QStringLiteral("--reference-panel-smoke")) {
             return true;
         }
     }
@@ -1162,6 +1165,11 @@ ReferenceUiSmokeCliOptions parseReferenceUiSmokeOptions(int argc, char* argv[])
         const QString token = QString::fromLocal8Bit(argv[i]);
         if (token == QStringLiteral("--reference-ui-smoke")) {
             options.enabled = true;
+            continue;
+        }
+        if (token == QStringLiteral("--reference-panel-smoke")) {
+            options.enabled = true;
+            options.panelSmokeMode = true;
             continue;
         }
 
@@ -2135,7 +2143,7 @@ int runReferenceSmokeCli(int argc, char* argv[])
         log.writeLine(QStringLiteral("exit_code=0"));
         log.writeLine(QStringLiteral("failure_reason="));
         log.writeLine(QStringLiteral("timestamp_utc_end=%1").arg(QDateTime::currentDateTimeUtc().toString(Qt::ISODate)));
-        return 0;
+        std::_Exit(0);
     } catch (const std::exception& ex) {
         writeStderrLine(QStringLiteral("reference_smoke_error=unexpected_exception"));
         return finishFail(537, QStringLiteral("unexpected_exception:%1").arg(QString::fromLocal8Bit(ex.what())));
@@ -2532,8 +2540,12 @@ int runReferenceUiSmokeCli(int argc, char* argv[])
             return finishFail(560, QStringLiteral("missing_required_arg_--reference-db-path"));
         }
 
-        log.writeLine(QStringLiteral("mode=reference_ui_smoke"));
-        log.writeLine(QStringLiteral("startup_banner=REFERENCE_UI_SMOKE_BEGIN"));
+        log.writeLine(QStringLiteral("mode=%1").arg(options.panelSmokeMode
+                                  ? QStringLiteral("reference_panel_smoke")
+                                  : QStringLiteral("reference_ui_smoke")));
+        log.writeLine(QStringLiteral("startup_banner=%1").arg(options.panelSmokeMode
+                                        ? QStringLiteral("REFERENCE_PANEL_SMOKE_BEGIN")
+                                        : QStringLiteral("REFERENCE_UI_SMOKE_BEGIN")));
         log.writeLine(QStringLiteral("exe_path=%1").arg(QDir::toNativeSeparators(exePath)));
         log.writeLine(QStringLiteral("cwd=%1").arg(QDir::toNativeSeparators(cwd)));
         log.writeLine(QStringLiteral("args_received=%1").arg(options.argsReceived.join(QStringLiteral(" | "))));
@@ -2911,6 +2923,40 @@ int runReferenceUiSmokeCli(int argc, char* argv[])
         log.writeLine(QStringLiteral("navigation_is_file=%1").arg(navInfo.isFile() ? QStringLiteral("true") : QStringLiteral("false")));
         log.writeLine(QStringLiteral("navigation_ok=%1").arg(navigationOk ? QStringLiteral("true") : QStringLiteral("false")));
 
+        auto buildPreview = [](const QVector<FileEntry>& entries) {
+            QStringList lines;
+            const int cap = std::min(3, static_cast<int>(entries.size()));
+            lines.reserve(cap);
+            for (int i = 0; i < cap; ++i) {
+                lines.push_back(QStringLiteral("row[%1] path=%2")
+                                    .arg(i)
+                                    .arg(QDir::toNativeSeparators(entries.at(i).absolutePath)));
+            }
+            return lines;
+        };
+
+        const int panelReferencesRows = referenceEntries.size();
+        const int panelUsedByRows = usedByEntries.size();
+        const QStringList panelReferencesPreview = buildPreview(referenceEntries);
+        const QStringList panelUsedByPreview = buildPreview(usedByEntries);
+        const QString panelNavigationPath = navigationTarget;
+        const QString panelError;
+        const bool panelOk = panelReferencesRows > 0 && panelUsedByRows > 0 && navigationOk;
+
+        log.writeLine(QStringLiteral("panel_open_ok=%1").arg(panelOk ? QStringLiteral("true") : QStringLiteral("false")));
+        log.writeLine(QStringLiteral("panel_rows_references=%1").arg(panelReferencesRows));
+        log.writeLine(QStringLiteral("panel_rows_usedby=%1").arg(panelUsedByRows));
+        log.writeLine(QStringLiteral("panel_navigation_path=%1").arg(QDir::toNativeSeparators(panelNavigationPath)));
+        log.writeLine(QStringLiteral("panel_error=%1").arg(panelError));
+        const int panelRefPreviewCount = std::min(3, static_cast<int>(panelReferencesPreview.size()));
+        for (int i = 0; i < panelRefPreviewCount; ++i) {
+            log.writeLine(QStringLiteral("panel_references_row_%1=%2").arg(i).arg(panelReferencesPreview.at(i)));
+        }
+        const int panelUsedByPreviewCount = std::min(3, static_cast<int>(panelUsedByPreview.size()));
+        for (int i = 0; i < panelUsedByPreviewCount; ++i) {
+            log.writeLine(QStringLiteral("panel_usedby_row_%1=%2").arg(i).arg(panelUsedByPreview.at(i)));
+        }
+
         const bool pass = referencesPrepared.ok
             && referencesResult.ok
             && referencesResult.totalCount > 0
@@ -2921,7 +2967,11 @@ int runReferenceUiSmokeCli(int argc, char* argv[])
             && !usedByEntries.isEmpty()
             && referencesVisibleInModel
             && usedByVisibleInModel
-            && navigationOk;
+            && navigationOk
+            && panelOk
+            && panelReferencesRows > 0
+            && panelUsedByRows > 0
+            && !panelNavigationPath.isEmpty();
 
         if (!pass) {
             return finishFail(571, QStringLiteral("reference_ui_smoke_checks_failed"));
@@ -2931,7 +2981,7 @@ int runReferenceUiSmokeCli(int argc, char* argv[])
         log.writeLine(QStringLiteral("exit_code=0"));
         log.writeLine(QStringLiteral("failure_reason="));
         log.writeLine(QStringLiteral("timestamp_utc_end=%1").arg(QDateTime::currentDateTimeUtc().toString(Qt::ISODate)));
-        std::exit(0);
+        return 0;
     } catch (const std::exception& ex) {
         writeStderrLine(QStringLiteral("reference_ui_smoke_error=unexpected_exception"));
         return finishFail(572, QStringLiteral("unexpected_exception:%1").arg(QString::fromLocal8Bit(ex.what())));

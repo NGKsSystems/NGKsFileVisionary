@@ -76,6 +76,14 @@ public:
                                                QStringList* diffRowsOut = nullptr,
                                                QString* navigationPathOut = nullptr,
                                                QString* errorText = nullptr);
+    bool triggerReferencePanelForTesting(const QString& rootPath,
+                                         const QString& selectedFilePath,
+                                         int* referencesRowCount = nullptr,
+                                         int* usedByRowCount = nullptr,
+                                         QStringList* referencesRowsOut = nullptr,
+                                         QStringList* usedByRowsOut = nullptr,
+                                         QString* navigationPathOut = nullptr,
+                                         QString* errorText = nullptr);
 
 private slots:
     void onBrowseRoot();
@@ -115,6 +123,8 @@ private slots:
     void onActionCompareSnapshots();
     void onStructuralPanelTabChanged(int index);
     void onStructuralCompareSnapshots();
+    void onStructuralShowReferences();
+    void onStructuralShowUsedBy();
     void onActionCopyPath();
     void onActionRename();
     void onActionPinFavorite();
@@ -194,6 +204,9 @@ private:
                                 int* addedCount = nullptr,
                                 int* removedCount = nullptr,
                                 int* changedCount = nullptr);
+    bool loadStructuralReferenceView(QueryGraphMode mode,
+                                    QString* errorText = nullptr,
+                                    int* rowCount = nullptr);
     bool navigateFromCurrentModelRow(int rowIndex, QString* navigatedPathOut = nullptr);
     QStringList collectCurrentModelRows(int maxRows = 200) const;
     bool loadHistoryRowsForPath(const QString& selectedFilePath,
@@ -310,9 +323,12 @@ private:
     QLabel* m_structuralHistoryStatusLabel = nullptr;
     QLabel* m_structuralSnapshotStatusLabel = nullptr;
     QLabel* m_structuralDiffStatusLabel = nullptr;
+    QLabel* m_structuralReferenceStatusLabel = nullptr;
     QPushButton* m_structuralHistoryLoadButton = nullptr;
     QPushButton* m_structuralSnapshotLoadButton = nullptr;
     QPushButton* m_structuralDiffCompareButton = nullptr;
+    QPushButton* m_structuralShowReferencesButton = nullptr;
+    QPushButton* m_structuralShowUsedByButton = nullptr;
     QComboBox* m_structuralOldSnapshotCombo = nullptr;
     QComboBox* m_structuralNewSnapshotCombo = nullptr;
     QString m_structuralRootPath;

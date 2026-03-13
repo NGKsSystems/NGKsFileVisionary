@@ -63,6 +63,7 @@
 #include "core/history/HistoryViewEngine.h"
 #include "core/db/MetaStore.h"
 #include "core/db/SqlHelpers.h"
+#include "core/query/QueryCore.h"
 #include "core/snapshot/SnapshotDiffEngine.h"
 #include "core/snapshot/SnapshotRepository.h"
 #include "model/DirectoryModel.h"
@@ -457,6 +458,17 @@ void MainWindow::setupStructuralPanel()
     diffLayout->addStretch(1);
     m_structuralTabWidget->addTab(diffTab, QStringLiteral("Diff"));
 
+    QWidget* referenceTab = new QWidget(m_structuralTabWidget);
+    QVBoxLayout* referenceLayout = new QVBoxLayout(referenceTab);
+    m_structuralShowReferencesButton = new QPushButton(QStringLiteral("Show References"), referenceTab);
+    m_structuralShowUsedByButton = new QPushButton(QStringLiteral("Show Used By"), referenceTab);
+    m_structuralReferenceStatusLabel = new QLabel(QStringLiteral("References tab idle"), referenceTab);
+    referenceLayout->addWidget(m_structuralShowReferencesButton);
+    referenceLayout->addWidget(m_structuralShowUsedByButton);
+    referenceLayout->addWidget(m_structuralReferenceStatusLabel);
+    referenceLayout->addStretch(1);
+    m_structuralTabWidget->addTab(referenceTab, QStringLiteral("References"));
+
     panelLayout->addWidget(m_structuralTabWidget);
     m_structuralPanelDock->setWidget(panelRoot);
     addDockWidget(Qt::BottomDockWidgetArea, m_structuralPanelDock);
@@ -465,6 +477,8 @@ void MainWindow::setupStructuralPanel()
     connect(m_structuralHistoryLoadButton, &QPushButton::clicked, this, &MainWindow::onActionShowHistory);
     connect(m_structuralSnapshotLoadButton, &QPushButton::clicked, this, &MainWindow::onActionSnapshots);
     connect(m_structuralDiffCompareButton, &QPushButton::clicked, this, &MainWindow::onStructuralCompareSnapshots);
+    connect(m_structuralShowReferencesButton, &QPushButton::clicked, this, &MainWindow::onStructuralShowReferences);
+    connect(m_structuralShowUsedByButton, &QPushButton::clicked, this, &MainWindow::onStructuralShowUsedBy);
     connect(m_structuralTabWidget, &QTabWidget::currentChanged, this, &MainWindow::onStructuralPanelTabChanged);
 }
 
@@ -2294,6 +2308,11 @@ void MainWindow::onStructuralPanelTabChanged(int index)
 
     if (index == 2) {
         refreshStructuralSnapshotSelectors(nullptr);
+        return;
+    }
+
+    if (index == 3 && m_structuralReferenceStatusLabel) {
+        m_structuralReferenceStatusLabel->setText(QStringLiteral("References tab ready"));
     }
 }
 
@@ -2375,6 +2394,44 @@ void MainWindow::onStructuralCompareSnapshots()
                     .arg(oldSnapshotId)
                     .arg(newSnapshotId)
                     .arg(m_structuralRootPath),
+                QString());
+}
+
+void MainWindow::onStructuralShowReferences()
+{
+    QString errorText;
+    int rows = 0;
+    if (!loadStructuralReferenceView(QueryGraphMode::References, &errorText, &rows)) {
+        logUiAction(QStringLiteral("Show References"), QStringLiteral("onStructuralShowReferences"), QStringLiteral("error"), QString(), errorText);
+        if (!(m_testMode && m_testScriptRunning)) {
+            QMessageBox::warning(this, QStringLiteral("Show References"), QStringLiteral("Unable to load references: %1").arg(errorText));
+        }
+        return;
+    }
+
+    logUiAction(QStringLiteral("Show References"),
+                QStringLiteral("onStructuralShowReferences"),
+                QStringLiteral("ok"),
+                QStringLiteral("rows=%1 root=%2 target=%3").arg(rows).arg(m_structuralRootPath, m_structuralTargetPath),
+                QString());
+}
+
+void MainWindow::onStructuralShowUsedBy()
+{
+    QString errorText;
+    int rows = 0;
+    if (!loadStructuralReferenceView(QueryGraphMode::UsedBy, &errorText, &rows)) {
+        logUiAction(QStringLiteral("Show Used By"), QStringLiteral("onStructuralShowUsedBy"), QStringLiteral("error"), QString(), errorText);
+        if (!(m_testMode && m_testScriptRunning)) {
+            QMessageBox::warning(this, QStringLiteral("Show Used By"), QStringLiteral("Unable to load used-by rows: %1").arg(errorText));
+        }
+        return;
+    }
+
+    logUiAction(QStringLiteral("Show Used By"),
+                QStringLiteral("onStructuralShowUsedBy"),
+                QStringLiteral("ok"),
+                QStringLiteral("rows=%1 root=%2 target=%3").arg(rows).arg(m_structuralRootPath, m_structuralTargetPath),
                 QString());
 }
 
@@ -2580,6 +2637,93 @@ bool MainWindow::loadStructuralDiffView(qint64 oldSnapshotId,
     return ok;
 }
 
+bool MainWindow::loadStructuralReferenceView(QueryGraphMode mode,
+                                             QString* errorText,
+                                             int* rowCount)
+{
+    if (m_structuralRootPath.trimmed().isEmpty() || m_structuralTargetPath.trimmed().isEmpty()) {
+        if (errorText) {
+            *errorText = QStringLiteral("invalid_reference_context");
+        }
+        return false;
+    }
+
+    MetaStore store;
+    QString initError;
+    QString migrationLog;
+    if (!store.initialize(m_uiDbPath, &initError, &migrationLog)) {
+        if (errorText) {
+            *errorText = QStringLiteral("reference_store_init_failed:%1").arg(initError);
+        }
+        return false;
+    }
+
+    QueryCore queryCore(store);
+    QueryOptions options;
+    options.sortField = QuerySortField::Path;
+    options.ascending = true;
+    const QString graphTarget = graphQueryTargetForPath(m_structuralTargetPath);
+    const QueryResult queryResult = queryCore.queryGraph(m_structuralRootPath, mode, graphTarget, options);
+    if (!queryResult.ok) {
+        store.shutdown();
+        if (errorText) {
+            *errorText = QStringLiteral("reference_query_failed:%1").arg(queryResult.errorText);
+        }
+        return false;
+    }
+
+    QVector<FileEntry> displayRows;
+    displayRows.reserve(queryResult.rows.size());
+    for (const QueryRow& rowData : queryResult.rows) {
+        const QString relation = rowData.graphReferenceType.isEmpty() ? QStringLiteral("reference") : rowData.graphReferenceType;
+        const QString sourcePath = rowData.graphSourcePath.isEmpty() ? rowData.path : rowData.graphSourcePath;
+        const QString symbol = rowData.name.isEmpty() ? QFileInfo(rowData.path).fileName() : rowData.name;
+
+        FileEntry entry;
+        entry.name = QStringLiteral("path=%1 | symbol=%2 | relation=%3 | source=%4")
+                         .arg(rowData.path)
+                         .arg(symbol)
+                         .arg(relation)
+                         .arg(sourcePath);
+        entry.isDir = false;
+        entry.size = static_cast<quint64>(qMax(0, rowData.graphSourceLine));
+        entry.modified = QDateTime();
+        entry.absolutePath = rowData.path;
+        displayRows.push_back(entry);
+    }
+
+    m_fileModel.clear();
+    m_viewMode = FileViewMode::Standard;
+    m_viewModeController.setModeFromIndex(0);
+    if (m_viewModeCombo) {
+        QSignalBlocker blocker(m_viewModeCombo);
+        m_viewModeCombo->setCurrentIndex(0);
+    }
+    m_fileModel.setViewMode(FileViewMode::Standard, m_structuralRootPath);
+    if (!displayRows.isEmpty()) {
+        m_fileModel.appendBatch(displayRows);
+    }
+    if (m_treeView) {
+        m_treeView->setSortingEnabled(true);
+    }
+
+    const QString modeText = (mode == QueryGraphMode::References)
+        ? QStringLiteral("References")
+        : QStringLiteral("Used By");
+    if (m_structuralReferenceStatusLabel) {
+        m_structuralReferenceStatusLabel->setText(QStringLiteral("%1 rows: %2").arg(modeText).arg(displayRows.size()));
+    }
+    if (m_statusLabel) {
+        m_statusLabel->setText(QStringLiteral("%1 view: %2 rows").arg(modeText).arg(displayRows.size()));
+    }
+
+    store.shutdown();
+    if (rowCount) {
+        *rowCount = displayRows.size();
+    }
+    return true;
+}
+
 bool MainWindow::navigateFromCurrentModelRow(int rowIndex, QString* navigatedPathOut)
 {
     if (rowIndex < 0 || rowIndex >= m_proxyModel.rowCount()) {
@@ -2754,6 +2898,77 @@ bool MainWindow::triggerHistorySnapshotPanelForTesting(const QString& rootPath,
         *diffRowCount = diffRows;
     }
     return (historyRows > 0) && (snapshotRows > 0) && (diffRows > 0);
+}
+
+bool MainWindow::triggerReferencePanelForTesting(const QString& rootPath,
+                                                 const QString& selectedFilePath,
+                                                 int* referencesRowCount,
+                                                 int* usedByRowCount,
+                                                 QStringList* referencesRowsOut,
+                                                 QStringList* usedByRowsOut,
+                                                 QString* navigationPathOut,
+                                                 QString* errorText)
+{
+    if (!m_structuralPanelDock || !m_structuralTabWidget) {
+        if (errorText) {
+            *errorText = QStringLiteral("structural_panel_not_initialized");
+        }
+        return false;
+    }
+
+    setActionContext({selectedFilePath}, QStringLiteral("reference_panel_smoke"));
+    m_structuralRootPath = QDir::fromNativeSeparators(QDir::cleanPath(rootPath));
+    m_structuralTargetPath = QDir::fromNativeSeparators(QDir::cleanPath(selectedFilePath));
+    if (m_rootEdit) {
+        m_rootEdit->setText(m_structuralRootPath);
+    }
+
+    updateStructuralPanelContextLabel();
+    m_structuralPanelDock->show();
+    m_structuralPanelDock->raise();
+    m_structuralTabWidget->setCurrentIndex(3);
+
+    QString localError;
+    int referenceRows = 0;
+    if (!loadStructuralReferenceView(QueryGraphMode::References, &localError, &referenceRows)) {
+        if (errorText) {
+            *errorText = QStringLiteral("references_load_failed:%1").arg(localError);
+        }
+        return false;
+    }
+    if (referencesRowsOut) {
+        *referencesRowsOut = collectCurrentModelRows();
+    }
+
+    int usedByRows = 0;
+    if (!loadStructuralReferenceView(QueryGraphMode::UsedBy, &localError, &usedByRows)) {
+        if (errorText) {
+            *errorText = QStringLiteral("usedby_load_failed:%1").arg(localError);
+        }
+        return false;
+    }
+    if (usedByRowsOut) {
+        *usedByRowsOut = collectCurrentModelRows();
+    }
+
+    QString navigatedPath;
+    if (!navigateFromCurrentModelRow(0, &navigatedPath)) {
+        if (errorText) {
+            *errorText = QStringLiteral("navigation_from_reference_row_failed");
+        }
+        return false;
+    }
+
+    if (referencesRowCount) {
+        *referencesRowCount = referenceRows;
+    }
+    if (usedByRowCount) {
+        *usedByRowCount = usedByRows;
+    }
+    if (navigationPathOut) {
+        *navigationPathOut = navigatedPath;
+    }
+    return referenceRows > 0 && usedByRows > 0 && !navigatedPath.isEmpty();
 }
 
 void MainWindow::onActionCopyPath()
