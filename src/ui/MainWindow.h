@@ -26,9 +26,11 @@
 
 class QCheckBox;
 class QComboBox;
+class QDockWidget;
 class QLabel;
 class QProcess;
 class QProgressDialog;
+class QTabWidget;
 class QTreeWidgetItem;
 class DirectoryModel;
 class QueryBarWidget;
@@ -62,6 +64,18 @@ public:
                                            int* removedCount = nullptr,
                                            int* changedCount = nullptr,
                                            QString* errorText = nullptr);
+    bool triggerHistorySnapshotPanelForTesting(const QString& rootPath,
+                                               const QString& selectedFilePath,
+                                               qint64 oldSnapshotId,
+                                               qint64 newSnapshotId,
+                                               int* historyRowCount = nullptr,
+                                               int* snapshotRowCount = nullptr,
+                                               int* diffRowCount = nullptr,
+                                               QStringList* historyRowsOut = nullptr,
+                                               QStringList* snapshotRowsOut = nullptr,
+                                               QStringList* diffRowsOut = nullptr,
+                                               QString* navigationPathOut = nullptr,
+                                               QString* errorText = nullptr);
 
 private slots:
     void onBrowseRoot();
@@ -95,9 +109,12 @@ private slots:
     void onActionExtractHere();
     void onActionExtractTo();
     void onActionExploreArchive();
+    void onActionOpenStructuralPanel();
     void onActionShowHistory();
     void onActionSnapshots();
     void onActionCompareSnapshots();
+    void onStructuralPanelTabChanged(int index);
+    void onStructuralCompareSnapshots();
     void onActionCopyPath();
     void onActionRename();
     void onActionPinFavorite();
@@ -162,6 +179,23 @@ private:
     void ensureUiActionTracePath();
     void maybeOpenStartupRoot();
     void triggerNamedAction(const QString& actionName, const QStringList& paths, const QString& selectionType);
+    void setupStructuralPanel();
+    bool resolveStructuralPanelContextFromCurrentSelection(QString* rootPathOut,
+                                                           QString* targetPathOut,
+                                                           QString* errorText = nullptr);
+    void updateStructuralPanelContextLabel();
+    bool refreshStructuralSnapshotSelectors(QString* errorText = nullptr);
+    bool loadStructuralHistoryView(QString* errorText = nullptr, int* rowCount = nullptr);
+    bool loadStructuralSnapshotView(QString* errorText = nullptr, int* rowCount = nullptr);
+    bool loadStructuralDiffView(qint64 oldSnapshotId,
+                                qint64 newSnapshotId,
+                                QString* errorText = nullptr,
+                                int* rowCount = nullptr,
+                                int* addedCount = nullptr,
+                                int* removedCount = nullptr,
+                                int* changedCount = nullptr);
+    bool navigateFromCurrentModelRow(int rowIndex, QString* navigatedPathOut = nullptr);
+    QStringList collectCurrentModelRows(int maxRows = 200) const;
     bool loadHistoryRowsForPath(const QString& selectedFilePath,
                                 QString* errorText = nullptr,
                                 int* rowCount = nullptr,
@@ -261,6 +295,7 @@ private:
     QAction* m_actionExtractHere = nullptr;
     QAction* m_actionExtractTo = nullptr;
     QAction* m_actionExploreArchive = nullptr;
+    QAction* m_actionOpenStructuralPanel = nullptr;
     QAction* m_actionShowHistory = nullptr;
     QAction* m_actionSnapshots = nullptr;
     QAction* m_actionCompareSnapshots = nullptr;
@@ -268,4 +303,18 @@ private:
     QAction* m_actionRename = nullptr;
     QAction* m_actionPinFavorite = nullptr;
     QAction* m_actionUnpinFavorite = nullptr;
+
+    QDockWidget* m_structuralPanelDock = nullptr;
+    QTabWidget* m_structuralTabWidget = nullptr;
+    QLabel* m_structuralContextLabel = nullptr;
+    QLabel* m_structuralHistoryStatusLabel = nullptr;
+    QLabel* m_structuralSnapshotStatusLabel = nullptr;
+    QLabel* m_structuralDiffStatusLabel = nullptr;
+    QPushButton* m_structuralHistoryLoadButton = nullptr;
+    QPushButton* m_structuralSnapshotLoadButton = nullptr;
+    QPushButton* m_structuralDiffCompareButton = nullptr;
+    QComboBox* m_structuralOldSnapshotCombo = nullptr;
+    QComboBox* m_structuralNewSnapshotCombo = nullptr;
+    QString m_structuralRootPath;
+    QString m_structuralTargetPath;
 };

@@ -12,6 +12,7 @@
 #include <QDesktopServices>
 #include <QDir>
 #include <QDirIterator>
+#include <QDockWidget>
 #include <QEventLoop>
 #include <QFileDialog>
 #include <QFile>
@@ -46,6 +47,7 @@
 #include <QTextStream>
 #include <QThread>
 #include <QToolBar>
+#include <QTabWidget>
 #include <QTreeWidget>
 #include <QTreeWidgetItem>
 #include <QUrl>
@@ -373,6 +375,7 @@ void MainWindow::setupUi()
     rootLayout->addWidget(splitter, 1);
     rootLayout->addWidget(m_statusLabel);
     setCentralWidget(central);
+    setupStructuralPanel();
 
     connect(m_browseButton, &QPushButton::clicked, this, &MainWindow::onBrowseRoot);
     connect(m_rescanButton, &QPushButton::clicked, this, &MainWindow::onRescan);
@@ -402,6 +405,67 @@ void MainWindow::setupUi()
 
     appendRuntimeLog(QStringLiteral("MainWindow setup complete. sidebar_created=true favorites_config=%1 root=%2 startup_autorescan=false")
                          .arg(favoritesConfigPath(), m_rootEdit->text()));
+}
+
+void MainWindow::setupStructuralPanel()
+{
+    m_structuralPanelDock = new QDockWidget(QStringLiteral("Structural Panel"), this);
+    m_structuralPanelDock->setObjectName(QStringLiteral("structuralPanelDock"));
+    m_structuralPanelDock->setAllowedAreas(Qt::BottomDockWidgetArea | Qt::RightDockWidgetArea);
+
+    QWidget* panelRoot = new QWidget(m_structuralPanelDock);
+    QVBoxLayout* panelLayout = new QVBoxLayout(panelRoot);
+    panelLayout->setContentsMargins(8, 8, 8, 8);
+
+    m_structuralContextLabel = new QLabel(QStringLiteral("Root: (none) | Target: (none)"), panelRoot);
+    m_structuralContextLabel->setObjectName(QStringLiteral("structuralContextLabel"));
+    panelLayout->addWidget(m_structuralContextLabel);
+
+    m_structuralTabWidget = new QTabWidget(panelRoot);
+    m_structuralTabWidget->setObjectName(QStringLiteral("structuralTabWidget"));
+
+    QWidget* historyTab = new QWidget(m_structuralTabWidget);
+    QVBoxLayout* historyLayout = new QVBoxLayout(historyTab);
+    m_structuralHistoryLoadButton = new QPushButton(QStringLiteral("Load Path History"), historyTab);
+    m_structuralHistoryStatusLabel = new QLabel(QStringLiteral("History tab idle"), historyTab);
+    historyLayout->addWidget(m_structuralHistoryLoadButton);
+    historyLayout->addWidget(m_structuralHistoryStatusLabel);
+    historyLayout->addStretch(1);
+    m_structuralTabWidget->addTab(historyTab, QStringLiteral("History"));
+
+    QWidget* snapshotsTab = new QWidget(m_structuralTabWidget);
+    QVBoxLayout* snapshotLayout = new QVBoxLayout(snapshotsTab);
+    m_structuralSnapshotLoadButton = new QPushButton(QStringLiteral("Load Snapshot List"), snapshotsTab);
+    m_structuralSnapshotStatusLabel = new QLabel(QStringLiteral("Snapshots tab idle"), snapshotsTab);
+    snapshotLayout->addWidget(m_structuralSnapshotLoadButton);
+    snapshotLayout->addWidget(m_structuralSnapshotStatusLabel);
+    snapshotLayout->addStretch(1);
+    m_structuralTabWidget->addTab(snapshotsTab, QStringLiteral("Snapshots"));
+
+    QWidget* diffTab = new QWidget(m_structuralTabWidget);
+    QVBoxLayout* diffLayout = new QVBoxLayout(diffTab);
+    QFormLayout* selectorLayout = new QFormLayout();
+    m_structuralOldSnapshotCombo = new QComboBox(diffTab);
+    m_structuralNewSnapshotCombo = new QComboBox(diffTab);
+    selectorLayout->addRow(QStringLiteral("Old Snapshot"), m_structuralOldSnapshotCombo);
+    selectorLayout->addRow(QStringLiteral("New Snapshot"), m_structuralNewSnapshotCombo);
+    m_structuralDiffCompareButton = new QPushButton(QStringLiteral("Compare Selected Snapshots"), diffTab);
+    m_structuralDiffStatusLabel = new QLabel(QStringLiteral("Diff tab idle"), diffTab);
+    diffLayout->addLayout(selectorLayout);
+    diffLayout->addWidget(m_structuralDiffCompareButton);
+    diffLayout->addWidget(m_structuralDiffStatusLabel);
+    diffLayout->addStretch(1);
+    m_structuralTabWidget->addTab(diffTab, QStringLiteral("Diff"));
+
+    panelLayout->addWidget(m_structuralTabWidget);
+    m_structuralPanelDock->setWidget(panelRoot);
+    addDockWidget(Qt::BottomDockWidgetArea, m_structuralPanelDock);
+    m_structuralPanelDock->hide();
+
+    connect(m_structuralHistoryLoadButton, &QPushButton::clicked, this, &MainWindow::onActionShowHistory);
+    connect(m_structuralSnapshotLoadButton, &QPushButton::clicked, this, &MainWindow::onActionSnapshots);
+    connect(m_structuralDiffCompareButton, &QPushButton::clicked, this, &MainWindow::onStructuralCompareSnapshots);
+    connect(m_structuralTabWidget, &QTabWidget::currentChanged, this, &MainWindow::onStructuralPanelTabChanged);
 }
 
 void MainWindow::setupActionRegistry()
@@ -435,6 +499,10 @@ void MainWindow::setupActionRegistry()
     m_actionExploreArchive = new QAction(QStringLiteral("Explore Archive..."), this);
     m_actionExploreArchive->setObjectName(QStringLiteral("actionExploreArchive"));
     connect(m_actionExploreArchive, &QAction::triggered, this, &MainWindow::onActionExploreArchive);
+
+    m_actionOpenStructuralPanel = new QAction(QStringLiteral("Open Structural Panel"), this);
+    m_actionOpenStructuralPanel->setObjectName(QStringLiteral("actionOpenStructuralPanel"));
+    connect(m_actionOpenStructuralPanel, &QAction::triggered, this, &MainWindow::onActionOpenStructuralPanel);
 
     m_actionShowHistory = new QAction(QStringLiteral("Show History"), this);
     m_actionShowHistory->setObjectName(QStringLiteral("actionShowHistory"));
@@ -486,6 +554,7 @@ void MainWindow::setupTestSurface()
     menu->addAction(m_actionExtractHere);
     menu->addAction(m_actionExtractTo);
     menu->addAction(m_actionExploreArchive);
+    menu->addAction(m_actionOpenStructuralPanel);
     menu->addAction(m_actionShowHistory);
     menu->addAction(m_actionSnapshots);
     menu->addAction(m_actionCompareSnapshots);
@@ -632,6 +701,8 @@ void MainWindow::triggerNamedAction(const QString& actionName, const QStringList
         m_actionExtractTo->trigger();
     } else if (actionName == QStringLiteral("ExploreArchive") && m_actionExploreArchive) {
         m_actionExploreArchive->trigger();
+    } else if (actionName == QStringLiteral("OpenStructuralPanel") && m_actionOpenStructuralPanel) {
+        m_actionOpenStructuralPanel->trigger();
     } else if (actionName == QStringLiteral("ShowHistory") && m_actionShowHistory) {
         m_actionShowHistory->trigger();
     } else if (actionName == QStringLiteral("Snapshots") && m_actionSnapshots) {
@@ -934,9 +1005,11 @@ void MainWindow::onTreeContextMenu(const QPoint& pos)
         QAction* newFolderAction = backgroundMenu.addAction(QStringLiteral("New Folder"));
         QAction* newTextFileAction = backgroundMenu.addAction(QStringLiteral("New Text File"));
         backgroundMenu.addSeparator();
+        backgroundMenu.addAction(m_actionOpenStructuralPanel);
         backgroundMenu.addAction(m_actionTreeSnapshot);
         backgroundMenu.addAction(m_actionSnapshots);
         backgroundMenu.addAction(m_actionCompareSnapshots);
+        QAction* openStructuralPanelAction = m_actionOpenStructuralPanel;
         QAction* snapshotCurrentAction = m_actionTreeSnapshot;
         QAction* snapshotsAction = m_actionSnapshots;
         QAction* compareSnapshotsAction = m_actionCompareSnapshots;
@@ -969,6 +1042,8 @@ void MainWindow::onTreeContextMenu(const QPoint& pos)
             createNewFolderInCurrentRoot();
         } else if (chosen == newTextFileAction) {
             createNewTextFileInCurrentRoot();
+        } else if (chosen == openStructuralPanelAction) {
+            onActionOpenStructuralPanel();
         } else if (chosen == snapshotCurrentAction) {
             onActionTreeSnapshot();
         } else if (chosen == snapshotsAction) {
@@ -1119,7 +1194,10 @@ void MainWindow::onTreeContextMenu(const QPoint& pos)
     QAction* pinFavoriteAction = nullptr;
     QAction* unpinFavoriteAction = nullptr;
     QAction* treeSnapshotAction = nullptr;
+    QAction* openStructuralPanelAction = nullptr;
     if (isFolder) {
+        menu.addAction(m_actionOpenStructuralPanel);
+        openStructuralPanelAction = m_actionOpenStructuralPanel;
         menu.addAction(m_actionTreeSnapshot);
         treeSnapshotAction = m_actionTreeSnapshot;
         menu.addAction(m_actionSnapshots);
@@ -1148,6 +1226,7 @@ void MainWindow::onTreeContextMenu(const QPoint& pos)
         compareSnapshotsAction = m_actionCompareSnapshots;
     }
     if (!isFolder) {
+        openStructuralPanelAction = menu.addAction(QStringLiteral("Open Structural Panel"));
         hashFileAction = menu.addAction(QStringLiteral("Hash File..."));
         previewAction = menu.addAction(QStringLiteral("Preview"));
 
@@ -1202,6 +1281,8 @@ void MainWindow::onTreeContextMenu(const QPoint& pos)
         executeGraphQueryFromSelection(QueryGraphMode::References, firstPath);
     } else if (showUsedByAction && chosen == showUsedByAction) {
         executeGraphQueryFromSelection(QueryGraphMode::UsedBy, firstPath);
+    } else if (openStructuralPanelAction && chosen == openStructuralPanelAction) {
+        onActionOpenStructuralPanel();
     } else if (showHistoryAction && chosen == showHistoryAction) {
         onActionShowHistory();
     } else if (snapshotsAction && chosen == snapshotsAction) {
@@ -2064,26 +2145,25 @@ bool MainWindow::loadHistoryRowsForPath(const QString& selectedFilePath,
 
 void MainWindow::onActionShowHistory()
 {
-    const QString path = primaryActionPathForCurrentContext();
-    const QFileInfo info(path);
-    if (path.isEmpty()) {
-        logUiAction(QStringLiteral("Show History"), QStringLiteral("onActionShowHistory"), QStringLiteral("error"), QString(), QStringLiteral("invalid_file_selection"));
-        return;
-    }
-    if (info.exists() && info.isDir()) {
-        logUiAction(QStringLiteral("Show History"), QStringLiteral("onActionShowHistory"), QStringLiteral("error"), QString(), QStringLiteral("folder_not_supported"));
-        return;
-    }
-    if (isArchivePath(path) || PathUtils::isArchiveVirtualPath(path)) {
-        logUiAction(QStringLiteral("Show History"), QStringLiteral("onActionShowHistory"), QStringLiteral("error"), QString(), QStringLiteral("archive_history_not_supported"));
+    QString errorText;
+    if (!m_structuralPanelDock || !resolveStructuralPanelContextFromCurrentSelection(&m_structuralRootPath, &m_structuralTargetPath, &errorText)) {
+        logUiAction(QStringLiteral("Show History"), QStringLiteral("onActionShowHistory"), QStringLiteral("error"), QString(), errorText);
+        if (!(m_testMode && m_testScriptRunning)) {
+            QMessageBox::warning(this, QStringLiteral("Show History"), QStringLiteral("Unable to resolve structural context: %1").arg(errorText));
+        }
         return;
     }
 
-    QString errorText;
+    updateStructuralPanelContextLabel();
+    refreshStructuralSnapshotSelectors(nullptr);
+    m_structuralPanelDock->show();
+    m_structuralPanelDock->raise();
+    if (m_structuralTabWidget) {
+        m_structuralTabWidget->setCurrentIndex(0);
+    }
+
     int rows = 0;
-    QString rootPath;
-    QString targetPath;
-    if (!loadHistoryRowsForPath(path, &errorText, &rows, &rootPath, &targetPath)) {
+    if (!loadStructuralHistoryView(&errorText, &rows)) {
         logUiAction(QStringLiteral("Show History"), QStringLiteral("onActionShowHistory"), QStringLiteral("error"), QString(), errorText);
         if (!(m_testMode && m_testScriptRunning)) {
             QMessageBox::warning(this, QStringLiteral("Show History"), QStringLiteral("Unable to load history: %1").arg(errorText));
@@ -2094,23 +2174,30 @@ void MainWindow::onActionShowHistory()
     logUiAction(QStringLiteral("Show History"),
                 QStringLiteral("onActionShowHistory"),
                 QStringLiteral("ok"),
-                QStringLiteral("rows=%1 root=%2 target=%3").arg(rows).arg(rootPath, targetPath),
+                QStringLiteral("rows=%1 root=%2 target=%3").arg(rows).arg(m_structuralRootPath, m_structuralTargetPath),
                 QString());
 }
 
 void MainWindow::onActionSnapshots()
 {
-    const QString rootPath = resolveSnapshotRootForAction(primaryActionPathForCurrentContext());
-    int rows = 0;
-    qint64 createdSnapshotId = 0;
     QString errorText;
-    if (!renderSnapshotListForRoot(rootPath,
-                                   true,
-                                   &rows,
-                                   &createdSnapshotId,
-                                   nullptr,
-                                   nullptr,
-                                   &errorText)) {
+    if (!m_structuralPanelDock || !resolveStructuralPanelContextFromCurrentSelection(&m_structuralRootPath, &m_structuralTargetPath, &errorText)) {
+        logUiAction(QStringLiteral("Snapshots"), QStringLiteral("onActionSnapshots"), QStringLiteral("error"), QString(), errorText);
+        if (!(m_testMode && m_testScriptRunning)) {
+            QMessageBox::warning(this, QStringLiteral("Snapshots"), QStringLiteral("Unable to resolve structural context: %1").arg(errorText));
+        }
+        return;
+    }
+
+    updateStructuralPanelContextLabel();
+    m_structuralPanelDock->show();
+    m_structuralPanelDock->raise();
+    if (m_structuralTabWidget) {
+        m_structuralTabWidget->setCurrentIndex(1);
+    }
+
+    int rows = 0;
+    if (!loadStructuralSnapshotView(&errorText, &rows)) {
         logUiAction(QStringLiteral("Snapshots"), QStringLiteral("onActionSnapshots"), QStringLiteral("error"), QString(), errorText);
         if (!(m_testMode && m_testScriptRunning)) {
             QMessageBox::warning(this, QStringLiteral("Snapshots"), QStringLiteral("Unable to load snapshots: %1").arg(errorText));
@@ -2121,37 +2208,119 @@ void MainWindow::onActionSnapshots()
     logUiAction(QStringLiteral("Snapshots"),
                 QStringLiteral("onActionSnapshots"),
                 QStringLiteral("ok"),
-                QStringLiteral("rows=%1 created_snapshot_id=%2 root=%3")
+                QStringLiteral("rows=%1 root=%2")
                     .arg(rows)
-                    .arg(createdSnapshotId)
-                    .arg(rootPath),
+                    .arg(m_structuralRootPath),
                 QString());
 }
 
 void MainWindow::onActionCompareSnapshots()
 {
-    const QString rootPath = resolveSnapshotRootForAction(primaryActionPathForCurrentContext());
-
-    qint64 newestSnapshotId = 0;
-    qint64 previousSnapshotId = 0;
-    QString listError;
-    if (!renderSnapshotListForRoot(rootPath,
-                                   false,
-                                   nullptr,
-                                   nullptr,
-                                   &newestSnapshotId,
-                                   &previousSnapshotId,
-                                   &listError)) {
-        logUiAction(QStringLiteral("Compare Snapshots"), QStringLiteral("onActionCompareSnapshots"), QStringLiteral("error"), QString(), listError);
+    QString errorText;
+    if (!m_structuralPanelDock || !resolveStructuralPanelContextFromCurrentSelection(&m_structuralRootPath, &m_structuralTargetPath, &errorText)) {
+        logUiAction(QStringLiteral("Compare Snapshots"), QStringLiteral("onActionCompareSnapshots"), QStringLiteral("error"), QString(), errorText);
         if (!(m_testMode && m_testScriptRunning)) {
-            QMessageBox::warning(this, QStringLiteral("Compare Snapshots"), QStringLiteral("Unable to list snapshots: %1").arg(listError));
+            QMessageBox::warning(this, QStringLiteral("Compare Snapshots"), QStringLiteral("Unable to resolve structural context: %1").arg(errorText));
         }
         return;
     }
 
-    if (newestSnapshotId <= 0 || previousSnapshotId <= 0) {
-        const QString errorText = QStringLiteral("snapshot_compare_requires_two_snapshots");
-        logUiAction(QStringLiteral("Compare Snapshots"), QStringLiteral("onActionCompareSnapshots"), QStringLiteral("error"), QString(), errorText);
+    updateStructuralPanelContextLabel();
+    m_structuralPanelDock->show();
+    m_structuralPanelDock->raise();
+    if (m_structuralTabWidget) {
+        m_structuralTabWidget->setCurrentIndex(2);
+    }
+
+    onStructuralCompareSnapshots();
+}
+
+void MainWindow::onActionOpenStructuralPanel()
+{
+    QString errorText;
+    if (!resolveStructuralPanelContextFromCurrentSelection(&m_structuralRootPath, &m_structuralTargetPath, &errorText)) {
+        logUiAction(QStringLiteral("Open Structural Panel"),
+                    QStringLiteral("onActionOpenStructuralPanel"),
+                    QStringLiteral("error"),
+                    QString(),
+                    errorText);
+        if (!(m_testMode && m_testScriptRunning)) {
+            QMessageBox::warning(this,
+                                 QStringLiteral("Open Structural Panel"),
+                                 QStringLiteral("Unable to resolve panel context: %1").arg(errorText));
+        }
+        return;
+    }
+
+    updateStructuralPanelContextLabel();
+    refreshStructuralSnapshotSelectors(nullptr);
+    if (m_structuralPanelDock) {
+        m_structuralPanelDock->show();
+        m_structuralPanelDock->raise();
+    }
+
+    logUiAction(QStringLiteral("Open Structural Panel"),
+                QStringLiteral("onActionOpenStructuralPanel"),
+                QStringLiteral("ok"),
+                QStringLiteral("root=%1 target=%2").arg(m_structuralRootPath, m_structuralTargetPath),
+                QString());
+}
+
+void MainWindow::onStructuralPanelTabChanged(int index)
+{
+    QString errorText;
+    if (m_structuralRootPath.isEmpty() || m_structuralTargetPath.isEmpty()) {
+        if (!resolveStructuralPanelContextFromCurrentSelection(&m_structuralRootPath, &m_structuralTargetPath, &errorText)) {
+            return;
+        }
+        updateStructuralPanelContextLabel();
+    }
+
+    if (index == 0) {
+        int rows = 0;
+        if (!loadStructuralHistoryView(&errorText, &rows) && m_structuralHistoryStatusLabel) {
+            m_structuralHistoryStatusLabel->setText(QStringLiteral("History error: %1").arg(errorText));
+        }
+        return;
+    }
+
+    if (index == 1) {
+        int rows = 0;
+        if (!loadStructuralSnapshotView(&errorText, &rows) && m_structuralSnapshotStatusLabel) {
+            m_structuralSnapshotStatusLabel->setText(QStringLiteral("Snapshots error: %1").arg(errorText));
+        }
+        return;
+    }
+
+    if (index == 2) {
+        refreshStructuralSnapshotSelectors(nullptr);
+    }
+}
+
+void MainWindow::onStructuralCompareSnapshots()
+{
+    QString errorText;
+    if (m_structuralRootPath.isEmpty() || m_structuralTargetPath.isEmpty()) {
+        if (!resolveStructuralPanelContextFromCurrentSelection(&m_structuralRootPath, &m_structuralTargetPath, &errorText)) {
+            logUiAction(QStringLiteral("Compare Snapshots"), QStringLiteral("onStructuralCompareSnapshots"), QStringLiteral("error"), QString(), errorText);
+            return;
+        }
+        updateStructuralPanelContextLabel();
+    }
+
+    if (!refreshStructuralSnapshotSelectors(&errorText)) {
+        logUiAction(QStringLiteral("Compare Snapshots"), QStringLiteral("onStructuralCompareSnapshots"), QStringLiteral("error"), QString(), errorText);
+        if (!(m_testMode && m_testScriptRunning)) {
+            QMessageBox::warning(this, QStringLiteral("Compare Snapshots"), QStringLiteral("Unable to list snapshots: %1").arg(errorText));
+        }
+        return;
+    }
+
+    if (!m_structuralOldSnapshotCombo || !m_structuralNewSnapshotCombo
+        || m_structuralOldSnapshotCombo->currentIndex() < 0
+        || m_structuralNewSnapshotCombo->currentIndex() < 0) {
+        const QString noSelectionError = QStringLiteral("snapshot_compare_requires_two_snapshots");
+        logUiAction(QStringLiteral("Compare Snapshots"), QStringLiteral("onStructuralCompareSnapshots"), QStringLiteral("error"), QString(), noSelectionError);
         if (!(m_testMode && m_testScriptRunning)) {
             QMessageBox::warning(this,
                                  QStringLiteral("Compare Snapshots"),
@@ -2160,38 +2329,431 @@ void MainWindow::onActionCompareSnapshots()
         return;
     }
 
-    int rows = 0;
-    int added = 0;
-    int removed = 0;
-    int changed = 0;
-    QString diffError;
-    if (!renderSnapshotDiffForRoot(rootPath,
-                                   previousSnapshotId,
-                                   newestSnapshotId,
-                                   &rows,
-                                   &added,
-                                   &removed,
-                                   &changed,
-                                   &diffError)) {
-        logUiAction(QStringLiteral("Compare Snapshots"), QStringLiteral("onActionCompareSnapshots"), QStringLiteral("error"), QString(), diffError);
+    const qint64 oldSnapshotId = m_structuralOldSnapshotCombo->currentData().toLongLong();
+    const qint64 newSnapshotId = m_structuralNewSnapshotCombo->currentData().toLongLong();
+    if (oldSnapshotId <= 0 || newSnapshotId <= 0 || oldSnapshotId == newSnapshotId) {
+        const QString badSelectionError = QStringLiteral("invalid_snapshot_compare_selection");
+        logUiAction(QStringLiteral("Compare Snapshots"), QStringLiteral("onStructuralCompareSnapshots"), QStringLiteral("error"), QString(), badSelectionError);
         if (!(m_testMode && m_testScriptRunning)) {
-            QMessageBox::warning(this, QStringLiteral("Compare Snapshots"), QStringLiteral("Unable to compare snapshots: %1").arg(diffError));
+            QMessageBox::warning(this,
+                                 QStringLiteral("Compare Snapshots"),
+                                 QStringLiteral("Select two different snapshots before comparison."));
         }
         return;
     }
 
+    int rows = 0;
+    int added = 0;
+    int removed = 0;
+    int changed = 0;
+    if (!loadStructuralDiffView(oldSnapshotId,
+                                newSnapshotId,
+                                &errorText,
+                                &rows,
+                                &added,
+                                &removed,
+                                &changed)) {
+        logUiAction(QStringLiteral("Compare Snapshots"), QStringLiteral("onStructuralCompareSnapshots"), QStringLiteral("error"), QString(), errorText);
+        if (!(m_testMode && m_testScriptRunning)) {
+            QMessageBox::warning(this, QStringLiteral("Compare Snapshots"), QStringLiteral("Unable to compare snapshots: %1").arg(errorText));
+        }
+        return;
+    }
+
+    if (m_structuralTabWidget) {
+        m_structuralTabWidget->setCurrentIndex(2);
+    }
+
     logUiAction(QStringLiteral("Compare Snapshots"),
-                QStringLiteral("onActionCompareSnapshots"),
+                QStringLiteral("onStructuralCompareSnapshots"),
                 QStringLiteral("ok"),
                 QStringLiteral("rows=%1 added=%2 removed=%3 changed=%4 old_snapshot_id=%5 new_snapshot_id=%6 root=%7")
                     .arg(rows)
                     .arg(added)
                     .arg(removed)
                     .arg(changed)
-                    .arg(previousSnapshotId)
-                    .arg(newestSnapshotId)
-                    .arg(rootPath),
+                    .arg(oldSnapshotId)
+                    .arg(newSnapshotId)
+                    .arg(m_structuralRootPath),
                 QString());
+}
+
+bool MainWindow::resolveStructuralPanelContextFromCurrentSelection(QString* rootPathOut,
+                                                                   QString* targetPathOut,
+                                                                   QString* errorText)
+{
+    const QString selectedPath = QDir::fromNativeSeparators(QDir::cleanPath(primaryActionPathForCurrentContext()));
+    const QString rootPath = resolveSnapshotRootForAction(selectedPath);
+    if (rootPath.trimmed().isEmpty()) {
+        if (errorText) {
+            *errorText = QStringLiteral("invalid_root_path");
+        }
+        return false;
+    }
+
+    QString targetPath;
+    QFileInfo selectedInfo(selectedPath);
+    if (!selectedPath.isEmpty() && selectedInfo.exists() && selectedInfo.isFile()) {
+        targetPath = selectedPath;
+    } else {
+        const QString preferred = QDir(rootPath).filePath(QStringLiteral("src/main.cpp"));
+        QFileInfo preferredInfo(preferred);
+        if (preferredInfo.exists() && preferredInfo.isFile()) {
+            targetPath = preferredInfo.absoluteFilePath();
+        } else {
+            QDirIterator it(rootPath,
+                            QDir::Files | QDir::NoDotAndDotDot | QDir::Hidden | QDir::System,
+                            QDirIterator::Subdirectories);
+            if (it.hasNext()) {
+                targetPath = QDir::fromNativeSeparators(QDir::cleanPath(it.next()));
+            }
+        }
+    }
+
+    if (targetPath.isEmpty()) {
+        if (errorText) {
+            *errorText = QStringLiteral("no_file_target_available");
+        }
+        return false;
+    }
+
+    if (m_rootEdit) {
+        m_rootEdit->setText(rootPath);
+    }
+
+    if (rootPathOut) {
+        *rootPathOut = rootPath;
+    }
+    if (targetPathOut) {
+        *targetPathOut = targetPath;
+    }
+    return true;
+}
+
+void MainWindow::updateStructuralPanelContextLabel()
+{
+    if (!m_structuralContextLabel) {
+        return;
+    }
+    m_structuralContextLabel->setText(
+        QStringLiteral("Root: %1 | Target: %2")
+            .arg(m_structuralRootPath.isEmpty() ? QStringLiteral("(none)") : m_structuralRootPath)
+            .arg(m_structuralTargetPath.isEmpty() ? QStringLiteral("(none)") : m_structuralTargetPath));
+}
+
+bool MainWindow::refreshStructuralSnapshotSelectors(QString* errorText)
+{
+    if (!m_structuralOldSnapshotCombo || !m_structuralNewSnapshotCombo) {
+        if (errorText) {
+            *errorText = QStringLiteral("snapshot_selectors_missing");
+        }
+        return false;
+    }
+
+    m_structuralOldSnapshotCombo->clear();
+    m_structuralNewSnapshotCombo->clear();
+
+    if (m_structuralRootPath.trimmed().isEmpty()) {
+        if (errorText) {
+            *errorText = QStringLiteral("structural_root_missing");
+        }
+        return false;
+    }
+
+    MetaStore store;
+    QString initError;
+    QString migrationLog;
+    if (!store.initialize(m_uiDbPath, &initError, &migrationLog)) {
+        if (errorText) {
+            *errorText = QStringLiteral("snapshot_store_init_failed:%1").arg(initError);
+        }
+        return false;
+    }
+
+    SnapshotRepository repository(store);
+    QVector<SnapshotRecord> snapshots;
+    QString listError;
+    const bool listed = repository.listSnapshots(m_structuralRootPath, &snapshots, &listError);
+    store.shutdown();
+    if (!listed) {
+        if (errorText) {
+            *errorText = QStringLiteral("snapshot_list_failed:%1").arg(listError);
+        }
+        return false;
+    }
+
+    for (const SnapshotRecord& snapshot : snapshots) {
+        const QString label = QStringLiteral("%1 (%2)").arg(snapshot.snapshotName, QString::number(snapshot.id));
+        m_structuralOldSnapshotCombo->addItem(label, snapshot.id);
+        m_structuralNewSnapshotCombo->addItem(label, snapshot.id);
+    }
+
+    if (snapshots.size() >= 2) {
+        m_structuralOldSnapshotCombo->setCurrentIndex(1);
+        m_structuralNewSnapshotCombo->setCurrentIndex(0);
+    }
+
+    return true;
+}
+
+bool MainWindow::loadStructuralHistoryView(QString* errorText, int* rowCount)
+{
+    QString rootPath;
+    QString targetPath;
+    int rows = 0;
+    const bool ok = loadHistoryRowsForPath(m_structuralTargetPath, errorText, &rows, &rootPath, &targetPath);
+    if (ok) {
+        if (m_structuralHistoryStatusLabel) {
+            m_structuralHistoryStatusLabel->setText(QStringLiteral("History rows: %1").arg(rows));
+        }
+        if (rowCount) {
+            *rowCount = rows;
+        }
+    }
+    return ok;
+}
+
+bool MainWindow::loadStructuralSnapshotView(QString* errorText, int* rowCount)
+{
+    int rows = 0;
+    const bool ok = renderSnapshotListForRoot(m_structuralRootPath,
+                                              false,
+                                              &rows,
+                                              nullptr,
+                                              nullptr,
+                                              nullptr,
+                                              errorText);
+    if (ok) {
+        refreshStructuralSnapshotSelectors(nullptr);
+        if (m_structuralSnapshotStatusLabel) {
+            m_structuralSnapshotStatusLabel->setText(QStringLiteral("Snapshot rows: %1").arg(rows));
+        }
+        if (rowCount) {
+            *rowCount = rows;
+        }
+    }
+    return ok;
+}
+
+bool MainWindow::loadStructuralDiffView(qint64 oldSnapshotId,
+                                        qint64 newSnapshotId,
+                                        QString* errorText,
+                                        int* rowCount,
+                                        int* addedCount,
+                                        int* removedCount,
+                                        int* changedCount)
+{
+    int rows = 0;
+    int added = 0;
+    int removed = 0;
+    int changed = 0;
+    const bool ok = renderSnapshotDiffForRoot(m_structuralRootPath,
+                                              oldSnapshotId,
+                                              newSnapshotId,
+                                              &rows,
+                                              &added,
+                                              &removed,
+                                              &changed,
+                                              errorText);
+    if (ok) {
+        if (m_structuralDiffStatusLabel) {
+            m_structuralDiffStatusLabel->setText(
+                QStringLiteral("Diff rows: %1 (added=%2 removed=%3 changed=%4)")
+                    .arg(rows)
+                    .arg(added)
+                    .arg(removed)
+                    .arg(changed));
+        }
+        if (rowCount) {
+            *rowCount = rows;
+        }
+        if (addedCount) {
+            *addedCount = added;
+        }
+        if (removedCount) {
+            *removedCount = removed;
+        }
+        if (changedCount) {
+            *changedCount = changed;
+        }
+    }
+    return ok;
+}
+
+bool MainWindow::navigateFromCurrentModelRow(int rowIndex, QString* navigatedPathOut)
+{
+    if (rowIndex < 0 || rowIndex >= m_proxyModel.rowCount()) {
+        return false;
+    }
+
+    const QModelIndex proxyIndex = m_proxyModel.index(rowIndex, 0);
+    if (!proxyIndex.isValid()) {
+        return false;
+    }
+
+    const QModelIndex sourceIndex = m_proxyModel.mapToSource(proxyIndex);
+    QString candidatePath = selectedPath(sourceIndex);
+    const int snapshotSuffix = candidatePath.indexOf(QStringLiteral("#snapshot_"));
+    if (snapshotSuffix >= 0) {
+        candidatePath = candidatePath.left(snapshotSuffix);
+    }
+
+    QFileInfo info(candidatePath);
+    if (!info.exists()) {
+        return false;
+    }
+
+    const QString destination = info.isDir() ? info.absoluteFilePath() : info.absolutePath();
+    if (!isNavigablePath(destination)) {
+        return false;
+    }
+
+    navigateToDirectory(destination);
+    if (navigatedPathOut) {
+        *navigatedPathOut = destination;
+    }
+    return true;
+}
+
+QStringList MainWindow::collectCurrentModelRows(int maxRows) const
+{
+    QStringList rows;
+    const int count = qMin(maxRows, m_proxyModel.rowCount());
+    rows.reserve(count);
+    for (int i = 0; i < count; ++i) {
+        const QString c0 = m_proxyModel.data(m_proxyModel.index(i, 0), Qt::DisplayRole).toString();
+        const QString c1 = m_proxyModel.data(m_proxyModel.index(i, 1), Qt::DisplayRole).toString();
+        const QString c2 = m_proxyModel.data(m_proxyModel.index(i, 2), Qt::DisplayRole).toString();
+        const QString c3 = m_proxyModel.data(m_proxyModel.index(i, 3), Qt::DisplayRole).toString();
+        const QString c4 = m_proxyModel.data(m_proxyModel.index(i, 4), Qt::DisplayRole).toString();
+        rows << QStringLiteral("row[%1] col0=%2 col1=%3 col2=%4 col3=%5 col4=%6")
+                    .arg(i)
+                    .arg(c0)
+                    .arg(c1)
+                    .arg(c2)
+                    .arg(c3)
+                    .arg(c4);
+    }
+    return rows;
+}
+
+bool MainWindow::triggerHistorySnapshotPanelForTesting(const QString& rootPath,
+                                                       const QString& selectedFilePath,
+                                                       qint64 oldSnapshotId,
+                                                       qint64 newSnapshotId,
+                                                       int* historyRowCount,
+                                                       int* snapshotRowCount,
+                                                       int* diffRowCount,
+                                                       QStringList* historyRowsOut,
+                                                       QStringList* snapshotRowsOut,
+                                                       QStringList* diffRowsOut,
+                                                       QString* navigationPathOut,
+                                                       QString* errorText)
+{
+    if (!m_structuralPanelDock || !m_structuralTabWidget) {
+        if (errorText) {
+            *errorText = QStringLiteral("structural_panel_not_initialized");
+        }
+        return false;
+    }
+
+    setActionContext({selectedFilePath}, QStringLiteral("panel_smoke"));
+    m_structuralRootPath = QDir::fromNativeSeparators(QDir::cleanPath(rootPath));
+    m_structuralTargetPath = QDir::fromNativeSeparators(QDir::cleanPath(selectedFilePath));
+    if (m_rootEdit) {
+        m_rootEdit->setText(m_structuralRootPath);
+    }
+
+    updateStructuralPanelContextLabel();
+    m_structuralPanelDock->show();
+    m_structuralPanelDock->raise();
+
+    QString localError;
+    int historyRows = 0;
+    m_structuralTabWidget->setCurrentIndex(0);
+    if (!loadStructuralHistoryView(&localError, &historyRows)) {
+        if (errorText) {
+            *errorText = QStringLiteral("history_load_failed:%1").arg(localError);
+        }
+        return false;
+    }
+    if (historyRowsOut) {
+        *historyRowsOut = collectCurrentModelRows();
+    }
+
+    int snapshotRows = 0;
+    m_structuralTabWidget->setCurrentIndex(1);
+    if (!loadStructuralSnapshotView(&localError, &snapshotRows)) {
+        if (errorText) {
+            *errorText = QStringLiteral("snapshot_load_failed:%1").arg(localError);
+        }
+        return false;
+    }
+    if (snapshotRowsOut) {
+        *snapshotRowsOut = collectCurrentModelRows();
+    }
+
+    if (!refreshStructuralSnapshotSelectors(&localError)) {
+        if (errorText) {
+            *errorText = QStringLiteral("snapshot_selector_load_failed:%1").arg(localError);
+        }
+        return false;
+    }
+
+    const int oldIndex = m_structuralOldSnapshotCombo ? m_structuralOldSnapshotCombo->findData(oldSnapshotId) : -1;
+    const int newIndex = m_structuralNewSnapshotCombo ? m_structuralNewSnapshotCombo->findData(newSnapshotId) : -1;
+    if (oldIndex < 0 || newIndex < 0) {
+        if (errorText) {
+            *errorText = QStringLiteral("snapshot_ids_not_available old=%1 new=%2").arg(oldSnapshotId).arg(newSnapshotId);
+        }
+        return false;
+    }
+    m_structuralOldSnapshotCombo->setCurrentIndex(oldIndex);
+    m_structuralNewSnapshotCombo->setCurrentIndex(newIndex);
+
+    int diffRows = 0;
+    int added = 0;
+    int removed = 0;
+    int changed = 0;
+    m_structuralTabWidget->setCurrentIndex(2);
+    if (!loadStructuralDiffView(oldSnapshotId,
+                                newSnapshotId,
+                                &localError,
+                                &diffRows,
+                                &added,
+                                &removed,
+                                &changed)) {
+        if (errorText) {
+            *errorText = QStringLiteral("diff_load_failed:%1").arg(localError);
+        }
+        return false;
+    }
+    if (diffRowsOut) {
+        *diffRowsOut = collectCurrentModelRows();
+    }
+
+    QString navigatedPath;
+    const bool navigationOk = navigateFromCurrentModelRow(0, &navigatedPath);
+    if (!navigationOk) {
+        if (errorText) {
+            *errorText = QStringLiteral("navigation_from_diff_row_failed");
+        }
+        return false;
+    }
+
+    if (navigationPathOut) {
+        *navigationPathOut = navigatedPath;
+    }
+    if (historyRowCount) {
+        *historyRowCount = historyRows;
+    }
+    if (snapshotRowCount) {
+        *snapshotRowCount = snapshotRows;
+    }
+    if (diffRowCount) {
+        *diffRowCount = diffRows;
+    }
+    return (historyRows > 0) && (snapshotRows > 0) && (diffRows > 0);
 }
 
 void MainWindow::onActionCopyPath()

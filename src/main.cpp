@@ -218,6 +218,16 @@ struct SnapshotUiSmokeCliOptions {
     QString parseError;
 };
 
+struct HistorySnapshotPanelSmokeCliOptions {
+    bool enabled = false;
+    QString historyDbPath;
+    QString historyRoot;
+    QString historyTarget;
+    QString historyLogPath;
+    QStringList argsReceived;
+    QString parseError;
+};
+
 struct SnapshotDiffProbeCliOptions {
     bool enabled = false;
     QString snapshotDbPath;
@@ -425,6 +435,16 @@ bool hasSnapshotUiSmokeFlag(int argc, char* argv[])
 {
     for (int i = 1; i < argc; ++i) {
         if (QString::fromLocal8Bit(argv[i]) == QStringLiteral("--snapshot-ui-smoke")) {
+            return true;
+        }
+    }
+    return false;
+}
+
+bool hasHistorySnapshotPanelSmokeFlag(int argc, char* argv[])
+{
+    for (int i = 1; i < argc; ++i) {
+        if (QString::fromLocal8Bit(argv[i]) == QStringLiteral("--history-snapshot-panel-smoke")) {
             return true;
         }
     }
@@ -1328,6 +1348,63 @@ SnapshotUiSmokeCliOptions parseSnapshotUiSmokeOptions(int argc, char* argv[])
 
         if (token == QStringLiteral("--history-root")) {
             if (!consumeValue(&options.historyRoot)) {
+                break;
+            }
+            continue;
+        }
+
+        if (token == QStringLiteral("--history-log")) {
+            if (!consumeValue(&options.historyLogPath)) {
+                break;
+            }
+            continue;
+        }
+    }
+
+    return options;
+}
+
+HistorySnapshotPanelSmokeCliOptions parseHistorySnapshotPanelSmokeOptions(int argc, char* argv[])
+{
+    HistorySnapshotPanelSmokeCliOptions options;
+
+    for (int i = 0; i < argc; ++i) {
+        options.argsReceived << QString::fromLocal8Bit(argv[i]);
+    }
+
+    for (int i = 1; i < argc; ++i) {
+        const QString token = QString::fromLocal8Bit(argv[i]);
+        if (token == QStringLiteral("--history-snapshot-panel-smoke")) {
+            options.enabled = true;
+            continue;
+        }
+
+        auto consumeValue = [&](QString* out) {
+            if ((i + 1) >= argc) {
+                options.parseError = QStringLiteral("missing_value_for_%1").arg(token);
+                return false;
+            }
+            ++i;
+            *out = QDir::cleanPath(QString::fromLocal8Bit(argv[i]));
+            return true;
+        };
+
+        if (token == QStringLiteral("--history-db-path")) {
+            if (!consumeValue(&options.historyDbPath)) {
+                break;
+            }
+            continue;
+        }
+
+        if (token == QStringLiteral("--history-root")) {
+            if (!consumeValue(&options.historyRoot)) {
+                break;
+            }
+            continue;
+        }
+
+        if (token == QStringLiteral("--history-target")) {
+            if (!consumeValue(&options.historyTarget)) {
                 break;
             }
             continue;
@@ -5664,6 +5741,351 @@ int runSnapshotUiSmokeCli(int argc, char* argv[])
     }
 }
 
+int runHistorySnapshotPanelSmokeCli(int argc, char* argv[])
+{
+    QApplication uiApp(argc, argv);
+
+    const HistorySnapshotPanelSmokeCliOptions options = parseHistorySnapshotPanelSmokeOptions(argc, argv);
+    const QString exePath = QFileInfo(QString::fromLocal8Bit(argv[0])).absoluteFilePath();
+    const QString cwd = QDir::currentPath();
+
+    if (!options.parseError.isEmpty()) {
+        writeStderrLine(QStringLiteral("history_snapshot_panel_smoke_parse_error=%1").arg(options.parseError));
+        return 652;
+    }
+    if (options.historyLogPath.trimmed().isEmpty()) {
+        writeStderrLine(QStringLiteral("history_snapshot_panel_smoke_error=missing_required_arg_--history-log"));
+        return 653;
+    }
+
+    IndexSmokeLogWriter log;
+    QString logOpenError;
+    if (!log.open(options.historyLogPath, &logOpenError)) {
+        writeStderrLine(QStringLiteral("history_snapshot_panel_smoke_error=log_open_failed:%1").arg(logOpenError));
+        return 654;
+    }
+
+    auto finishFail = [&](int exitCode, const QString& reason) {
+        log.writeLine(QStringLiteral("final_status=FAIL"));
+        log.writeLine(QStringLiteral("exit_code=%1").arg(exitCode));
+        log.writeLine(QStringLiteral("failure_reason=%1").arg(reason));
+        log.writeLine(QStringLiteral("timestamp_utc_end=%1").arg(QDateTime::currentDateTimeUtc().toString(Qt::ISODate)));
+        return exitCode;
+    };
+
+    auto writeTextFile = [](const QString& path, const QString& content, QString* errorText) {
+        QFileInfo info(path);
+        if (!QDir().mkpath(info.absolutePath())) {
+            if (errorText) {
+                *errorText = QStringLiteral("create_parent_dir_failed:%1").arg(info.absolutePath());
+            }
+            return false;
+        }
+        QFile out(path);
+        if (!out.open(QIODevice::WriteOnly | QIODevice::Text | QIODevice::Truncate)) {
+            if (errorText) {
+                *errorText = QStringLiteral("open_write_failed:%1").arg(out.errorString());
+            }
+            return false;
+        }
+        QTextStream ts(&out);
+        ts << content;
+        return true;
+    };
+
+    auto writeLines = [](const QString& path, const QStringList& lines) {
+        QFileInfo info(path);
+        QDir().mkpath(info.absolutePath());
+        QFile out(path);
+        if (!out.open(QIODevice::WriteOnly | QIODevice::Text | QIODevice::Truncate)) {
+            return false;
+        }
+        QTextStream ts(&out);
+        for (const QString& line : lines) {
+            ts << line << '\n';
+        }
+        return true;
+    };
+
+    try {
+        if (options.historyDbPath.trimmed().isEmpty()) {
+            return finishFail(655, QStringLiteral("missing_required_arg_--history-db-path"));
+        }
+        if (options.historyRoot.trimmed().isEmpty()) {
+            return finishFail(656, QStringLiteral("missing_required_arg_--history-root"));
+        }
+        if (options.historyTarget.trimmed().isEmpty()) {
+            return finishFail(657, QStringLiteral("missing_required_arg_--history-target"));
+        }
+
+        const QString normalizedRoot = QDir::fromNativeSeparators(QDir::cleanPath(QFileInfo(options.historyRoot).absoluteFilePath()));
+        const QString normalizedDbPath = QDir::fromNativeSeparators(QDir::cleanPath(QFileInfo(options.historyDbPath).absoluteFilePath()));
+        const QString normalizedTarget = QDir::fromNativeSeparators(QDir::cleanPath(QDir(normalizedRoot).filePath(options.historyTarget)));
+        const QString panelDir = QFileInfo(options.historyLogPath).absolutePath();
+
+        const QString historyPanelLogPath = options.historyLogPath;
+        const QString snapshotPanelLogPath = QDir(panelDir).filePath(QStringLiteral("07_panel_snapshot_log.txt"));
+        const QString diffPanelLogPath = QDir(panelDir).filePath(QStringLiteral("08_panel_diff_log.txt"));
+        const QString navigationPanelLogPath = QDir(panelDir).filePath(QStringLiteral("09_panel_navigation_log.txt"));
+        const QString historyRowsPath = QDir(panelDir).filePath(QStringLiteral("10_history_rows.txt"));
+        const QString snapshotRowsPath = QDir(panelDir).filePath(QStringLiteral("11_snapshot_rows.txt"));
+        const QString diffRowsPath = QDir(panelDir).filePath(QStringLiteral("12_diff_rows.txt"));
+
+        log.writeLine(QStringLiteral("mode=history_snapshot_panel_smoke"));
+        log.writeLine(QStringLiteral("startup_banner=HISTORY_SNAPSHOT_PANEL_SMOKE_BEGIN"));
+        log.writeLine(QStringLiteral("exe_path=%1").arg(QDir::toNativeSeparators(exePath)));
+        log.writeLine(QStringLiteral("cwd=%1").arg(QDir::toNativeSeparators(cwd)));
+        log.writeLine(QStringLiteral("args_received=%1").arg(options.argsReceived.join(QStringLiteral(" | "))));
+        log.writeLine(QStringLiteral("history_root=%1").arg(QDir::toNativeSeparators(normalizedRoot)));
+        log.writeLine(QStringLiteral("history_db_path=%1").arg(QDir::toNativeSeparators(normalizedDbPath)));
+        log.writeLine(QStringLiteral("history_target=%1").arg(QDir::toNativeSeparators(normalizedTarget)));
+        log.writeLine(QStringLiteral("timestamp_utc=%1").arg(QDateTime::currentDateTimeUtc().toString(Qt::ISODate)));
+
+        QFile::remove(normalizedDbPath);
+        QFile::remove(normalizedDbPath + QStringLiteral("-wal"));
+        QFile::remove(normalizedDbPath + QStringLiteral("-shm"));
+
+        QDir rootDir(normalizedRoot);
+        if (rootDir.exists() && !rootDir.removeRecursively()) {
+            return finishFail(658, QStringLiteral("sample_root_cleanup_failed"));
+        }
+        if (!QDir().mkpath(QDir(normalizedRoot).filePath(QStringLiteral("src")))
+            || !QDir().mkpath(QDir(normalizedRoot).filePath(QStringLiteral("docs")))) {
+            return finishFail(659, QStringLiteral("sample_root_create_failed"));
+        }
+
+        QString writeError;
+        if (!writeTextFile(QDir(normalizedRoot).filePath(QStringLiteral("src/main.cpp")),
+                           QStringLiteral("int main(){return 1;}\n"),
+                           &writeError)
+            || !writeTextFile(QDir(normalizedRoot).filePath(QStringLiteral("src/util.h")),
+                              QStringLiteral("#pragma once\nint util();\n"),
+                              &writeError)
+            || !writeTextFile(QDir(normalizedRoot).filePath(QStringLiteral("docs/readme.md")),
+                              QStringLiteral("baseline\n"),
+                              &writeError)) {
+            return finishFail(660, QStringLiteral("baseline_seed_failed:%1").arg(writeError));
+        }
+
+        MetaStore store;
+        QString errorText;
+        QString migrationLog;
+        if (!store.initialize(normalizedDbPath, &errorText, &migrationLog)) {
+            return finishFail(661, QStringLiteral("db_init_failure:%1").arg(errorText));
+        }
+
+        SnapshotRepository repository(store);
+        auto collectSnapshotEntries = [&](QVector<SnapshotEntryRecord>* outEntries) {
+            outEntries->clear();
+            QStringList paths;
+            paths.push_back(normalizedRoot);
+            QDirIterator it(normalizedRoot,
+                            QDir::AllEntries | QDir::NoDotAndDotDot | QDir::Hidden | QDir::System,
+                            QDirIterator::Subdirectories);
+            while (it.hasNext()) {
+                paths.push_back(QDir::fromNativeSeparators(QDir::cleanPath(it.next())));
+            }
+            std::sort(paths.begin(), paths.end(), [](const QString& a, const QString& b) {
+                return QString::compare(a, b, Qt::CaseInsensitive) < 0;
+            });
+            outEntries->reserve(paths.size());
+            for (const QString& path : paths) {
+                QFileInfo info(path);
+                if (!info.exists()) {
+                    continue;
+                }
+
+                SnapshotEntryRecord entry;
+                entry.entryPath = QDir::fromNativeSeparators(QDir::cleanPath(info.absoluteFilePath()));
+                entry.virtualPath = entry.entryPath;
+                entry.parentPath = QDir::fromNativeSeparators(QDir::cleanPath(info.absolutePath()));
+                entry.name = info.fileName().isEmpty() ? entry.entryPath : info.fileName();
+                entry.normalizedName = entry.name.toLower();
+                entry.extension = info.isDir() || info.suffix().isEmpty() ? QString() : (QStringLiteral(".") + info.suffix().toLower());
+                entry.isDir = info.isDir();
+                entry.hasSizeBytes = !entry.isDir;
+                entry.sizeBytes = entry.isDir ? 0 : info.size();
+                entry.modifiedUtc = info.lastModified().toUTC().toString(Qt::ISODate);
+                entry.hiddenFlag = info.isHidden();
+                entry.systemFlag = false;
+                entry.archiveFlag = false;
+                entry.existsFlag = true;
+                const QString hashPayload = QStringLiteral("%1|%2|%3")
+                                                .arg(entry.entryPath)
+                                                .arg(entry.hasSizeBytes ? QString::number(entry.sizeBytes) : QStringLiteral("null"))
+                                                .arg(entry.modifiedUtc);
+                entry.entryHash = QString::fromLatin1(QCryptographicHash::hash(hashPayload.toUtf8(), QCryptographicHash::Sha256).toHex());
+                entry.hasEntryHash = !entry.entryHash.isEmpty();
+                outEntries->push_back(entry);
+            }
+            return true;
+        };
+
+        auto createSnapshot = [&](const QString& snapshotName, const QString& noteText, qint64* snapshotIdOut) {
+            QVector<SnapshotEntryRecord> entries;
+            if (!collectSnapshotEntries(&entries)) {
+                errorText = QStringLiteral("collect_snapshot_entries_failed");
+                return false;
+            }
+
+            SnapshotRecord snapshot;
+            snapshot.rootPath = normalizedRoot;
+            snapshot.snapshotName = snapshotName;
+            snapshot.snapshotType = QStringLiteral("structural_full");
+            snapshot.createdUtc = SqlHelpers::utcNowIso();
+            snapshot.optionsJson = SnapshotTypesUtil::optionsToJson(SnapshotCreateOptions{});
+            snapshot.itemCount = entries.size();
+            snapshot.noteText = noteText;
+
+            if (!store.beginTransaction(&errorText)) {
+                return false;
+            }
+            qint64 snapshotId = 0;
+            if (!repository.createSnapshot(snapshot, &snapshotId, &errorText)) {
+                store.rollbackTransaction(nullptr);
+                return false;
+            }
+            for (SnapshotEntryRecord& entry : entries) {
+                entry.snapshotId = snapshotId;
+            }
+            if (!repository.insertSnapshotEntries(snapshotId, entries, &errorText)
+                || !repository.updateSnapshotItemCount(snapshotId, entries.size(), &errorText)
+                || !store.commitTransaction(&errorText)) {
+                store.rollbackTransaction(nullptr);
+                return false;
+            }
+            if (snapshotIdOut) {
+                *snapshotIdOut = snapshotId;
+            }
+            return true;
+        };
+
+        qint64 snapshotAId = 0;
+        if (!createSnapshot(QStringLiteral("snapshot_A"), QStringLiteral("baseline"), &snapshotAId)) {
+            store.shutdown();
+            return finishFail(662, QStringLiteral("snapshot_a_failed:%1").arg(errorText));
+        }
+
+        if (!writeTextFile(QDir(normalizedRoot).filePath(QStringLiteral("src/main.cpp")),
+                           QStringLiteral("int main(){\n    int v = 2;\n    return v;\n}\n"),
+                           &writeError)
+            || !writeTextFile(QDir(normalizedRoot).filePath(QStringLiteral("src/newfile.cpp")),
+                              QStringLiteral("#include \"util.h\"\nint created(){return 2;}\n"),
+                              &writeError)) {
+            store.shutdown();
+            return finishFail(663, QStringLiteral("snapshot_b_mutation_failed:%1").arg(writeError));
+        }
+
+        std::this_thread::sleep_for(std::chrono::milliseconds(1100));
+        qint64 snapshotBId = 0;
+        if (!createSnapshot(QStringLiteral("snapshot_B"), QStringLiteral("main_changed_newfile_added"), &snapshotBId)) {
+            store.shutdown();
+            return finishFail(664, QStringLiteral("snapshot_b_failed:%1").arg(errorText));
+        }
+
+        const QString readmePath = QDir(normalizedRoot).filePath(QStringLiteral("docs/readme.md"));
+        if (!QFile::remove(readmePath)) {
+            store.shutdown();
+            return finishFail(665, QStringLiteral("snapshot_c_mutation_failed:remove_readme"));
+        }
+
+        std::this_thread::sleep_for(std::chrono::milliseconds(1100));
+        qint64 snapshotCId = 0;
+        if (!createSnapshot(QStringLiteral("snapshot_C"), QStringLiteral("readme_removed"), &snapshotCId)) {
+            store.shutdown();
+            return finishFail(666, QStringLiteral("snapshot_c_failed:%1").arg(errorText));
+        }
+
+        store.shutdown();
+
+        MainWindow uiProbe(true,
+                           QString(),
+                           options.historyLogPath + QStringLiteral(".actions.log"),
+                           QString(),
+                           normalizedDbPath,
+                           nullptr);
+
+        int historyRows = 0;
+        int snapshotRows = 0;
+        int diffRows = 0;
+        QStringList historyPreview;
+        QStringList snapshotPreview;
+        QStringList diffPreview;
+        QString navigatedPath;
+        QString panelError;
+        const bool panelOk = uiProbe.triggerHistorySnapshotPanelForTesting(normalizedRoot,
+                                                                            normalizedTarget,
+                                                                            snapshotAId,
+                                                                            snapshotBId,
+                                                                            &historyRows,
+                                                                            &snapshotRows,
+                                                                            &diffRows,
+                                                                            &historyPreview,
+                                                                            &snapshotPreview,
+                                                                            &diffPreview,
+                                                                            &navigatedPath,
+                                                                            &panelError);
+
+        writeLines(snapshotPanelLogPath,
+                   {
+                       QStringLiteral("tab=snapshots"),
+                       QStringLiteral("snapshot_a_id=%1").arg(snapshotAId),
+                       QStringLiteral("snapshot_b_id=%1").arg(snapshotBId),
+                       QStringLiteral("snapshot_c_id=%1").arg(snapshotCId),
+                       QStringLiteral("snapshot_rows=%1").arg(snapshotRows),
+                   });
+        writeLines(diffPanelLogPath,
+                   {
+                       QStringLiteral("tab=diff"),
+                       QStringLiteral("selected_old_snapshot_id=%1").arg(snapshotAId),
+                       QStringLiteral("selected_new_snapshot_id=%1").arg(snapshotBId),
+                       QStringLiteral("diff_rows=%1").arg(diffRows),
+                       QStringLiteral("panel_error=%1").arg(panelError),
+                   });
+        writeLines(navigationPanelLogPath,
+                   {
+                       QStringLiteral("tab=navigation"),
+                       QStringLiteral("navigation_path=%1").arg(QDir::toNativeSeparators(navigatedPath)),
+                       QStringLiteral("navigation_ok=%1").arg(!navigatedPath.isEmpty() ? QStringLiteral("true") : QStringLiteral("false")),
+                   });
+        writeLines(historyRowsPath, historyPreview);
+        writeLines(snapshotRowsPath, snapshotPreview);
+        writeLines(diffRowsPath, diffPreview);
+
+        log.writeLine(QStringLiteral("panel_open_ok=%1").arg(panelOk ? QStringLiteral("true") : QStringLiteral("false")));
+        log.writeLine(QStringLiteral("history_rows=%1").arg(historyRows));
+        log.writeLine(QStringLiteral("snapshot_rows=%1").arg(snapshotRows));
+        log.writeLine(QStringLiteral("diff_rows=%1").arg(diffRows));
+        log.writeLine(QStringLiteral("navigation_path=%1").arg(QDir::toNativeSeparators(navigatedPath)));
+        log.writeLine(QStringLiteral("snapshot_id_A=%1").arg(snapshotAId));
+        log.writeLine(QStringLiteral("snapshot_id_B=%1").arg(snapshotBId));
+        log.writeLine(QStringLiteral("snapshot_id_C=%1").arg(snapshotCId));
+        log.writeLine(QStringLiteral("panel_error=%1").arg(panelError));
+
+        const bool pass = panelOk
+            && historyRows > 0
+            && snapshotRows > 0
+            && diffRows > 0
+            && !navigatedPath.isEmpty();
+
+        if (!pass) {
+            return finishFail(667, QStringLiteral("history_snapshot_panel_smoke_checks_failed"));
+        }
+
+        log.writeLine(QStringLiteral("final_status=PASS"));
+        log.writeLine(QStringLiteral("exit_code=0"));
+        log.writeLine(QStringLiteral("failure_reason="));
+        log.writeLine(QStringLiteral("timestamp_utc_end=%1").arg(QDateTime::currentDateTimeUtc().toString(Qt::ISODate)));
+        return 0;
+    } catch (const std::exception& ex) {
+        writeStderrLine(QStringLiteral("history_snapshot_panel_smoke_error=unexpected_exception"));
+        return finishFail(668, QStringLiteral("unexpected_exception:%1").arg(QString::fromLocal8Bit(ex.what())));
+    } catch (...) {
+        writeStderrLine(QStringLiteral("history_snapshot_panel_smoke_error=unexpected_error"));
+        return finishFail(669, QStringLiteral("unexpected_error"));
+    }
+}
+
 int runSnapshotDiffProbeCli(int argc, char* argv[])
 {
     QCoreApplication cliApp(argc, argv);
@@ -6545,6 +6967,10 @@ bool writeLogFile(const QString& logPath, const QStringList& lines)
 
 int main(int argc, char* argv[])
 {
+    if (hasHistorySnapshotPanelSmokeFlag(argc, argv)) {
+        return runHistorySnapshotPanelSmokeCli(argc, argv);
+    }
+
     if (hasSnapshotDiffProbeFlag(argc, argv)) {
         return runSnapshotDiffProbeCli(argc, argv);
     }
