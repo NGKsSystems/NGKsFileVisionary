@@ -44,8 +44,24 @@ public:
                         const QString& startupRoot = QString(),
                         const QString& actionLogPath = QString(),
                         const QString& testScriptPath = QString(),
+                        const QString& uiDbPathOverride = QString(),
                         QWidget* parent = nullptr);
     ~MainWindow() override;
+
+    bool triggerShowHistoryForTesting(const QString& rootPath,
+                                      const QString& selectedFilePath,
+                                      int* rowCount = nullptr,
+                                      QString* errorText = nullptr);
+    bool triggerSnapshotsForTesting(const QString& rootPath,
+                                    int* rowCount = nullptr,
+                                    qint64* createdSnapshotId = nullptr,
+                                    QString* errorText = nullptr);
+    bool triggerCompareSnapshotsForTesting(const QString& rootPath,
+                                           int* rowCount = nullptr,
+                                           int* addedCount = nullptr,
+                                           int* removedCount = nullptr,
+                                           int* changedCount = nullptr,
+                                           QString* errorText = nullptr);
 
 private slots:
     void onBrowseRoot();
@@ -79,6 +95,9 @@ private slots:
     void onActionExtractHere();
     void onActionExtractTo();
     void onActionExploreArchive();
+    void onActionShowHistory();
+    void onActionSnapshots();
+    void onActionCompareSnapshots();
     void onActionCopyPath();
     void onActionRename();
     void onActionPinFavorite();
@@ -143,6 +162,27 @@ private:
     void ensureUiActionTracePath();
     void maybeOpenStartupRoot();
     void triggerNamedAction(const QString& actionName, const QStringList& paths, const QString& selectionType);
+    bool loadHistoryRowsForPath(const QString& selectedFilePath,
+                                QString* errorText = nullptr,
+                                int* rowCount = nullptr,
+                                QString* resolvedRoot = nullptr,
+                                QString* resolvedTarget = nullptr);
+    QString resolveSnapshotRootForAction(const QString& actionPath) const;
+    bool renderSnapshotListForRoot(const QString& rootPath,
+                                   bool createNewSnapshot,
+                                   int* rowCount = nullptr,
+                                   qint64* createdSnapshotId = nullptr,
+                                   qint64* newestSnapshotId = nullptr,
+                                   qint64* previousSnapshotId = nullptr,
+                                   QString* errorText = nullptr);
+    bool renderSnapshotDiffForRoot(const QString& rootPath,
+                                   qint64 oldSnapshotId,
+                                   qint64 newSnapshotId,
+                                   int* rowCount = nullptr,
+                                   int* addedCount = nullptr,
+                                   int* removedCount = nullptr,
+                                   int* changedCount = nullptr,
+                                   QString* errorText = nullptr);
 
 private:
     FileModel m_fileModel;
@@ -221,6 +261,9 @@ private:
     QAction* m_actionExtractHere = nullptr;
     QAction* m_actionExtractTo = nullptr;
     QAction* m_actionExploreArchive = nullptr;
+    QAction* m_actionShowHistory = nullptr;
+    QAction* m_actionSnapshots = nullptr;
+    QAction* m_actionCompareSnapshots = nullptr;
     QAction* m_actionCopyPath = nullptr;
     QAction* m_actionRename = nullptr;
     QAction* m_actionPinFavorite = nullptr;

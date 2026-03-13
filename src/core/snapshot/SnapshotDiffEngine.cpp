@@ -171,50 +171,41 @@ SnapshotDiffResult SnapshotDiffEngine::compareSnapshots(qint64 oldSnapshotId,
         return result;
     }
 
-    QHash<QString, SnapshotEntryRecord> oldByPath;
-    QHash<QString, SnapshotEntryRecord> newByPath;
+    QVector<SnapshotEntryRecord> oldFiltered;
+    QVector<SnapshotEntryRecord> newFiltered;
+    oldFiltered.reserve(oldRows.size());
+    newFiltered.reserve(newRows.size());
+
     for (const SnapshotEntryRecord& row : oldRows) {
-        if (!rowPassesFilters(row, options)) {
-            continue;
+        if (rowPassesFilters(row, options)) {
+            oldFiltered.push_back(row);
         }
-        oldByPath.insert(row.entryPath, row);
     }
     for (const SnapshotEntryRecord& row : newRows) {
-        if (!rowPassesFilters(row, options)) {
-            continue;
+        if (rowPassesFilters(row, options)) {
+            newFiltered.push_back(row);
         }
-        newByPath.insert(row.entryPath, row);
     }
 
-    QSet<QString> allPaths;
-    for (auto it = oldByPath.constBegin(); it != oldByPath.constEnd(); ++it) {
-        allPaths.insert(it.key());
-    }
-    for (auto it = newByPath.constBegin(); it != newByPath.constEnd(); ++it) {
-        allPaths.insert(it.key());
-    }
+    QSet<int> matchedNewIndices;
+    result.rows.reserve(oldFiltered.size() + newFiltered.size());
 
-    QList<QString> sortedPaths = allPaths.values();
-    std::sort(sortedPaths.begin(), sortedPaths.end(), [](const QString& a, const QString& b) {
-        return QString::compare(a, b, Qt::CaseInsensitive) < 0;
-    });
-
-    result.rows.reserve(sortedPaths.size());
-    for (const QString& path : sortedPaths) {
-        const bool hasOld = oldByPath.contains(path);
-        const bool hasNew = newByPath.contains(path);
-
-        if (!hasOld && hasNew) {
-            result.rows.push_back(makeAddedRow(newByPath.value(path)));
-            continue;
+    for (const SnapshotEntryRecord& oldRow : oldFiltered) {
+        int matchedIndex = -1;
+        for (int i = 0; i < newFiltered.size(); ++i) {
+            if (newFiltered.at(i).entryPath == oldRow.entryPath) {
+                matchedIndex = i;
+                break;
+            }
         }
-        if (hasOld && !hasNew) {
-            result.rows.push_back(makeRemovedRow(oldByPath.value(path)));
+
+        if (matchedIndex < 0) {
+            result.rows.push_back(makeRemovedRow(oldRow));
             continue;
         }
 
-        const SnapshotEntryRecord oldRow = oldByPath.value(path);
-        const SnapshotEntryRecord newRow = newByPath.value(path);
+        matchedNewIndices.insert(matchedIndex);
+        const SnapshotEntryRecord& newRow = newFiltered.at(matchedIndex);
         const bool same = rowsEquivalent(oldRow, newRow, options);
         if (!same) {
             result.rows.push_back(makeCompareRow(oldRow, newRow, SnapshotDiffStatus::Changed));
@@ -222,6 +213,17 @@ SnapshotDiffResult SnapshotDiffEngine::compareSnapshots(qint64 oldSnapshotId,
             result.rows.push_back(makeCompareRow(oldRow, newRow, SnapshotDiffStatus::Unchanged));
         }
     }
+
+    for (int i = 0; i < newFiltered.size(); ++i) {
+        if (matchedNewIndices.contains(i)) {
+            continue;
+        }
+        result.rows.push_back(makeAddedRow(newFiltered.at(i)));
+    }
+
+    std::sort(result.rows.begin(), result.rows.end(), [](const SnapshotDiffRow& a, const SnapshotDiffRow& b) {
+        return QString::compare(a.path, b.path, Qt::CaseInsensitive) < 0;
+    });
 
     result.ok = true;
     result.summary = summarizeDiff(result);
