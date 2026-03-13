@@ -10,6 +10,17 @@
 class QueryController
 {
 public:
+    struct PrepareResult
+    {
+        bool ok = false;
+        QString parseError;
+        QString queryString;
+        QString executionRoot;
+        QueryParseResult parseResult;
+        QueryPlan plan;
+        QueryOptions options;
+    };
+
     struct ExecutionResult
     {
         bool ok = false;
@@ -23,6 +34,13 @@ public:
     };
 
     explicit QueryController(DirectoryModel* directoryModel);
+
+    PrepareResult prepare(const QString& queryString,
+                          const QString& runtimeRoot,
+                          bool includeHiddenDefault,
+                          bool includeSystemDefault,
+                          QuerySortField fallbackSortField,
+                          bool fallbackAscending) const;
 
     ExecutionResult execute(const QString& queryString,
                             const QString& runtimeRoot,

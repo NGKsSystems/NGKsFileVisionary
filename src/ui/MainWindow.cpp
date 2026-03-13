@@ -962,9 +962,18 @@ void MainWindow::onTreeContextMenu(const QPoint& pos)
     QAction* openWithCodeAction = menu.addAction(QStringLiteral("Open with Code"));
     QAction* hashFileAction = nullptr;
     QAction* previewAction = nullptr;
+    QAction* showReferencesAction = nullptr;
+    QAction* showUsedByAction = nullptr;
     if (!isFolder) {
         hashFileAction = menu.addAction(QStringLiteral("Hash File..."));
         previewAction = menu.addAction(QStringLiteral("Preview"));
+
+        const bool supportsGraphQuery = !isArchive && !PathUtils::isArchiveVirtualPath(firstPath);
+        if (supportsGraphQuery) {
+            menu.addSeparator();
+            showReferencesAction = menu.addAction(QStringLiteral("Show References"));
+            showUsedByAction = menu.addAction(QStringLiteral("Show Used By"));
+        }
     }
     QAction* propertiesAction = menu.addAction(QStringLiteral("Properties"));
 
@@ -1002,6 +1011,10 @@ void MainWindow::onTreeContextMenu(const QPoint& pos)
         QProcess::startDetached(QStringLiteral("explorer.exe"), {QStringLiteral("/select,"), QDir::toNativeSeparators(firstPath)});
     } else if (chosen == openContainingAction) {
         openContainingFolder(firstPath);
+    } else if (showReferencesAction && chosen == showReferencesAction) {
+        executeGraphQueryFromSelection(QueryGraphMode::References, firstPath);
+    } else if (showUsedByAction && chosen == showUsedByAction) {
+        executeGraphQueryFromSelection(QueryGraphMode::UsedBy, firstPath);
     } else if (chosen == copyPathAction) {
         onActionCopyPath();
     } else if (chosen == copyNameAction) {
@@ -2051,6 +2064,45 @@ void MainWindow::onArchiveFinished(int exitCode, QProcess::ExitStatus exitStatus
 QString MainWindow::currentRootPath() const
 {
     return m_rootEdit ? m_rootEdit->text().trimmed() : QString();
+}
+
+QString MainWindow::graphQueryTargetForPath(const QString& absolutePath) const
+{
+    const QString normalizedPath = QDir::cleanPath(absolutePath);
+    const QString root = QDir::cleanPath(currentRootPath());
+    if (root.isEmpty()) {
+        return normalizedPath;
+    }
+
+    QDir rootDir(root);
+    QString relative = QDir::cleanPath(rootDir.relativeFilePath(normalizedPath));
+    const bool outsideRoot = relative.startsWith(QStringLiteral(".."));
+    if (outsideRoot) {
+        relative = normalizedPath;
+    }
+
+    return QDir::fromNativeSeparators(relative);
+}
+
+void MainWindow::executeGraphQueryFromSelection(QueryGraphMode graphMode, const QString& absolutePath)
+{
+    if (!m_queryBarWidget) {
+        return;
+    }
+
+    const QString target = graphQueryTargetForPath(absolutePath);
+    const QString prefix = (graphMode == QueryGraphMode::References)
+                               ? QStringLiteral("references:")
+                               : QStringLiteral("usedby:");
+    const QString query = prefix + target;
+
+    appendRuntimeLog(QStringLiteral("ui_graph_query_action mode=%1 target=%2 query=%3")
+                         .arg(prefix.chopped(1))
+                         .arg(target)
+                         .arg(query));
+
+    m_queryBarWidget->setQueryText(query);
+    onQuerySubmitted(query);
 }
 
 void MainWindow::createNewFolderInCurrentRoot()

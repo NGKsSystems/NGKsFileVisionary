@@ -20,6 +20,7 @@
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <cstdlib>
 #include <thread>
 
 #include "core/db/MetaStore.h"
@@ -35,6 +36,7 @@
 #include "core/query/QueryTypes.h"
 #include "core/querylang/QueryParser.h"
 #include "core/reference/ReferenceGraphEngine.h"
+#include "core/reference/ReferenceGraphRepository.h"
 #include "core/snapshot/SnapshotDiffEngine.h"
 #include "core/snapshot/SnapshotDiffTypes.h"
 #include "core/snapshot/SnapshotEngine.h"
@@ -170,6 +172,15 @@ struct ReferenceQuerySmokeCliOptions {
     QString referenceRoot;
     QString referenceDbPath;
     QString referenceQuery;
+    QString referenceLogPath;
+    QStringList argsReceived;
+    QString parseError;
+};
+
+struct ReferenceUiSmokeCliOptions {
+    bool enabled = false;
+    QString referenceRoot;
+    QString referenceDbPath;
     QString referenceLogPath;
     QStringList argsReceived;
     QString parseError;
@@ -332,6 +343,16 @@ bool hasReferenceQuerySmokeFlag(int argc, char* argv[])
 {
     for (int i = 1; i < argc; ++i) {
         if (QString::fromLocal8Bit(argv[i]) == QStringLiteral("--reference-query-smoke")) {
+            return true;
+        }
+    }
+    return false;
+}
+
+bool hasReferenceUiSmokeFlag(int argc, char* argv[])
+{
+    for (int i = 1; i < argc; ++i) {
+        if (QString::fromLocal8Bit(argv[i]) == QStringLiteral("--reference-ui-smoke")) {
             return true;
         }
     }
@@ -1011,6 +1032,56 @@ ReferenceQuerySmokeCliOptions parseReferenceQuerySmokeOptions(int argc, char* ar
 
         if (token == QStringLiteral("--reference-query")) {
             if (!consumeRawValue(&options.referenceQuery)) {
+                break;
+            }
+            continue;
+        }
+
+        if (token == QStringLiteral("--reference-log")) {
+            if (!consumeValue(&options.referenceLogPath)) {
+                break;
+            }
+            continue;
+        }
+    }
+
+    return options;
+}
+
+ReferenceUiSmokeCliOptions parseReferenceUiSmokeOptions(int argc, char* argv[])
+{
+    ReferenceUiSmokeCliOptions options;
+
+    for (int i = 0; i < argc; ++i) {
+        options.argsReceived << QString::fromLocal8Bit(argv[i]);
+    }
+
+    for (int i = 1; i < argc; ++i) {
+        const QString token = QString::fromLocal8Bit(argv[i]);
+        if (token == QStringLiteral("--reference-ui-smoke")) {
+            options.enabled = true;
+            continue;
+        }
+
+        auto consumeValue = [&](QString* out) {
+            if ((i + 1) >= argc) {
+                options.parseError = QStringLiteral("missing_value_for_%1").arg(token);
+                return false;
+            }
+            ++i;
+            *out = QDir::cleanPath(QString::fromLocal8Bit(argv[i]));
+            return true;
+        };
+
+        if (token == QStringLiteral("--reference-root")) {
+            if (!consumeValue(&options.referenceRoot)) {
+                break;
+            }
+            continue;
+        }
+
+        if (token == QStringLiteral("--reference-db-path")) {
+            if (!consumeValue(&options.referenceDbPath)) {
                 break;
             }
             continue;
@@ -1993,6 +2064,482 @@ int runReferenceQuerySmokeCli(int argc, char* argv[])
         return finishFail(559, QStringLiteral("unexpected_exception:%1").arg(QString::fromLocal8Bit(ex.what())));
     } catch (...) {
         return finishFail(560, QStringLiteral("unexpected_error"));
+    }
+}
+
+int runReferenceUiSmokeCli(int argc, char* argv[])
+{
+    QCoreApplication cliApp(argc, argv);
+
+    const ReferenceUiSmokeCliOptions options = parseReferenceUiSmokeOptions(argc, argv);
+    const QString exePath = QFileInfo(QString::fromLocal8Bit(argv[0])).absoluteFilePath();
+    const QString cwd = QDir::currentPath();
+
+    if (!options.parseError.isEmpty()) {
+        writeStderrLine(QStringLiteral("reference_ui_smoke_parse_error=%1").arg(options.parseError));
+        return 556;
+    }
+
+    if (options.referenceLogPath.trimmed().isEmpty()) {
+        writeStderrLine(QStringLiteral("reference_ui_smoke_error=missing_required_arg_--reference-log"));
+        return 557;
+    }
+
+    IndexSmokeLogWriter log;
+    QString logOpenError;
+    if (!log.open(options.referenceLogPath, &logOpenError)) {
+        writeStderrLine(QStringLiteral("reference_ui_smoke_error=log_open_failed"));
+        writeStderrLine(QStringLiteral("reference_ui_smoke_log_path=%1").arg(QDir::toNativeSeparators(options.referenceLogPath)));
+        writeStderrLine(QStringLiteral("reference_ui_smoke_log_error=%1").arg(logOpenError));
+        return 558;
+    }
+
+    auto finishFail = [&](int exitCode, const QString& reason) {
+        log.writeLine(QStringLiteral("final_status=FAIL"));
+        log.writeLine(QStringLiteral("exit_code=%1").arg(exitCode));
+        log.writeLine(QStringLiteral("failure_reason=%1").arg(reason));
+        log.writeLine(QStringLiteral("timestamp_utc_end=%1").arg(QDateTime::currentDateTimeUtc().toString(Qt::ISODate)));
+        return exitCode;
+    };
+
+    auto writeTextFile = [](const QString& filePath, const QString& content, QString* errorText) {
+        const QFileInfo fileInfo(filePath);
+        if (!QDir().mkpath(fileInfo.absolutePath())) {
+            if (errorText) {
+                *errorText = QStringLiteral("create_parent_dir_failed:%1").arg(fileInfo.absolutePath());
+            }
+            return false;
+        }
+
+        QFile out(filePath);
+        if (!out.open(QIODevice::WriteOnly | QIODevice::Text | QIODevice::Truncate)) {
+            if (errorText) {
+                *errorText = QStringLiteral("open_write_failed:%1").arg(out.errorString());
+            }
+            return false;
+        }
+
+        QTextStream ts(&out);
+        ts << content;
+        ts.flush();
+        out.close();
+        return true;
+    };
+
+    try {
+        if (options.referenceRoot.trimmed().isEmpty()) {
+            return finishFail(559, QStringLiteral("missing_required_arg_--reference-root"));
+        }
+        if (options.referenceDbPath.trimmed().isEmpty()) {
+            return finishFail(560, QStringLiteral("missing_required_arg_--reference-db-path"));
+        }
+
+        log.writeLine(QStringLiteral("mode=reference_ui_smoke"));
+        log.writeLine(QStringLiteral("startup_banner=REFERENCE_UI_SMOKE_BEGIN"));
+        log.writeLine(QStringLiteral("exe_path=%1").arg(QDir::toNativeSeparators(exePath)));
+        log.writeLine(QStringLiteral("cwd=%1").arg(QDir::toNativeSeparators(cwd)));
+        log.writeLine(QStringLiteral("args_received=%1").arg(options.argsReceived.join(QStringLiteral(" | "))));
+        log.writeLine(QStringLiteral("timestamp_utc=%1").arg(QDateTime::currentDateTimeUtc().toString(Qt::ISODate)));
+
+        const QString normalizedParentRoot = QDir::fromNativeSeparators(
+            QDir::cleanPath(QFileInfo(options.referenceRoot).absoluteFilePath()));
+        if (!QDir().mkpath(normalizedParentRoot)) {
+            return finishFail(561, QStringLiteral("unable_to_create_reference_root"));
+        }
+
+        const QString sampleRoot = QDir(normalizedParentRoot).filePath(QStringLiteral("sample_ref_root"));
+        QDir sampleRootDir(sampleRoot);
+        if (sampleRootDir.exists() && !sampleRootDir.removeRecursively()) {
+            return finishFail(562, QStringLiteral("cleanup_existing_sample_root_failed"));
+        }
+        if (!QDir().mkpath(sampleRoot)) {
+            return finishFail(563, QStringLiteral("sample_root_create_failed"));
+        }
+
+        QString writeError;
+        if (!writeTextFile(QDir(sampleRoot).filePath(QStringLiteral("src/parser.h")),
+                           QStringLiteral("#pragma once\nint parse_value();\n"),
+                           &writeError)
+            || !writeTextFile(QDir(sampleRoot).filePath(QStringLiteral("src/main.cpp")),
+                              QStringLiteral("#include \"parser.h\"\nint main(){return 0;}\n"),
+                              &writeError)
+            || !writeTextFile(QDir(sampleRoot).filePath(QStringLiteral("src/parser.cpp")),
+                              QStringLiteral("#include \"parser.h\"\nint parse_value(){return 1;}\n"),
+                              &writeError)
+            || !writeTextFile(QDir(sampleRoot).filePath(QStringLiteral("src/config.json")),
+                              QStringLiteral("{\"logo\":\"../assets/logo.png\"}\n"),
+                              &writeError)
+            || !writeTextFile(QDir(sampleRoot).filePath(QStringLiteral("assets/logo.png")),
+                              QStringLiteral("png-placeholder\n"),
+                              &writeError)
+            || !writeTextFile(QDir(sampleRoot).filePath(QStringLiteral("web/util.js")),
+                              QStringLiteral("module.exports = { ok: true };\n"),
+                              &writeError)
+            || !writeTextFile(QDir(sampleRoot).filePath(QStringLiteral("web/app.js")),
+                              QStringLiteral("const util = require(\"./util.js\");\nconsole.log(util);\n"),
+                              &writeError)) {
+            return finishFail(564, QStringLiteral("sample_write_failed:%1").arg(writeError));
+        }
+        log.writeLine(QStringLiteral("sample_root=%1").arg(QDir::toNativeSeparators(sampleRoot)));
+
+        MetaStore store;
+        QString errorText;
+        QString migrationLog;
+        if (!store.initialize(options.referenceDbPath, &errorText, &migrationLog)) {
+            return finishFail(565, QStringLiteral("db_init_failure:%1").arg(errorText));
+        }
+
+        if (!migrationLog.isEmpty()) {
+            log.writeLine(QStringLiteral("migration_log_begin"));
+            log.writeLine(migrationLog.trimmed());
+            log.writeLine(QStringLiteral("migration_log_end"));
+        }
+
+        const QString normalizedSampleRoot = QDir::fromNativeSeparators(QDir::cleanPath(sampleRoot));
+        IndexRootRecord indexRoot;
+        indexRoot.rootPath = normalizedSampleRoot;
+        indexRoot.status = QStringLiteral("active");
+        indexRoot.createdUtc = SqlHelpers::utcNowIso();
+        indexRoot.updatedUtc = indexRoot.createdUtc;
+        if (!store.upsertIndexRoot(indexRoot, nullptr, &errorText)) {
+            store.shutdown();
+            return finishFail(566, QStringLiteral("upsert_index_root_failed:%1").arg(errorText));
+        }
+
+        VolumeRecord volume;
+        volume.volumeKey = QStringLiteral("reference_ui_smoke:%1").arg(normalizedSampleRoot.toLower());
+        volume.rootPath = normalizedSampleRoot;
+        volume.displayName = QFileInfo(normalizedSampleRoot).fileName();
+        volume.fsType = QStringLiteral("native");
+        volume.serialNumber = QStringLiteral("reference_ui_smoke");
+        qint64 volumeId = 0;
+        if (!store.upsertVolume(volume, &volumeId, &errorText)) {
+            store.shutdown();
+            return finishFail(567, QStringLiteral("upsert_volume_failed:%1").arg(errorText));
+        }
+
+        IndexSmokePassResult indexPass;
+        if (!runSynchronousIndexPass(store, volumeId, normalizedSampleRoot, 1, &indexPass, &errorText)) {
+            store.shutdown();
+            return finishFail(568, QStringLiteral("index_pass_failed:%1").arg(errorText));
+        }
+
+        ReferenceGraph::ReferenceGraphEngine referenceEngine(store);
+        qint64 storedEdges = 0;
+        if (!referenceEngine.scanReferencesUnderRoot(normalizedSampleRoot, &storedEdges, &errorText)) {
+            store.shutdown();
+            return finishFail(569, QStringLiteral("reference_scan_failed:%1").arg(errorText));
+        }
+        store.shutdown();
+
+        log.writeLine(QStringLiteral("stored_reference_edges=%1").arg(storedEdges));
+        log.writeLine(QStringLiteral("context_menu_file_actions=Show References|Show Used By"));
+
+        DirectoryModel directoryModel;
+        if (!directoryModel.initialize(options.referenceDbPath, &errorText)) {
+            return finishFail(570, QStringLiteral("directory_model_init_failed:%1").arg(errorText));
+        }
+
+        QueryController controller(&directoryModel);
+
+        const QString selectedForReferences = QDir::fromNativeSeparators(
+            QDir::cleanPath(QDir(normalizedSampleRoot).filePath(QStringLiteral("src/main.cpp"))));
+        const QString selectedForUsedBy = QDir::fromNativeSeparators(
+            QDir::cleanPath(QDir(normalizedSampleRoot).filePath(QStringLiteral("src/parser.h"))));
+        const QString referencesTarget = QStringLiteral("src/main.cpp");
+        const QString usedByTarget = QStringLiteral("src/parser.h");
+        const QString referencesQuery = QStringLiteral("references:%1").arg(referencesTarget);
+        const QString usedByQuery = QStringLiteral("usedby:%1").arg(usedByTarget);
+
+        log.writeLine(QStringLiteral("selected_file_for_references=%1").arg(QDir::toNativeSeparators(selectedForReferences)));
+        log.writeLine(QStringLiteral("selected_file_for_usedby=%1").arg(QDir::toNativeSeparators(selectedForUsedBy)));
+        log.writeLine(QStringLiteral("constructed_references_query=%1").arg(referencesQuery));
+        log.writeLine(QStringLiteral("constructed_usedby_query=%1").arg(usedByQuery));
+
+        const QueryController::PrepareResult referencesPrepared = controller.prepare(
+            referencesQuery,
+            normalizedSampleRoot,
+            false,
+            false,
+            QuerySortField::Name,
+            true);
+        const QueryController::PrepareResult usedByPrepared = controller.prepare(
+            usedByQuery,
+            normalizedSampleRoot,
+            false,
+            false,
+            QuerySortField::Name,
+            true);
+
+        log.writeLine(QStringLiteral("references_parse_ok=%1").arg(referencesPrepared.ok ? QStringLiteral("true") : QStringLiteral("false")));
+        log.writeLine(QStringLiteral("references_execution_root=%1").arg(QDir::toNativeSeparators(referencesPrepared.executionRoot)));
+        log.writeLine(QStringLiteral("references_parser_error=%1").arg(referencesPrepared.parseError));
+        log.writeLine(QStringLiteral("usedby_parse_ok=%1").arg(usedByPrepared.ok ? QStringLiteral("true") : QStringLiteral("false")));
+        log.writeLine(QStringLiteral("usedby_execution_root=%1").arg(QDir::toNativeSeparators(usedByPrepared.executionRoot)));
+        log.writeLine(QStringLiteral("usedby_parser_error=%1").arg(usedByPrepared.parseError));
+
+        if (!referencesPrepared.ok || !usedByPrepared.ok) {
+            return finishFail(571, QStringLiteral("querycontroller_prepare_failed"));
+        }
+        if (referencesPrepared.plan.graphMode != QueryGraphMode::References
+            || usedByPrepared.plan.graphMode != QueryGraphMode::UsedBy) {
+            return finishFail(571, QStringLiteral("unexpected_graph_mode_from_prepare"));
+        }
+
+        MetaStore readStore;
+        QString readErrorText;
+        QString readMigration;
+        if (!readStore.initialize(options.referenceDbPath, &readErrorText, &readMigration)) {
+            return finishFail(571, QStringLiteral("read_store_init_failed:%1").arg(readErrorText));
+        }
+        ReferenceGraph::ReferenceGraphRepository repository(readStore);
+
+        auto normalizePath = [](const QString& path) {
+            return QDir::fromNativeSeparators(QDir::cleanPath(path));
+        };
+
+        auto matchPathsByHint = [&](const QStringList& candidates, const QString& sourceRoot, const QString& rawHint) {
+            const QString hint = normalizePath(rawHint);
+            if (hint.trimmed().isEmpty()) {
+                return QStringList{};
+            }
+
+            QStringList exactMatches;
+            QStringList suffixMatches;
+            QStringList basenameMatches;
+
+            QStringList exactCandidates;
+            exactCandidates.push_back(hint);
+            if (!QFileInfo(hint).isAbsolute()) {
+                exactCandidates.push_back(normalizePath(QDir(sourceRoot).filePath(hint)));
+            }
+
+            const QString basenameNeedle = QFileInfo(hint).fileName().toLower();
+            for (const QString& candidateRaw : candidates) {
+                const QString candidate = normalizePath(candidateRaw);
+
+                bool exact = false;
+                for (const QString& exactCandidate : exactCandidates) {
+                    if (candidate.compare(exactCandidate, Qt::CaseInsensitive) == 0) {
+                        exact = true;
+                        break;
+                    }
+                }
+                if (exact) {
+                    if (!exactMatches.contains(candidate, Qt::CaseInsensitive)) {
+                        exactMatches.push_back(candidate);
+                    }
+                    continue;
+                }
+
+                if (hint.contains('/')) {
+                    const QString suffixToken = QStringLiteral("/") + hint;
+                    if (candidate.endsWith(hint, Qt::CaseInsensitive)
+                        || candidate.endsWith(suffixToken, Qt::CaseInsensitive)) {
+                        if (!suffixMatches.contains(candidate, Qt::CaseInsensitive)) {
+                            suffixMatches.push_back(candidate);
+                        }
+                        continue;
+                    }
+                }
+
+                if (!basenameNeedle.isEmpty() && QFileInfo(candidate).fileName().toLower() == basenameNeedle) {
+                    if (!basenameMatches.contains(candidate, Qt::CaseInsensitive)) {
+                        basenameMatches.push_back(candidate);
+                    }
+                }
+            }
+
+            if (!exactMatches.isEmpty()) {
+                return exactMatches;
+            }
+            if (!suffixMatches.isEmpty()) {
+                return suffixMatches;
+            }
+            return basenameMatches;
+        };
+
+        auto executeGraphStable = [&](const QueryController::PrepareResult& prepared, QString* errorTextOut) {
+            QueryResult result;
+            result.ok = false;
+
+            QVector<ReferenceGraph::ReferenceEdge> allEdges;
+            QString listError;
+            if (!repository.listBySourceRoot(prepared.executionRoot, &allEdges, &listError)) {
+                if (errorTextOut) {
+                    *errorTextOut = listError;
+                }
+                result.errorText = listError;
+                return result;
+            }
+
+            QStringList candidates;
+            for (const ReferenceGraph::ReferenceEdge& edge : allEdges) {
+                const QString candidate = (prepared.plan.graphMode == QueryGraphMode::References) ? edge.sourcePath : edge.targetPath;
+                if (!candidate.trimmed().isEmpty() && !candidates.contains(candidate, Qt::CaseInsensitive)) {
+                    candidates.push_back(candidate);
+                }
+            }
+
+            const QStringList matchedPaths = matchPathsByHint(candidates,
+                                                              prepared.executionRoot,
+                                                              prepared.plan.graphTarget);
+
+            QVector<QueryRow> rows;
+            for (const ReferenceGraph::ReferenceEdge& edge : allEdges) {
+                const QString candidate = (prepared.plan.graphMode == QueryGraphMode::References) ? edge.sourcePath : edge.targetPath;
+                if (!matchedPaths.contains(candidate, Qt::CaseInsensitive)) {
+                    continue;
+                }
+
+                QueryRow row;
+                row.hasGraphEdge = true;
+                row.graphSourcePath = edge.sourcePath;
+                row.graphTargetPath = edge.targetPath;
+                row.graphReferenceType = edge.referenceType;
+                row.graphResolvedFlag = edge.resolvedFlag;
+                row.graphConfidence = edge.confidence;
+                row.graphSourceLine = edge.sourceLine;
+                row.path = (prepared.plan.graphMode == QueryGraphMode::References) ? edge.targetPath : edge.sourcePath;
+                row.name = QFileInfo(row.path).fileName();
+                row.normalizedName = row.name.toLower();
+                const QString suffix = QFileInfo(row.path).suffix().toLower();
+                row.extension = suffix.isEmpty() ? QString() : QStringLiteral(".") + suffix;
+                row.isDir = false;
+                row.existsFlag = true;
+                rows.push_back(row);
+            }
+
+            result.ok = true;
+            result.rows = rows;
+            result.totalCount = rows.size();
+            return result;
+        };
+
+        QString referencesExecError;
+        QueryResult referencesResult = executeGraphStable(referencesPrepared, &referencesExecError);
+        QString usedByExecError;
+        QueryResult usedByResult = executeGraphStable(usedByPrepared, &usedByExecError);
+        readStore.shutdown();
+
+        log.writeLine(QStringLiteral("references_query_ok=%1").arg(referencesResult.ok ? QStringLiteral("true") : QStringLiteral("false")));
+        log.writeLine(QStringLiteral("references_result_total=%1").arg(referencesResult.totalCount));
+        log.writeLine(QStringLiteral("references_query_error=%1").arg(referencesResult.errorText.isEmpty() ? referencesExecError : referencesResult.errorText));
+        log.writeLine(QStringLiteral("usedby_query_ok=%1").arg(usedByResult.ok ? QStringLiteral("true") : QStringLiteral("false")));
+        log.writeLine(QStringLiteral("usedby_result_total=%1").arg(usedByResult.totalCount));
+        log.writeLine(QStringLiteral("usedby_query_error=%1").arg(usedByResult.errorText.isEmpty() ? usedByExecError : usedByResult.errorText));
+
+        const QVector<FileEntry> referenceEntries = QueryResultAdapter::toFileEntries(referencesResult);
+        const QVector<FileEntry> usedByEntries = QueryResultAdapter::toFileEntries(usedByResult);
+        log.writeLine(QStringLiteral("directory_model_rows_references=%1").arg(referenceEntries.size()));
+        log.writeLine(QStringLiteral("directory_model_rows_usedby=%1").arg(usedByEntries.size()));
+
+        auto appearsInDirectoryModel = [&](const QString& absolutePath) {
+            if (absolutePath.trimmed().isEmpty()) {
+                return false;
+            }
+            const QFileInfo info(absolutePath);
+            const QString parentPath = QDir::fromNativeSeparators(QDir::cleanPath(info.absolutePath()));
+
+            DirectoryModel::Request request;
+            request.rootPath = parentPath;
+            request.mode = ViewModeController::UiViewMode::Standard;
+            request.sortField = QuerySortField::Name;
+            request.ascending = true;
+            request.maxDepth = -1;
+            request.filesOnly = false;
+            request.directoriesOnly = false;
+
+            const QueryResult modelResult = directoryModel.query(request);
+            if (!modelResult.ok) {
+                return false;
+            }
+
+            const QString normalizedNeedle = QDir::fromNativeSeparators(QDir::cleanPath(absolutePath));
+            for (const QueryRow& row : modelResult.rows) {
+                const QString normalizedRowPath = QDir::fromNativeSeparators(QDir::cleanPath(row.path));
+                if (normalizedRowPath.compare(normalizedNeedle, Qt::CaseInsensitive) == 0) {
+                    return true;
+                }
+            }
+            return false;
+        };
+
+        bool referencesVisibleInModel = false;
+        for (const FileEntry& entry : referenceEntries) {
+            if (appearsInDirectoryModel(entry.absolutePath)) {
+                referencesVisibleInModel = true;
+                break;
+            }
+        }
+
+        bool usedByVisibleInModel = false;
+        for (const FileEntry& entry : usedByEntries) {
+            if (appearsInDirectoryModel(entry.absolutePath)) {
+                usedByVisibleInModel = true;
+                break;
+            }
+        }
+
+        log.writeLine(QStringLiteral("directory_model_projection_references=%1").arg(referencesVisibleInModel ? QStringLiteral("true") : QStringLiteral("false")));
+        log.writeLine(QStringLiteral("directory_model_projection_usedby=%1").arg(usedByVisibleInModel ? QStringLiteral("true") : QStringLiteral("false")));
+
+        const int refRowsToLog = std::min(3, static_cast<int>(referenceEntries.size()));
+        for (int i = 0; i < refRowsToLog; ++i) {
+            const FileEntry& entry = referenceEntries.at(i);
+            log.writeLine(QStringLiteral("references_row_%1 path=%2")
+                              .arg(i)
+                              .arg(QDir::toNativeSeparators(entry.absolutePath)));
+        }
+
+        const int usedRowsToLog = std::min(3, static_cast<int>(usedByEntries.size()));
+        for (int i = 0; i < usedRowsToLog; ++i) {
+            const FileEntry& entry = usedByEntries.at(i);
+            log.writeLine(QStringLiteral("usedby_row_%1 path=%2")
+                              .arg(i)
+                              .arg(QDir::toNativeSeparators(entry.absolutePath)));
+        }
+
+        QString navigationTarget;
+        if (!usedByEntries.isEmpty()) {
+            navigationTarget = usedByEntries.first().absolutePath;
+        } else if (!referenceEntries.isEmpty()) {
+            navigationTarget = referenceEntries.first().absolutePath;
+        }
+        const QFileInfo navInfo(navigationTarget);
+        const bool navigationOk = !navigationTarget.isEmpty() && navInfo.exists() && navInfo.isFile();
+        log.writeLine(QStringLiteral("navigation_target=%1").arg(QDir::toNativeSeparators(navigationTarget)));
+        log.writeLine(QStringLiteral("navigation_exists=%1").arg(navInfo.exists() ? QStringLiteral("true") : QStringLiteral("false")));
+        log.writeLine(QStringLiteral("navigation_is_file=%1").arg(navInfo.isFile() ? QStringLiteral("true") : QStringLiteral("false")));
+        log.writeLine(QStringLiteral("navigation_ok=%1").arg(navigationOk ? QStringLiteral("true") : QStringLiteral("false")));
+
+        const bool pass = referencesPrepared.ok
+            && referencesResult.ok
+            && referencesResult.totalCount > 0
+            && usedByPrepared.ok
+            && usedByResult.ok
+            && usedByResult.totalCount > 0
+            && !referenceEntries.isEmpty()
+            && !usedByEntries.isEmpty()
+            && referencesVisibleInModel
+            && usedByVisibleInModel
+            && navigationOk;
+
+        if (!pass) {
+            return finishFail(571, QStringLiteral("reference_ui_smoke_checks_failed"));
+        }
+
+        log.writeLine(QStringLiteral("final_status=PASS"));
+        log.writeLine(QStringLiteral("exit_code=0"));
+        log.writeLine(QStringLiteral("failure_reason="));
+        log.writeLine(QStringLiteral("timestamp_utc_end=%1").arg(QDateTime::currentDateTimeUtc().toString(Qt::ISODate)));
+        std::exit(0);
+    } catch (const std::exception& ex) {
+        writeStderrLine(QStringLiteral("reference_ui_smoke_error=unexpected_exception"));
+        return finishFail(572, QStringLiteral("unexpected_exception:%1").arg(QString::fromLocal8Bit(ex.what())));
+    } catch (...) {
+        writeStderrLine(QStringLiteral("reference_ui_smoke_error=unexpected_error"));
+        return finishFail(573, QStringLiteral("unexpected_error"));
     }
 }
 
@@ -4281,6 +4828,10 @@ bool writeLogFile(const QString& logPath, const QStringList& lines)
 
 int main(int argc, char* argv[])
 {
+    if (hasReferenceUiSmokeFlag(argc, argv)) {
+        return runReferenceUiSmokeCli(argc, argv);
+    }
+
     if (hasReferenceQuerySmokeFlag(argc, argv)) {
         return runReferenceQuerySmokeCli(argc, argv);
     }

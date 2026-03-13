@@ -125,6 +125,8 @@ private:
     void runArchiveCommand(const QString& title, const QStringList& args);
     void ensureArchiveProcessUi();
     QString currentRootPath() const;
+    QString graphQueryTargetForPath(const QString& absolutePath) const;
+    void executeGraphQueryFromSelection(QueryGraphMode graphMode, const QString& absolutePath);
     void createNewFolderInCurrentRoot();
     void createNewTextFileInCurrentRoot();
     void setupActionRegistry();

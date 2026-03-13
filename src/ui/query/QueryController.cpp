@@ -10,6 +10,45 @@ QueryController::QueryController(DirectoryModel* directoryModel)
 {
 }
 
+QueryController::PrepareResult QueryController::prepare(const QString& queryString,
+                                                        const QString& runtimeRoot,
+                                                        bool includeHiddenDefault,
+                                                        bool includeSystemDefault,
+                                                        QuerySortField fallbackSortField,
+                                                        bool fallbackAscending) const
+{
+    PrepareResult out;
+    out.queryString = queryString.trimmed();
+
+    QueryParser parser;
+    out.parseResult = parser.parse(out.queryString);
+    if (!out.parseResult.ok) {
+        out.parseError = out.parseResult.errorMessage;
+        return out;
+    }
+
+    out.plan = out.parseResult.plan;
+
+    if (!queryContainsKey(out.queryString, QStringLiteral("hidden"))) {
+        out.plan.includeHidden = includeHiddenDefault;
+    }
+    if (!queryContainsKey(out.queryString, QStringLiteral("system"))) {
+        out.plan.includeSystem = includeSystemDefault;
+    }
+
+    if (!queryContainsKey(out.queryString, QStringLiteral("sort"))) {
+        out.plan.sortField = fallbackSortField;
+    }
+    if (!queryContainsKey(out.queryString, QStringLiteral("order"))) {
+        out.plan.ascending = fallbackAscending;
+    }
+
+    out.executionRoot = out.plan.resolveRootPath(runtimeRoot);
+    out.options = out.plan.toQueryOptions(runtimeRoot);
+    out.ok = true;
+    return out;
+}
+
 QueryController::ExecutionResult QueryController::execute(const QString& queryString,
                                                           const QString& runtimeRoot,
                                                           ViewModeController::UiViewMode viewMode,
@@ -26,33 +65,23 @@ QueryController::ExecutionResult QueryController::execute(const QString& querySt
         return out;
     }
 
-    QueryParser parser;
-    out.parseResult = parser.parse(out.queryString);
-    out.parseOk = out.parseResult.ok;
+    const PrepareResult prepared = prepare(queryString,
+                                           runtimeRoot,
+                                           includeHiddenDefault,
+                                           includeSystemDefault,
+                                           fallbackSortField,
+                                           fallbackAscending);
+
+    out.parseResult = prepared.parseResult;
+    out.parseOk = prepared.ok;
+    out.parseError = prepared.parseError;
     if (!out.parseOk) {
-        out.parseError = out.parseResult.errorMessage;
         return out;
     }
 
-    QueryPlan plan = out.parseResult.plan;
-
-    if (!queryContainsKey(out.queryString, QStringLiteral("hidden"))) {
-        plan.includeHidden = includeHiddenDefault;
-    }
-    if (!queryContainsKey(out.queryString, QStringLiteral("system"))) {
-        plan.includeSystem = includeSystemDefault;
-    }
-
-    if (!queryContainsKey(out.queryString, QStringLiteral("sort"))) {
-        plan.sortField = fallbackSortField;
-    }
-    if (!queryContainsKey(out.queryString, QStringLiteral("order"))) {
-        plan.ascending = fallbackAscending;
-    }
-
-    out.executionRoot = plan.resolveRootPath(runtimeRoot);
-
-    const QueryOptions options = plan.toQueryOptions(runtimeRoot);
+    const QueryPlan plan = prepared.plan;
+    out.executionRoot = prepared.executionRoot;
+    const QueryOptions options = prepared.options;
 
     if (plan.graphMode != QueryGraphMode::None) {
         out.queryResult = m_directoryModel->queryGraph(out.executionRoot,

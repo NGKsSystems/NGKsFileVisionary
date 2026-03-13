@@ -16,7 +16,7 @@ QueryBarWidget::QueryBarWidget(QWidget* parent)
     auto* label = new QLabel(QStringLiteral("Query:"), this);
     m_queryInput = new QLineEdit(this);
     m_queryInput->setObjectName(QStringLiteral("queryInput"));
-    m_queryInput->setPlaceholderText(QStringLiteral("ext:.cpp under:src/ name:main sort:name order:asc"));
+    m_queryInput->setPlaceholderText(QStringLiteral("ext:.cpp under:src/ name:main references:src/main.cpp usedby:parser.h"));
 
     m_clearButton = new QPushButton(QStringLiteral("Clear"), this);
     m_clearButton->setObjectName(QStringLiteral("queryClearButton"));
