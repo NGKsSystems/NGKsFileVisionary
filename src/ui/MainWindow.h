@@ -24,6 +24,7 @@
 #include "model/ViewModeController.h"
 #include "model/StructuralFilterState.h"
 #include "model/StructuralResultRow.h"
+#include "model/StructuralSortEngine.h"
 #include "core/query/QueryTypes.h"
 #include "core/services/RefreshTypes.h"
 
@@ -277,6 +278,7 @@ private:
                                        int* rowCount = nullptr);
     void updateStructuralNavigationButtons();
     void updateStructuralFilterStateFromControls();
+    void updateStructuralSortStateFromControls();
     void updateStructuralFilterControlChoices(const QVector<StructuralResultRow>& canonicalRows);
     void applyStructuralFiltersToCurrentRows(const QString& statusPrefix = QString());
     void clearStructuralFilters(bool applyNow = true);
@@ -414,6 +416,8 @@ private:
     QComboBox* m_structuralRelationshipFilterCombo = nullptr;
     QLineEdit* m_structuralTextFilterEdit = nullptr;
     QPushButton* m_structuralClearFiltersButton = nullptr;
+    QComboBox* m_structuralSortFieldCombo = nullptr;
+    QPushButton* m_structuralSortDirectionButton = nullptr;
     QComboBox* m_structuralOldSnapshotCombo = nullptr;
     QComboBox* m_structuralNewSnapshotCombo = nullptr;
     QString m_structuralRootPath;
@@ -423,5 +427,7 @@ private:
     QVector<StructuralResultRow> m_structuralCanonicalRows;
     QVector<StructuralResultRow> m_structuralFilteredRows;
     StructuralFilterState m_structuralFilterState;
+    StructuralSortField m_structuralSortField = StructuralSortField::PrimaryPath;
+    StructuralSortDirection m_structuralSortDirection = StructuralSortDirection::Ascending;
     StructuralPanelState m_structuralPanelState;
 };

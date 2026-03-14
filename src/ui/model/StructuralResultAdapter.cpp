@@ -113,7 +113,7 @@ QStringList toDebugStrings(const QVector<StructuralResultRow>& rows)
 
     for (int i = 0; i < rows.size(); ++i) {
         const StructuralResultRow& row = rows.at(i);
-        out.push_back(QStringLiteral("row[%1] category=%2 primaryPath=%3 secondaryPath=%4 relationship=%5 status=%6 snapshotId=%7 timestamp=%8 sizeBytes=%9 sourceFile=%10 symbol=%11 note=%12")
+        out.push_back(QStringLiteral("row[%1] category=%2 primaryPath=%3 secondaryPath=%4 relationship=%5 status=%6 snapshotId=%7 timestamp=%8 sizeBytes=%9 sourceFile=%10 symbol=%11 note=%12 dependencyFrequency=%13 changeFrequency=%14 hubScore=%15 rankScore=%16")
                           .arg(i)
                           .arg(StructuralResultRowUtil::categoryToString(row.category))
                           .arg(row.primaryPath)
@@ -125,7 +125,11 @@ QStringList toDebugStrings(const QVector<StructuralResultRow>& rows)
                           .arg(row.hasSizeBytes ? QString::number(row.sizeBytes) : QStringLiteral(""))
                           .arg(row.sourceFile)
                           .arg(row.symbol)
-                          .arg(row.note));
+                          .arg(row.note)
+                          .arg(row.dependencyFrequency)
+                          .arg(row.changeFrequency)
+                          .arg(row.hubScore)
+                          .arg(QString::number(row.rankScore, 'f', 3)));
     }
 
     return out;

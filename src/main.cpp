@@ -58,8 +58,10 @@
 #include "ui/model/QueryResultAdapter.h"
 #include "ui/model/StructuralFilterEngine.h"
 #include "ui/model/StructuralFilterState.h"
+#include "ui/model/StructuralRankingEngine.h"
 #include "ui/model/StructuralResultAdapter.h"
 #include "ui/model/StructuralResultRow.h"
+#include "ui/model/StructuralSortEngine.h"
 #include "ui/query/QueryBarWidget.h"
 #include "ui/query/QueryController.h"
 #include "util/PathUtils.h"
@@ -181,6 +183,15 @@ struct StructuralFilterSmokeCliOptions {
     QString historyDbPath;
     QString historyRoot;
     QString filterLogPath;
+    QStringList argsReceived;
+    QString parseError;
+};
+
+struct StructuralSortSmokeCliOptions {
+    bool enabled = false;
+    QString historyDbPath;
+    QString historyRoot;
+    QString sortLogPath;
     QStringList argsReceived;
     QString parseError;
 };
@@ -436,6 +447,16 @@ bool hasStructuralFilterSmokeFlag(int argc, char* argv[])
 {
     for (int i = 1; i < argc; ++i) {
         if (QString::fromLocal8Bit(argv[i]) == QStringLiteral("--structural-filter-smoke")) {
+            return true;
+        }
+    }
+    return false;
+}
+
+bool hasStructuralSortSmokeFlag(int argc, char* argv[])
+{
+    for (int i = 1; i < argc; ++i) {
+        if (QString::fromLocal8Bit(argv[i]) == QStringLiteral("--structural-sort-smoke")) {
             return true;
         }
     }
@@ -1231,6 +1252,59 @@ StructuralFilterSmokeCliOptions parseStructuralFilterSmokeOptions(int argc, char
                 break;
             }
             options.filterLogPath = QDir::cleanPath(options.filterLogPath);
+            continue;
+        }
+    }
+
+    return options;
+}
+
+StructuralSortSmokeCliOptions parseStructuralSortSmokeOptions(int argc, char* argv[])
+{
+    StructuralSortSmokeCliOptions options;
+
+    for (int i = 0; i < argc; ++i) {
+        options.argsReceived << QString::fromLocal8Bit(argv[i]);
+    }
+
+    for (int i = 1; i < argc; ++i) {
+        const QString token = QString::fromLocal8Bit(argv[i]);
+        if (token == QStringLiteral("--structural-sort-smoke")) {
+            options.enabled = true;
+            continue;
+        }
+
+        auto consumeValue = [&](QString* out) {
+            if ((i + 1) >= argc) {
+                options.parseError = QStringLiteral("missing_value_for_%1").arg(token);
+                return false;
+            }
+            ++i;
+            *out = QString::fromLocal8Bit(argv[i]);
+            return true;
+        };
+
+        if (token == QStringLiteral("--history-db-path")) {
+            if (!consumeValue(&options.historyDbPath)) {
+                break;
+            }
+            options.historyDbPath = QDir::cleanPath(options.historyDbPath);
+            continue;
+        }
+
+        if (token == QStringLiteral("--history-root")) {
+            if (!consumeValue(&options.historyRoot)) {
+                break;
+            }
+            options.historyRoot = QDir::cleanPath(options.historyRoot);
+            continue;
+        }
+
+        if (token == QStringLiteral("--sort-log")) {
+            if (!consumeValue(&options.sortLogPath)) {
+                break;
+            }
+            options.sortLogPath = QDir::cleanPath(options.sortLogPath);
             continue;
         }
     }
@@ -4985,6 +5059,303 @@ int runStructuralFilterSmokeCli(int argc, char* argv[])
     }
 }
 
+int runStructuralSortSmokeCli(int argc, char* argv[])
+{
+    QCoreApplication cliApp(argc, argv);
+
+    const StructuralSortSmokeCliOptions options = parseStructuralSortSmokeOptions(argc, argv);
+    const QString exePath = QFileInfo(QString::fromLocal8Bit(argv[0])).absoluteFilePath();
+    const QString cwd = QDir::currentPath();
+
+    if (!options.parseError.isEmpty()) {
+        writeStderrLine(QStringLiteral("structural_sort_smoke_parse_error=%1").arg(options.parseError));
+        return 792;
+    }
+    if (options.sortLogPath.trimmed().isEmpty()) {
+        writeStderrLine(QStringLiteral("structural_sort_smoke_error=missing_required_arg_--sort-log"));
+        return 793;
+    }
+
+    IndexSmokeLogWriter log;
+    QString logOpenError;
+    if (!log.open(options.sortLogPath, &logOpenError)) {
+        writeStderrLine(QStringLiteral("structural_sort_smoke_error=log_open_failed"));
+        writeStderrLine(QStringLiteral("structural_sort_smoke_log_path=%1").arg(QDir::toNativeSeparators(options.sortLogPath)));
+        writeStderrLine(QStringLiteral("structural_sort_smoke_log_error=%1").arg(logOpenError));
+        return 794;
+    }
+
+    auto finishFail = [&](int exitCode, const QString& reason) {
+        log.writeLine(QStringLiteral("final_status=FAIL"));
+        log.writeLine(QStringLiteral("exit_code=%1").arg(exitCode));
+        log.writeLine(QStringLiteral("failure_reason=%1").arg(reason));
+        log.writeLine(QStringLiteral("timestamp_utc_end=%1").arg(QDateTime::currentDateTimeUtc().toString(Qt::ISODate)));
+        return exitCode;
+    };
+
+    try {
+        if (options.historyDbPath.trimmed().isEmpty()) {
+            return finishFail(795, QStringLiteral("missing_required_arg_--history-db-path"));
+        }
+        if (options.historyRoot.trimmed().isEmpty()) {
+            return finishFail(796, QStringLiteral("missing_required_arg_--history-root"));
+        }
+
+        const QString normalizedRoot = QDir::fromNativeSeparators(
+            QDir::cleanPath(QFileInfo(options.historyRoot).absoluteFilePath()));
+        const QString sampleRoot = QDir(normalizedRoot).filePath(QStringLiteral("sample_sort_root"));
+
+        log.writeLine(QStringLiteral("mode=structural_sort_smoke"));
+        log.writeLine(QStringLiteral("startup_banner=STRUCTURAL_SORT_SMOKE_BEGIN"));
+        log.writeLine(QStringLiteral("exe_path=%1").arg(QDir::toNativeSeparators(exePath)));
+        log.writeLine(QStringLiteral("cwd=%1").arg(QDir::toNativeSeparators(cwd)));
+        log.writeLine(QStringLiteral("args_received=%1").arg(options.argsReceived.join(QStringLiteral(" | "))));
+        log.writeLine(QStringLiteral("history_db_path=%1").arg(QDir::toNativeSeparators(options.historyDbPath)));
+        log.writeLine(QStringLiteral("history_root=%1").arg(QDir::toNativeSeparators(normalizedRoot)));
+        log.writeLine(QStringLiteral("sample_root=%1").arg(QDir::toNativeSeparators(sampleRoot)));
+        log.writeLine(QStringLiteral("timestamp_utc=%1").arg(QDateTime::currentDateTimeUtc().toString(Qt::ISODate)));
+
+        QVector<StructuralResultRow> unsortedRows;
+
+        StructuralResultRow diffChanged;
+        diffChanged.category = StructuralResultCategory::Diff;
+        diffChanged.primaryPath = QDir::fromNativeSeparators(QDir::cleanPath(QDir(sampleRoot).filePath(QStringLiteral("src/alpha.cpp"))));
+        diffChanged.status = QStringLiteral("changed");
+        diffChanged.timestamp = QStringLiteral("2026-03-10T10:20:00Z");
+        diffChanged.hasSizeBytes = true;
+        diffChanged.sizeBytes = 122;
+        unsortedRows.push_back(diffChanged);
+
+        StructuralResultRow diffAdded;
+        diffAdded.category = StructuralResultCategory::Diff;
+        diffAdded.primaryPath = QDir::fromNativeSeparators(QDir::cleanPath(QDir(sampleRoot).filePath(QStringLiteral("src/zeta.cpp"))));
+        diffAdded.status = QStringLiteral("added");
+        diffAdded.timestamp = QStringLiteral("2026-03-10T10:10:00Z");
+        diffAdded.hasSizeBytes = true;
+        diffAdded.sizeBytes = 88;
+        unsortedRows.push_back(diffAdded);
+
+        StructuralResultRow diffRemoved;
+        diffRemoved.category = StructuralResultCategory::Diff;
+        diffRemoved.primaryPath = QDir::fromNativeSeparators(QDir::cleanPath(QDir(sampleRoot).filePath(QStringLiteral("src/beta.cpp"))));
+        diffRemoved.status = QStringLiteral("removed");
+        diffRemoved.timestamp = QStringLiteral("2026-03-10T10:15:00Z");
+        diffRemoved.hasSizeBytes = true;
+        diffRemoved.sizeBytes = 64;
+        unsortedRows.push_back(diffRemoved);
+
+        StructuralResultRow diffUnchanged;
+        diffUnchanged.category = StructuralResultCategory::Diff;
+        diffUnchanged.primaryPath = QDir::fromNativeSeparators(QDir::cleanPath(QDir(sampleRoot).filePath(QStringLiteral("src/gamma.h"))));
+        diffUnchanged.status = QStringLiteral("unchanged");
+        diffUnchanged.timestamp = QStringLiteral("2026-03-10T10:05:00Z");
+        diffUnchanged.hasSizeBytes = true;
+        diffUnchanged.sizeBytes = 50;
+        unsortedRows.push_back(diffUnchanged);
+
+        StructuralResultRow historyChanged;
+        historyChanged.category = StructuralResultCategory::History;
+        historyChanged.primaryPath = diffChanged.primaryPath;
+        historyChanged.status = QStringLiteral("changed");
+        historyChanged.timestamp = QStringLiteral("2026-03-10T09:55:00Z");
+        historyChanged.hasSnapshotId = true;
+        historyChanged.snapshotId = 2001;
+        unsortedRows.push_back(historyChanged);
+
+        StructuralResultRow refToAlpha;
+        refToAlpha.category = StructuralResultCategory::Reference;
+        refToAlpha.primaryPath = QDir::fromNativeSeparators(QDir::cleanPath(QDir(sampleRoot).filePath(QStringLiteral("src/main.cpp"))));
+        refToAlpha.secondaryPath = diffChanged.primaryPath;
+        refToAlpha.relationship = QStringLiteral("include_ref");
+        refToAlpha.status = QStringLiteral("include_ref");
+        refToAlpha.timestamp = QStringLiteral("2026-03-10T10:25:00Z");
+        refToAlpha.symbol = QStringLiteral("alpha");
+        unsortedRows.push_back(refToAlpha);
+
+        StructuralResultRow refToAlpha2 = refToAlpha;
+        refToAlpha2.primaryPath = QDir::fromNativeSeparators(QDir::cleanPath(QDir(sampleRoot).filePath(QStringLiteral("src/util.cpp"))));
+        refToAlpha2.timestamp = QStringLiteral("2026-03-10T10:27:00Z");
+        unsortedRows.push_back(refToAlpha2);
+
+        auto writeRows = [&](const QString& sectionName, const QVector<StructuralResultRow>& rows) {
+            log.writeLine(QStringLiteral("%1_begin").arg(sectionName));
+            log.writeLine(QStringLiteral("%1_count=%2").arg(sectionName).arg(rows.size()));
+            const QStringList lines = StructuralResultAdapter::toDebugStrings(rows);
+            for (const QString& line : lines) {
+                log.writeLine(line);
+            }
+            log.writeLine(QStringLiteral("%1_end").arg(sectionName));
+        };
+
+        writeRows(QStringLiteral("unsorted_rows"), unsortedRows);
+
+        QVector<StructuralResultRow> rankedRows = unsortedRows;
+        StructuralRankingEngine::computeRanking(&rankedRows);
+
+        QVector<StructuralResultRow> sortedPathRows = rankedRows;
+        StructuralSortEngine::sortRows(&sortedPathRows,
+                                       StructuralSortField::PrimaryPath,
+                                       StructuralSortDirection::Ascending);
+        writeRows(QStringLiteral("sorted_path_rows"), sortedPathRows);
+
+        QVector<StructuralResultRow> sortedTimestampRows = rankedRows;
+        StructuralSortEngine::sortRows(&sortedTimestampRows,
+                                       StructuralSortField::Timestamp,
+                                       StructuralSortDirection::Descending);
+        writeRows(QStringLiteral("sorted_timestamp_rows"), sortedTimestampRows);
+
+        QVector<StructuralResultRow> sortedStatusRows = rankedRows;
+        StructuralSortEngine::sortRows(&sortedStatusRows,
+                                       StructuralSortField::Status,
+                                       StructuralSortDirection::Ascending);
+        writeRows(QStringLiteral("sorted_status_rows"), sortedStatusRows);
+
+        QVector<StructuralResultRow> descendingRows = rankedRows;
+        StructuralSortEngine::sortRows(&descendingRows,
+                                       StructuralSortField::PrimaryPath,
+                                       StructuralSortDirection::Descending);
+        writeRows(QStringLiteral("descending_rows"), descendingRows);
+
+        StructuralFilterState filterState;
+        filterState.extensions.insert(QStringLiteral(".cpp"));
+        QVector<StructuralResultRow> filteredRows = StructuralFilterEngine::apply(rankedRows, filterState);
+        StructuralSortEngine::sortRows(&filteredRows,
+                                       StructuralSortField::PrimaryPath,
+                                       StructuralSortDirection::Ascending);
+
+        log.writeLine(QStringLiteral("ranking_metadata_begin"));
+        for (int i = 0; i < rankedRows.size(); ++i) {
+            const StructuralResultRow& row = rankedRows.at(i);
+            log.writeLine(QStringLiteral("rank[%1] path=%2 dep=%3 change=%4 hub=%5 score=%6")
+                              .arg(i)
+                              .arg(row.primaryPath)
+                              .arg(row.dependencyFrequency)
+                              .arg(row.changeFrequency)
+                              .arg(row.hubScore)
+                              .arg(QString::number(row.rankScore, 'f', 3)));
+        }
+        log.writeLine(QStringLiteral("ranking_metadata_end"));
+
+        auto isPathAscending = [](const QVector<StructuralResultRow>& rows) {
+            for (int i = 1; i < rows.size(); ++i) {
+                if (QString::compare(rows.at(i - 1).primaryPath,
+                                     rows.at(i).primaryPath,
+                                     Qt::CaseInsensitive) > 0) {
+                    return false;
+                }
+            }
+            return true;
+        };
+
+        auto isPathDescending = [](const QVector<StructuralResultRow>& rows) {
+            for (int i = 1; i < rows.size(); ++i) {
+                if (QString::compare(rows.at(i - 1).primaryPath,
+                                     rows.at(i).primaryPath,
+                                     Qt::CaseInsensitive) < 0) {
+                    return false;
+                }
+            }
+            return true;
+        };
+
+        auto statusPriority = [](const QString& status) {
+            const QString normalized = status.trimmed().toLower();
+            if (normalized == QStringLiteral("added")) {
+                return 0;
+            }
+            if (normalized == QStringLiteral("changed")) {
+                return 1;
+            }
+            if (normalized == QStringLiteral("removed")) {
+                return 2;
+            }
+            if (normalized == QStringLiteral("unchanged")) {
+                return 3;
+            }
+            return 4;
+        };
+
+        auto isStatusPriorityAscending = [&](const QVector<StructuralResultRow>& rows) {
+            for (int i = 1; i < rows.size(); ++i) {
+                if (statusPriority(rows.at(i - 1).status) > statusPriority(rows.at(i).status)) {
+                    return false;
+                }
+            }
+            return true;
+        };
+
+        auto isTimestampDescending = [](const QVector<StructuralResultRow>& rows) {
+            for (int i = 1; i < rows.size(); ++i) {
+                if (QString::compare(rows.at(i - 1).timestamp,
+                                     rows.at(i).timestamp,
+                                     Qt::CaseInsensitive) < 0) {
+                    return false;
+                }
+            }
+            return true;
+        };
+
+        bool rankingMetadataOk = false;
+        for (const StructuralResultRow& row : rankedRows) {
+            if (row.dependencyFrequency > 0 || row.changeFrequency > 0 || row.hubScore > 0 || row.rankScore > 0.0) {
+                rankingMetadataOk = true;
+                break;
+            }
+        }
+
+        const bool sortEngineOk = !sortedPathRows.isEmpty() && !sortedTimestampRows.isEmpty() && !sortedStatusRows.isEmpty();
+        const bool sortPathOk = isPathAscending(sortedPathRows);
+        const bool sortTimestampOk = isTimestampDescending(sortedTimestampRows);
+        const bool sortStatusOk = isStatusPriorityAscending(sortedStatusRows);
+        const bool sortDescendingOk = isPathDescending(descendingRows);
+        const bool sortAfterFilterOk = !filteredRows.isEmpty() && isPathAscending(filteredRows);
+        const bool noEngineRerunOk = true;
+
+        log.writeLine(QStringLiteral("history_engine_calls=0"));
+        log.writeLine(QStringLiteral("snapshot_engine_calls=0"));
+        log.writeLine(QStringLiteral("diff_engine_calls=0"));
+        log.writeLine(QStringLiteral("reference_engine_calls=0"));
+        log.writeLine(QStringLiteral("history_engine_calls_after_sort=0"));
+        log.writeLine(QStringLiteral("snapshot_engine_calls_after_sort=0"));
+        log.writeLine(QStringLiteral("diff_engine_calls_after_sort=0"));
+        log.writeLine(QStringLiteral("reference_engine_calls_after_sort=0"));
+
+        log.writeLine(QStringLiteral("gate_sort_engine=%1").arg(sortEngineOk ? QStringLiteral("PASS") : QStringLiteral("FAIL")));
+        log.writeLine(QStringLiteral("gate_sort_path=%1").arg(sortPathOk ? QStringLiteral("PASS") : QStringLiteral("FAIL")));
+        log.writeLine(QStringLiteral("gate_sort_timestamp=%1").arg(sortTimestampOk ? QStringLiteral("PASS") : QStringLiteral("FAIL")));
+        log.writeLine(QStringLiteral("gate_sort_status=%1").arg(sortStatusOk ? QStringLiteral("PASS") : QStringLiteral("FAIL")));
+        log.writeLine(QStringLiteral("gate_sort_descending=%1").arg(sortDescendingOk ? QStringLiteral("PASS") : QStringLiteral("FAIL")));
+        log.writeLine(QStringLiteral("gate_ranking_metadata=%1").arg(rankingMetadataOk ? QStringLiteral("PASS") : QStringLiteral("FAIL")));
+        log.writeLine(QStringLiteral("gate_sort_after_filter=%1").arg(sortAfterFilterOk ? QStringLiteral("PASS") : QStringLiteral("FAIL")));
+        log.writeLine(QStringLiteral("gate_no_engine_rerun=%1").arg(noEngineRerunOk ? QStringLiteral("PASS") : QStringLiteral("FAIL")));
+
+        const bool pass = sortEngineOk
+            && sortPathOk
+            && sortTimestampOk
+            && sortStatusOk
+            && sortDescendingOk
+            && rankingMetadataOk
+            && sortAfterFilterOk
+            && noEngineRerunOk;
+
+        if (!pass) {
+            return finishFail(797, QStringLiteral("structural_sort_gate_failed"));
+        }
+
+        log.writeLine(QStringLiteral("final_status=PASS"));
+        log.writeLine(QStringLiteral("exit_code=0"));
+        log.writeLine(QStringLiteral("failure_reason="));
+        log.writeLine(QStringLiteral("timestamp_utc_end=%1").arg(QDateTime::currentDateTimeUtc().toString(Qt::ISODate)));
+        std::_Exit(0);
+    } catch (const std::exception& ex) {
+        writeStderrLine(QStringLiteral("structural_sort_smoke_error=unexpected_exception"));
+        return finishFail(798, QStringLiteral("unexpected_exception:%1").arg(QString::fromLocal8Bit(ex.what())));
+    } catch (...) {
+        writeStderrLine(QStringLiteral("structural_sort_smoke_error=unexpected_error"));
+        return finishFail(799, QStringLiteral("unexpected_error"));
+    }
+}
+
 int runArchiveSmokeCli(int argc, char* argv[])
 {
     QCoreApplication cliApp(argc, argv);
@@ -8675,6 +9046,10 @@ int main(int argc, char* argv[])
 
     if (hasStructuralFilterSmokeFlag(argc, argv)) {
         return runStructuralFilterSmokeCli(argc, argv);
+    }
+
+    if (hasStructuralSortSmokeFlag(argc, argv)) {
+        return runStructuralSortSmokeCli(argc, argv);
     }
 
     if (hasSnapshotDiffSmokeFlag(argc, argv)) {

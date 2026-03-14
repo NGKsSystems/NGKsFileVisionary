@@ -28,6 +28,10 @@ struct StructuralResultRow
     QString sourceFile;
     QString symbol;
     QString note;
+    int dependencyFrequency = 0;
+    int changeFrequency = 0;
+    int hubScore = 0;
+    double rankScore = 0.0;
 };
 
 namespace StructuralResultRowUtil

@@ -69,7 +69,9 @@
 #include "model/DirectoryModel.h"
 #include "model/QueryResultAdapter.h"
 #include "model/StructuralFilterEngine.h"
+#include "model/StructuralRankingEngine.h"
 #include "model/StructuralResultAdapter.h"
+#include "model/StructuralSortEngine.h"
 #include "query/QueryBarWidget.h"
 #include "query/QueryController.h"
 #include "core/services/RefreshTypes.h"
@@ -441,6 +443,8 @@ void MainWindow::setupStructuralPanel()
     m_structuralRelationshipFilterCombo = new QComboBox(panelRoot);
     m_structuralTextFilterEdit = new QLineEdit(panelRoot);
     m_structuralClearFiltersButton = new QPushButton(QStringLiteral("Clear Filters"), panelRoot);
+    m_structuralSortFieldCombo = new QComboBox(panelRoot);
+    m_structuralSortDirectionButton = new QPushButton(QStringLiteral("Sort: Asc"), panelRoot);
 
     m_structuralCategoryFilterCombo->addItem(QStringLiteral("Category: All"), QString());
     m_structuralCategoryFilterCombo->addItem(QStringLiteral("history"), QStringLiteral("history"));
@@ -463,12 +467,22 @@ void MainWindow::setupStructuralPanel()
     m_structuralRelationshipFilterCombo->addItem(QStringLiteral("path_ref"), QStringLiteral("path_ref"));
 
     m_structuralTextFilterEdit->setPlaceholderText(QStringLiteral("Path / note text filter"));
+    m_structuralSortFieldCombo->addItem(QStringLiteral("Sort: Path"), static_cast<int>(StructuralSortField::PrimaryPath));
+    m_structuralSortFieldCombo->addItem(QStringLiteral("Sort: Status"), static_cast<int>(StructuralSortField::Status));
+    m_structuralSortFieldCombo->addItem(QStringLiteral("Sort: Time"), static_cast<int>(StructuralSortField::Timestamp));
+    m_structuralSortFieldCombo->addItem(QStringLiteral("Sort: Snapshot"), static_cast<int>(StructuralSortField::SnapshotId));
+    m_structuralSortFieldCombo->addItem(QStringLiteral("Sort: Relationship"), static_cast<int>(StructuralSortField::Relationship));
+    m_structuralSortFieldCombo->addItem(QStringLiteral("Sort: Size"), static_cast<int>(StructuralSortField::SizeBytes));
+    m_structuralSortFieldCombo->addItem(QStringLiteral("Sort: Symbol"), static_cast<int>(StructuralSortField::Symbol));
+    m_structuralSortFieldCombo->addItem(QStringLiteral("Sort: Rank"), static_cast<int>(StructuralSortField::RankScore));
 
     filterLayout->addWidget(m_structuralCategoryFilterCombo);
     filterLayout->addWidget(m_structuralStatusFilterCombo);
     filterLayout->addWidget(m_structuralExtensionFilterCombo);
     filterLayout->addWidget(m_structuralRelationshipFilterCombo);
     filterLayout->addWidget(m_structuralTextFilterEdit, 1);
+    filterLayout->addWidget(m_structuralSortFieldCombo);
+    filterLayout->addWidget(m_structuralSortDirectionButton);
     filterLayout->addWidget(m_structuralClearFiltersButton);
     panelLayout->addLayout(filterLayout);
 
@@ -551,6 +565,7 @@ void MainWindow::setupStructuralPanel()
 
     auto applyFilters = [this]() {
         updateStructuralFilterStateFromControls();
+        updateStructuralSortStateFromControls();
         applyStructuralFiltersToCurrentRows(m_structuralStatusPrefix);
     };
     connect(m_structuralCategoryFilterCombo, &QComboBox::currentIndexChanged, this, [applyFilters](int) { applyFilters(); });
@@ -558,6 +573,18 @@ void MainWindow::setupStructuralPanel()
     connect(m_structuralExtensionFilterCombo, &QComboBox::currentIndexChanged, this, [applyFilters](int) { applyFilters(); });
     connect(m_structuralRelationshipFilterCombo, &QComboBox::currentIndexChanged, this, [applyFilters](int) { applyFilters(); });
     connect(m_structuralTextFilterEdit, &QLineEdit::textChanged, this, [applyFilters](const QString&) { applyFilters(); });
+    connect(m_structuralSortFieldCombo, &QComboBox::currentIndexChanged, this, [applyFilters](int) { applyFilters(); });
+    connect(m_structuralSortDirectionButton, &QPushButton::clicked, this, [this, applyFilters]() {
+        m_structuralSortDirection = (m_structuralSortDirection == StructuralSortDirection::Ascending)
+            ? StructuralSortDirection::Descending
+            : StructuralSortDirection::Ascending;
+        if (m_structuralSortDirectionButton) {
+            m_structuralSortDirectionButton->setText(m_structuralSortDirection == StructuralSortDirection::Ascending
+                                                         ? QStringLiteral("Sort: Asc")
+                                                         : QStringLiteral("Sort: Desc"));
+        }
+        applyFilters();
+    });
     connect(m_structuralClearFiltersButton, &QPushButton::clicked, this, [this]() {
         clearStructuralFilters(true);
     });
@@ -2745,6 +2772,25 @@ void MainWindow::updateStructuralFilterStateFromControls()
     }
 }
 
+void MainWindow::updateStructuralSortStateFromControls()
+{
+    if (!m_structuralSortFieldCombo || m_structuralSortFieldCombo->currentIndex() < 0) {
+        return;
+    }
+
+    bool ok = false;
+    const int value = m_structuralSortFieldCombo->currentData().toInt(&ok);
+    if (ok) {
+        m_structuralSortField = static_cast<StructuralSortField>(value);
+    }
+
+    if (m_structuralSortDirectionButton) {
+        m_structuralSortDirectionButton->setText(m_structuralSortDirection == StructuralSortDirection::Ascending
+                                                     ? QStringLiteral("Sort: Asc")
+                                                     : QStringLiteral("Sort: Desc"));
+    }
+}
+
 void MainWindow::updateStructuralFilterControlChoices(const QVector<StructuralResultRow>& canonicalRows)
 {
     if (!m_structuralExtensionFilterCombo || !m_structuralRelationshipFilterCombo) {
@@ -2804,7 +2850,10 @@ void MainWindow::updateStructuralFilterControlChoices(const QVector<StructuralRe
 
 void MainWindow::applyStructuralFiltersToCurrentRows(const QString& statusPrefix)
 {
-    m_structuralFilteredRows = StructuralFilterEngine::apply(m_structuralCanonicalRows, m_structuralFilterState);
+    QVector<StructuralResultRow> rankedRows = m_structuralCanonicalRows;
+    StructuralRankingEngine::computeRanking(&rankedRows);
+    m_structuralFilteredRows = StructuralFilterEngine::apply(rankedRows, m_structuralFilterState);
+    StructuralSortEngine::sortRows(&m_structuralFilteredRows, m_structuralSortField, m_structuralSortDirection);
     const QVector<FileEntry> displayRows = StructuralResultAdapter::toFileEntries(m_structuralFilteredRows);
 
     m_fileModel.clear();
@@ -2831,12 +2880,16 @@ void MainWindow::applyStructuralFiltersToCurrentRows(const QString& statusPrefix
 
     const QString statusBase = statusPrefix.trimmed().isEmpty() ? QStringLiteral("Structural view") : statusPrefix;
     const QString activeFilters = m_structuralFilterState.isEmpty() ? QStringLiteral("none") : QStringLiteral("active");
+    const QString sortDirection = (m_structuralSortDirection == StructuralSortDirection::Ascending)
+        ? QStringLiteral("asc")
+        : QStringLiteral("desc");
     if (m_statusLabel) {
-        m_statusLabel->setText(QStringLiteral("%1: %2/%3 rows (filters=%4)")
+        m_statusLabel->setText(QStringLiteral("%1: %2/%3 rows (filters=%4 sort=%5)")
                                    .arg(statusBase)
                                    .arg(displayRows.size())
                                    .arg(m_structuralCanonicalRows.size())
-                                   .arg(activeFilters));
+                                   .arg(activeFilters)
+                                   .arg(sortDirection));
     }
 }
 
@@ -2863,6 +2916,11 @@ void MainWindow::clearStructuralFilters(bool applyNow)
         QSignalBlocker blocker(m_structuralTextFilterEdit);
         m_structuralTextFilterEdit->clear();
     }
+    if (m_structuralSortFieldCombo) {
+        QSignalBlocker blocker(m_structuralSortFieldCombo);
+        const int index = m_structuralSortFieldCombo->findData(static_cast<int>(m_structuralSortField));
+        m_structuralSortFieldCombo->setCurrentIndex(index >= 0 ? index : 0);
+    }
 
     if (applyNow) {
         applyStructuralFiltersToCurrentRows(m_structuralStatusPrefix);
@@ -2876,8 +2934,43 @@ void MainWindow::setStructuralCanonicalRows(const QVector<StructuralResultRow>& 
     m_structuralCanonicalRows = rows;
     m_structuralViewRoot = viewRoot;
     m_structuralStatusPrefix = statusPrefix;
+
+    if (!rows.isEmpty()) {
+        const StructuralResultCategory category = rows.first().category;
+        bool uniformCategory = true;
+        for (const StructuralResultRow& row : rows) {
+            if (row.category != category) {
+                uniformCategory = false;
+                break;
+            }
+        }
+
+        if (uniformCategory) {
+            StructuralSortField defaultField = m_structuralSortField;
+            StructuralSortDirection defaultDirection = m_structuralSortDirection;
+            if (StructuralSortEngine::defaultSortForCategory(category, &defaultField, &defaultDirection)) {
+                m_structuralSortField = defaultField;
+                m_structuralSortDirection = defaultDirection;
+                if (m_structuralSortFieldCombo) {
+                    QSignalBlocker blocker(m_structuralSortFieldCombo);
+                    const int index = m_structuralSortFieldCombo->findData(static_cast<int>(m_structuralSortField));
+                    if (index >= 0) {
+                        m_structuralSortFieldCombo->setCurrentIndex(index);
+                    }
+                }
+                if (m_structuralSortDirectionButton) {
+                    m_structuralSortDirectionButton->setText(
+                        m_structuralSortDirection == StructuralSortDirection::Ascending
+                            ? QStringLiteral("Sort: Asc")
+                            : QStringLiteral("Sort: Desc"));
+                }
+            }
+        }
+    }
+
     updateStructuralFilterControlChoices(rows);
     updateStructuralFilterStateFromControls();
+    updateStructuralSortStateFromControls();
     applyStructuralFiltersToCurrentRows(statusPrefix);
 }
 

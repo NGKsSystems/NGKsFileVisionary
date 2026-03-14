@@ -55,6 +55,8 @@
         "src/ui/model/StructuralResultAdapter.cpp",
         "src/ui/model/StructuralFilterState.cpp",
         "src/ui/model/StructuralFilterEngine.cpp",
+        "src/ui/model/StructuralSortEngine.cpp",
+        "src/ui/model/StructuralRankingEngine.cpp",
         "src/util/PathUtils.cpp"
       ],
       "include_dirs": [
