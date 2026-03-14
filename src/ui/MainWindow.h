@@ -40,6 +40,15 @@ class MainWindow : public QMainWindow
 {
     Q_OBJECT
 
+    struct StructuralPanelState
+    {
+        int activeTab = 0;
+        QStringList queryHistory;
+        int queryHistoryIndex = -1;
+        QString currentQuery;
+        QStringList lastResults;
+    };
+
 public:
     explicit MainWindow(QWidget* parent);
     explicit MainWindow(bool testMode = false,
@@ -92,6 +101,31 @@ public:
                                                   QStringList* rowsOut = nullptr,
                                                   QString* navigationPathOut = nullptr,
                                                   QString* errorText = nullptr);
+    bool triggerStructuralBackForTesting(int* activeTabIndex = nullptr,
+                                         QString* activeTabLabel = nullptr,
+                                         int* rowCount = nullptr,
+                                         QString* currentQueryOut = nullptr,
+                                         int* historySizeOut = nullptr,
+                                         int* historyIndexOut = nullptr,
+                                         QString* errorText = nullptr);
+    bool triggerStructuralForwardForTesting(int* activeTabIndex = nullptr,
+                                            QString* activeTabLabel = nullptr,
+                                            int* rowCount = nullptr,
+                                            QString* currentQueryOut = nullptr,
+                                            int* historySizeOut = nullptr,
+                                            int* historyIndexOut = nullptr,
+                                            QString* errorText = nullptr);
+    bool triggerStructuralRefreshForTesting(int* activeTabIndex = nullptr,
+                                            QString* activeTabLabel = nullptr,
+                                            int* rowCount = nullptr,
+                                            QString* currentQueryOut = nullptr,
+                                            int* historySizeOut = nullptr,
+                                            int* historyIndexOut = nullptr,
+                                            QString* errorText = nullptr);
+    quintptr structuralPanelInstanceTokenForTesting() const;
+    int structuralQueryHistorySizeForTesting() const;
+    int structuralQueryHistoryIndexForTesting() const;
+    QString structuralCurrentQueryForTesting() const;
 
 private slots:
     void onBrowseRoot();
@@ -218,7 +252,27 @@ private:
     bool dispatchStructuralQueryToPanel(const QString& queryText,
                                         QString* errorText = nullptr,
                                         int* activeTabIndex = nullptr,
-                                        int* rowCount = nullptr);
+                                        int* rowCount = nullptr,
+                                        bool pushHistory = true,
+                                        bool forceRefresh = false);
+    bool ensureStructuralPanel();
+    bool dispatchQueryToExistingPanel(const QString& queryText,
+                                      QString* errorText = nullptr,
+                                      int* activeTabIndex = nullptr,
+                                      int* rowCount = nullptr,
+                                      bool pushHistory = true,
+                                      bool forceRefresh = false);
+    void pushStructuralQueryHistory(const QString& queryText);
+    bool navigateStructuralBack(QString* errorText = nullptr,
+                                int* activeTabIndex = nullptr,
+                                int* rowCount = nullptr);
+    bool navigateStructuralForward(QString* errorText = nullptr,
+                                   int* activeTabIndex = nullptr,
+                                   int* rowCount = nullptr);
+    bool refreshStructuralCurrentQuery(QString* errorText = nullptr,
+                                       int* activeTabIndex = nullptr,
+                                       int* rowCount = nullptr);
+    void updateStructuralNavigationButtons();
     bool navigateFromCurrentModelRow(int rowIndex, QString* navigatedPathOut = nullptr);
     QStringList collectCurrentModelRows(int maxRows = 200) const;
     bool loadHistoryRowsForPath(const QString& selectedFilePath,
@@ -341,8 +395,12 @@ private:
     QPushButton* m_structuralDiffCompareButton = nullptr;
     QPushButton* m_structuralShowReferencesButton = nullptr;
     QPushButton* m_structuralShowUsedByButton = nullptr;
+    QPushButton* m_structuralBackButton = nullptr;
+    QPushButton* m_structuralForwardButton = nullptr;
+    QPushButton* m_structuralRefreshButton = nullptr;
     QComboBox* m_structuralOldSnapshotCombo = nullptr;
     QComboBox* m_structuralNewSnapshotCombo = nullptr;
     QString m_structuralRootPath;
     QString m_structuralTargetPath;
+    StructuralPanelState m_structuralPanelState;
 };
