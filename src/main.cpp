@@ -248,6 +248,15 @@ struct SessionRestoreSmokeCliOptions {
     QString parseError;
 };
 
+struct SystemCertificationSmokeCliOptions {
+    bool enabled = false;
+    QString historyDbPath;
+    QString historyRoot;
+    QString certLogPath;
+    QStringList argsReceived;
+    QString parseError;
+};
+
 struct ArchiveSmokeCliOptions {
     bool enabled = false;
     QString archiveRoot;
@@ -559,6 +568,16 @@ bool hasSessionRestoreSmokeFlag(int argc, char* argv[])
 {
     for (int i = 1; i < argc; ++i) {
         if (QString::fromLocal8Bit(argv[i]) == QStringLiteral("--session-restore-smoke")) {
+            return true;
+        }
+    }
+    return false;
+}
+
+bool hasSystemCertificationSmokeFlag(int argc, char* argv[])
+{
+    for (int i = 1; i < argc; ++i) {
+        if (QString::fromLocal8Bit(argv[i]) == QStringLiteral("--system-certification-smoke")) {
             return true;
         }
     }
@@ -1672,6 +1691,59 @@ SessionRestoreSmokeCliOptions parseSessionRestoreSmokeOptions(int argc, char* ar
                 break;
             }
             options.sessionLogPath = QDir::cleanPath(options.sessionLogPath);
+            continue;
+        }
+    }
+
+    return options;
+}
+
+SystemCertificationSmokeCliOptions parseSystemCertificationSmokeOptions(int argc, char* argv[])
+{
+    SystemCertificationSmokeCliOptions options;
+
+    for (int i = 0; i < argc; ++i) {
+        options.argsReceived << QString::fromLocal8Bit(argv[i]);
+    }
+
+    for (int i = 1; i < argc; ++i) {
+        const QString token = QString::fromLocal8Bit(argv[i]);
+        if (token == QStringLiteral("--system-certification-smoke")) {
+            options.enabled = true;
+            continue;
+        }
+
+        auto consumeValue = [&](QString* out) {
+            if ((i + 1) >= argc) {
+                options.parseError = QStringLiteral("missing_value_for_%1").arg(token);
+                return false;
+            }
+            ++i;
+            *out = QString::fromLocal8Bit(argv[i]);
+            return true;
+        };
+
+        if (token == QStringLiteral("--history-db-path")) {
+            if (!consumeValue(&options.historyDbPath)) {
+                break;
+            }
+            options.historyDbPath = QDir::cleanPath(options.historyDbPath);
+            continue;
+        }
+
+        if (token == QStringLiteral("--history-root")) {
+            if (!consumeValue(&options.historyRoot)) {
+                break;
+            }
+            options.historyRoot = QDir::cleanPath(options.historyRoot);
+            continue;
+        }
+
+        if (token == QStringLiteral("--cert-log")) {
+            if (!consumeValue(&options.certLogPath)) {
+                break;
+            }
+            options.certLogPath = QDir::cleanPath(options.certLogPath);
             continue;
         }
     }
@@ -7154,6 +7226,433 @@ int runSessionRestoreSmokeCli(int argc, char* argv[])
     }
 }
 
+int runSystemCertificationSmokeCli(int argc, char* argv[])
+{
+    QApplication cliApp(argc, argv);
+
+    const SystemCertificationSmokeCliOptions options = parseSystemCertificationSmokeOptions(argc, argv);
+    const QString exePath = QFileInfo(QString::fromLocal8Bit(argv[0])).absoluteFilePath();
+    const QString cwd = QDir::currentPath();
+
+    if (!options.parseError.isEmpty()) {
+        writeStderrLine(QStringLiteral("system_certification_smoke_parse_error=%1").arg(options.parseError));
+        return 871;
+    }
+    if (options.certLogPath.trimmed().isEmpty()) {
+        writeStderrLine(QStringLiteral("system_certification_smoke_error=missing_required_arg_--cert-log"));
+        return 872;
+    }
+
+    IndexSmokeLogWriter log;
+    QString logOpenError;
+    if (!log.open(options.certLogPath, &logOpenError)) {
+        writeStderrLine(QStringLiteral("system_certification_smoke_error=log_open_failed"));
+        writeStderrLine(QStringLiteral("system_certification_smoke_log_path=%1").arg(QDir::toNativeSeparators(options.certLogPath)));
+        writeStderrLine(QStringLiteral("system_certification_smoke_log_error=%1").arg(logOpenError));
+        return 873;
+    }
+
+    auto finishFail = [&](int exitCode, const QString& reason) {
+        log.writeLine(QStringLiteral("SYSTEM_CERTIFICATION_STATUS=FAIL"));
+        log.writeLine(QStringLiteral("final_status=FAIL"));
+        log.writeLine(QStringLiteral("exit_code=%1").arg(exitCode));
+        log.writeLine(QStringLiteral("failure_reason=%1").arg(reason));
+        log.writeLine(QStringLiteral("timestamp_utc_end=%1").arg(QDateTime::currentDateTimeUtc().toString(Qt::ISODate)));
+        return exitCode;
+    };
+
+    auto writeTextFile = [](const QString& filePath, const QString& content, QString* errorText) {
+        const QFileInfo info(filePath);
+        if (!QDir().mkpath(info.absolutePath())) {
+            if (errorText) {
+                *errorText = QStringLiteral("create_parent_dir_failed:%1").arg(info.absolutePath());
+            }
+            return false;
+        }
+
+        QFile out(filePath);
+        if (!out.open(QIODevice::WriteOnly | QIODevice::Text | QIODevice::Truncate)) {
+            if (errorText) {
+                *errorText = QStringLiteral("open_write_failed:%1").arg(out.errorString());
+            }
+            return false;
+        }
+
+        QTextStream ts(&out);
+        ts << content;
+        ts.flush();
+        out.close();
+        return true;
+    };
+
+    try {
+        if (options.historyDbPath.trimmed().isEmpty()) {
+            return finishFail(874, QStringLiteral("missing_required_arg_--history-db-path"));
+        }
+        if (options.historyRoot.trimmed().isEmpty()) {
+            return finishFail(875, QStringLiteral("missing_required_arg_--history-root"));
+        }
+
+        const QString normalizedRoot = QDir::fromNativeSeparators(
+            QDir::cleanPath(QFileInfo(options.historyRoot).absoluteFilePath()));
+        const QString sampleRoot = QDir(normalizedRoot).filePath(QStringLiteral("sample_cert_root"));
+        const QString certOutRoot = QDir(normalizedRoot).filePath(QStringLiteral("system_cert_outputs"));
+
+        log.writeLine(QStringLiteral("mode=system_certification_smoke"));
+        log.writeLine(QStringLiteral("startup_banner=SYSTEM_CERTIFICATION_SMOKE_BEGIN"));
+        log.writeLine(QStringLiteral("exe_path=%1").arg(QDir::toNativeSeparators(exePath)));
+        log.writeLine(QStringLiteral("cwd=%1").arg(QDir::toNativeSeparators(cwd)));
+        log.writeLine(QStringLiteral("args_received=%1").arg(options.argsReceived.join(QStringLiteral(" | "))));
+        log.writeLine(QStringLiteral("history_db_path=%1").arg(QDir::toNativeSeparators(options.historyDbPath)));
+        log.writeLine(QStringLiteral("history_root=%1").arg(QDir::toNativeSeparators(normalizedRoot)));
+        log.writeLine(QStringLiteral("sample_root=%1").arg(QDir::toNativeSeparators(sampleRoot)));
+        log.writeLine(QStringLiteral("cert_out_root=%1").arg(QDir::toNativeSeparators(certOutRoot)));
+        log.writeLine(QStringLiteral("timestamp_utc=%1").arg(QDateTime::currentDateTimeUtc().toString(Qt::ISODate)));
+
+        QDir sampleDir(sampleRoot);
+        if (sampleDir.exists() && !sampleDir.removeRecursively()) {
+            return finishFail(876, QStringLiteral("sample_root_cleanup_failed"));
+        }
+        if (!QDir().mkpath(QDir(sampleRoot).filePath(QStringLiteral("src/network")))
+            || !QDir().mkpath(QDir(sampleRoot).filePath(QStringLiteral("docs")))
+            || !QDir().mkpath(QDir(sampleRoot).filePath(QStringLiteral("config")))) {
+            return finishFail(877, QStringLiteral("sample_root_create_failed"));
+        }
+
+        QString writeError;
+        if (!writeTextFile(QDir(sampleRoot).filePath(QStringLiteral("src/main.cpp")),
+                           QStringLiteral("#include \"util.h\"\nint main(){ return util(); }\n"),
+                           &writeError)
+            || !writeTextFile(QDir(sampleRoot).filePath(QStringLiteral("src/util.cpp")),
+                              QStringLiteral("#include \"util.h\"\nint util(){ return 1; }\n"),
+                              &writeError)
+            || !writeTextFile(QDir(sampleRoot).filePath(QStringLiteral("src/util.h")),
+                              QStringLiteral("#pragma once\nint util();\n"),
+                              &writeError)
+            || !writeTextFile(QDir(sampleRoot).filePath(QStringLiteral("src/network/server.cpp")),
+                              QStringLiteral("#include \"../util.h\"\nint server(){ return util(); }\n"),
+                              &writeError)
+            || !writeTextFile(QDir(sampleRoot).filePath(QStringLiteral("docs/readme.md")),
+                              QStringLiteral("system certification sample\n"),
+                              &writeError)
+            || !writeTextFile(QDir(sampleRoot).filePath(QStringLiteral("config/app.json")),
+                              QStringLiteral("{\n  \"service\": \"cert\"\n}\n"),
+                              &writeError)) {
+            return finishFail(878, QStringLiteral("sample_seed_failed:%1").arg(writeError));
+        }
+
+        const QString mainPath = QDir::fromNativeSeparators(QDir::cleanPath(QDir(sampleRoot).filePath(QStringLiteral("src/main.cpp"))));
+        const QString utilCppPath = QDir::fromNativeSeparators(QDir::cleanPath(QDir(sampleRoot).filePath(QStringLiteral("src/util.cpp"))));
+        const QString utilHeaderPath = QDir::fromNativeSeparators(QDir::cleanPath(QDir(sampleRoot).filePath(QStringLiteral("src/util.h"))));
+        const QString serverPath = QDir::fromNativeSeparators(QDir::cleanPath(QDir(sampleRoot).filePath(QStringLiteral("src/network/server.cpp"))));
+
+        MainWindow windowA(true,
+                           normalizedRoot,
+                           QString(),
+                           QString(),
+                           options.historyDbPath,
+                           nullptr);
+        windowA.show();
+        cliApp.processEvents();
+
+        int snapshotRows = 0;
+        qint64 snapshotA = 0;
+        QString snapshotError;
+        if (!windowA.triggerSnapshotsForTesting(sampleRoot, &snapshotRows, &snapshotA, &snapshotError)) {
+            return finishFail(879, QStringLiteral("snapshot_create_a_failed:%1").arg(snapshotError));
+        }
+        if (!writeTextFile(QDir(sampleRoot).filePath(QStringLiteral("src/util.cpp")),
+                           QStringLiteral("#include \"util.h\"\nint util(){ return 2; }\n"),
+                           &writeError)) {
+            return finishFail(880, QStringLiteral("sample_modify_failed:%1").arg(writeError));
+        }
+        int snapshotRows2 = 0;
+        qint64 snapshotB = 0;
+        if (!windowA.triggerSnapshotsForTesting(sampleRoot, &snapshotRows2, &snapshotB, &snapshotError)) {
+            return finishFail(881, QStringLiteral("snapshot_create_b_failed:%1").arg(snapshotError));
+        }
+
+        int activeTab = -1;
+        QString activeTabLabel;
+        int queryRows = 0;
+        QStringList queryRowsOut;
+        QString navPath;
+        QString queryError;
+        const QString queryText = QStringLiteral("history:%1").arg(mainPath);
+        const bool queryDispatchOk = windowA.triggerStructuralQueryDispatchForTesting(sampleRoot,
+                                                                                       queryText,
+                                                                                       &activeTab,
+                                                                                       &activeTabLabel,
+                                                                                       &queryRows,
+                                                                                       &queryRowsOut,
+                                                                                       &navPath,
+                                                                                       &queryError);
+        if (!queryDispatchOk) {
+            return finishFail(882, QStringLiteral("query_dispatch_failed:%1").arg(queryError));
+        }
+
+        QString configureError;
+        const bool filterSortConfigured = windowA.configureStructuralSessionStateForTesting(0,
+                                                                                             0,
+                                                                                             QStringLiteral("history"),
+                                                                                             QStringLiteral("changed"),
+                                                                                             QString(),
+                                                                                             StructuralSortField::Timestamp,
+                                                                                             StructuralSortDirection::Descending,
+                                                                                             &configureError);
+        if (!filterSortConfigured) {
+            return finishFail(883, QStringLiteral("filter_sort_config_failed:%1").arg(configureError));
+        }
+
+        int filteredTab = -1;
+        QString filteredLabel;
+        int filteredRows = 0;
+        QStringList filteredRowsOut;
+        QString filteredNav;
+        QString filteredError;
+        const bool filteredDispatchOk = windowA.triggerStructuralQueryDispatchForTesting(sampleRoot,
+                                                                                          queryText,
+                                                                                          &filteredTab,
+                                                                                          &filteredLabel,
+                                                                                          &filteredRows,
+                                                                                          &filteredRowsOut,
+                                                                                          &filteredNav,
+                                                                                          &filteredError);
+        if (!filteredDispatchOk) {
+            return finishFail(884, QStringLiteral("filtered_dispatch_failed:%1").arg(filteredError));
+        }
+
+        QVector<StructuralResultRow> canonicalRows;
+        auto makeRefRow = [&](const QString& sourcePath, const QString& targetPath, const QString& rel, const QString& ts) {
+            StructuralResultRow row;
+            row.category = StructuralResultCategory::Reference;
+            row.primaryPath = targetPath;
+            row.secondaryPath = targetPath;
+            row.relationship = rel;
+            row.status = rel;
+            row.sourceFile = sourcePath;
+            row.symbol = QFileInfo(sourcePath).fileName();
+            row.timestamp = ts;
+            row.hasSnapshotId = true;
+            row.snapshotId = 2001;
+            row.hasSizeBytes = true;
+            row.sizeBytes = 32;
+            row.note = QStringLiteral("resolved");
+            return row;
+        };
+        canonicalRows.push_back(makeRefRow(mainPath, utilHeaderPath, QStringLiteral("include_ref"), QStringLiteral("2026-03-10T10:01:00Z")));
+        canonicalRows.push_back(makeRefRow(utilCppPath, utilHeaderPath, QStringLiteral("include_ref"), QStringLiteral("2026-03-10T10:02:00Z")));
+        canonicalRows.push_back(makeRefRow(serverPath, utilHeaderPath, QStringLiteral("include_ref"), QStringLiteral("2026-03-10T10:03:00Z")));
+
+        StructuralFilterState filterState;
+        filterState.extensions.insert(QStringLiteral(".h"));
+        QVector<StructuralResultRow> filteredCanonical = StructuralFilterEngine::apply(canonicalRows, filterState);
+        StructuralSortEngine::sortRows(&filteredCanonical,
+                                       StructuralSortField::Timestamp,
+                                       StructuralSortDirection::Descending);
+
+        bool orderingOk = true;
+        for (int i = 1; i < filteredCanonical.size(); ++i) {
+            if (QString::compare(filteredCanonical.at(i - 1).timestamp,
+                                 filteredCanonical.at(i).timestamp,
+                                 Qt::CaseInsensitive) < 0) {
+                orderingOk = false;
+                break;
+            }
+        }
+
+        StructuralGraphBuildOptions graphOptions;
+        graphOptions.mode = StructuralGraphMode::Dependency;
+        graphOptions.maxNodes = 100;
+        const StructuralGraphData graphData = StructuralGraphBuilder::build(filteredCanonical, graphOptions);
+
+        QVector<StructuralTimelineSnapshotRows> timelineSnapshots;
+        {
+            StructuralTimelineSnapshotRows a;
+            a.snapshotId = snapshotA > 0 ? snapshotA : 3001;
+            a.timestamp = QStringLiteral("2026-03-10T10:00:00Z");
+            a.rows = filteredCanonical;
+            timelineSnapshots.push_back(a);
+
+            StructuralTimelineSnapshotRows b;
+            b.snapshotId = snapshotB > 0 ? snapshotB : 3002;
+            b.timestamp = QStringLiteral("2026-03-10T10:05:00Z");
+            b.rows = filteredCanonical;
+            timelineSnapshots.push_back(b);
+        }
+        const QVector<StructuralTimelineEvent> timelineEvents = StructuralTimelineBuilder::build(timelineSnapshots);
+
+        if (!QDir().mkpath(certOutRoot)) {
+            return finishFail(885, QStringLiteral("cert_output_dir_create_failed"));
+        }
+        const QString exportJsonPath = QDir(certOutRoot).filePath(QStringLiteral("cert_export.json"));
+        QString exportError;
+        bool dotEdges = false;
+        const bool exportJsonOk = StructuralExportEngine::writeRowsToFile(filteredCanonical,
+                                                                           StructuralExportFormat::Json,
+                                                                           exportJsonPath,
+                                                                           &exportError,
+                                                                           nullptr);
+        const QString exportDotPath = QDir(certOutRoot).filePath(QStringLiteral("cert_export.dot"));
+        const bool exportDotOk = StructuralExportEngine::writeRowsToFile(filteredCanonical,
+                                                                          StructuralExportFormat::GraphViz,
+                                                                          exportDotPath,
+                                                                          &exportError,
+                                                                          &dotEdges);
+        if (!exportJsonOk || !exportDotOk) {
+            return finishFail(886, QStringLiteral("export_failed:%1").arg(exportError));
+        }
+
+        StructuralAutocompleteContext acContext;
+        acContext.currentTargetPath = mainPath;
+        acContext.knownPaths = {mainPath, utilCppPath, utilHeaderPath, serverPath};
+        acContext.snapshotTokens = {QString::number(snapshotA), QString::number(snapshotB)};
+        const QStringList acPrefix = StructuralQueryAutocomplete::buildSuggestions(QStringLiteral("his"), acContext);
+        const QStringList acRefPrefix = StructuralQueryAutocomplete::buildSuggestions(QStringLiteral("ref"), acContext);
+
+        const QString sessionPath = QDir(certOutRoot).filePath(QStringLiteral("cert_session_state.json"));
+        QString sessionSaveError;
+        if (!windowA.saveStructuralSessionForTesting(sessionPath, &sessionSaveError)) {
+            return finishFail(887, QStringLiteral("session_save_failed:%1").arg(sessionSaveError));
+        }
+
+        MainWindow windowB(true,
+                           normalizedRoot,
+                           QString(),
+                           QString(),
+                           options.historyDbPath,
+                           nullptr);
+        windowB.show();
+        cliApp.processEvents();
+        QString sessionRestoreError;
+        if (!windowB.restoreStructuralSessionForTesting(sessionPath, &sessionRestoreError)) {
+            return finishFail(888, QStringLiteral("session_restore_failed:%1").arg(sessionRestoreError));
+        }
+
+        int navTab = -1;
+        QString navLabel;
+        int navRows = 0;
+        QString navQuery;
+        int historySize = 0;
+        int historyIndex = -1;
+        QString navError;
+        const bool navRefreshOk = windowB.triggerStructuralRefreshForTesting(&navTab,
+                                                                              &navLabel,
+                                                                              &navRows,
+                                                                              &navQuery,
+                                                                              &historySize,
+                                                                              &historyIndex,
+                                                                              &navError);
+
+        int navTab2 = -1;
+        QString navLabel2;
+        int navRows2 = 0;
+        QString navQuery2;
+        int historySize2 = 0;
+        int historyIndex2 = -1;
+        QString navErr2;
+        windowB.triggerStructuralQueryDispatchForTesting(sampleRoot,
+                                                         QStringLiteral("snapshots:%1").arg(sampleRoot),
+                                                         &navTab2,
+                                                         &navLabel2,
+                                                         &navRows2,
+                                                         nullptr,
+                                                         nullptr,
+                                                         &navErr2);
+        int backTab = -1;
+        QString backLabel;
+        int backRows = 0;
+        QString backQuery;
+        int backHistorySize = 0;
+        int backHistoryIndex = -1;
+        QString backError;
+        const bool backOk = windowB.triggerStructuralBackForTesting(&backTab,
+                                                                     &backLabel,
+                                                                     &backRows,
+                                                                     &backQuery,
+                                                                     &backHistorySize,
+                                                                     &backHistoryIndex,
+                                                                     &backError);
+        int forwardTab = -1;
+        QString forwardLabel;
+        int forwardRows = 0;
+        QString forwardQuery;
+        int forwardHistorySize = 0;
+        int forwardHistoryIndex = -1;
+        QString forwardError;
+        const bool forwardOk = windowB.triggerStructuralForwardForTesting(&forwardTab,
+                                                                           &forwardLabel,
+                                                                           &forwardRows,
+                                                                           &forwardQuery,
+                                                                           &forwardHistorySize,
+                                                                           &forwardHistoryIndex,
+                                                                           &forwardError);
+
+        const bool canonicalRowsOk = queryRows > 0 && !queryRowsOut.isEmpty();
+        const bool filteringOk = filteredCanonical.size() > 0;
+        const bool sortingOk = orderingOk;
+        const bool graphOk = !graphData.nodes.isEmpty() && !graphData.edges.isEmpty();
+        const bool timelineOk = !timelineEvents.isEmpty();
+        const bool exportOk = QFileInfo::exists(exportJsonPath) && QFileInfo::exists(exportDotPath);
+        const bool autocompleteOk = acPrefix.contains(QStringLiteral("history:")) && acRefPrefix.contains(QStringLiteral("references:"));
+        const bool sessionOk = navRefreshOk && navRows > 0;
+        const bool navigationOk = backOk && forwardOk;
+
+        log.writeLine(QStringLiteral("query_rows=%1").arg(queryRows));
+        log.writeLine(QStringLiteral("filtered_canonical_rows=%1").arg(filteredCanonical.size()));
+        log.writeLine(QStringLiteral("graph_nodes=%1").arg(graphData.nodes.size()));
+        log.writeLine(QStringLiteral("graph_edges=%1").arg(graphData.edges.size()));
+        log.writeLine(QStringLiteral("timeline_events=%1").arg(timelineEvents.size()));
+        log.writeLine(QStringLiteral("export_json_path=%1").arg(QDir::toNativeSeparators(exportJsonPath)));
+        log.writeLine(QStringLiteral("export_dot_path=%1").arg(QDir::toNativeSeparators(exportDotPath)));
+        log.writeLine(QStringLiteral("dot_has_edges=%1").arg(dotEdges ? QStringLiteral("true") : QStringLiteral("false")));
+        log.writeLine(QStringLiteral("autocomplete_prefix_his=%1").arg(acPrefix.join(QStringLiteral(" | "))));
+        log.writeLine(QStringLiteral("autocomplete_prefix_ref=%1").arg(acRefPrefix.join(QStringLiteral(" | "))));
+        log.writeLine(QStringLiteral("session_refresh_rows=%1").arg(navRows));
+        log.writeLine(QStringLiteral("navigation_back_ok=%1").arg(backOk ? QStringLiteral("true") : QStringLiteral("false")));
+        log.writeLine(QStringLiteral("navigation_forward_ok=%1").arg(forwardOk ? QStringLiteral("true") : QStringLiteral("false")));
+
+        log.writeLine(QStringLiteral("gate_structural_queries_execute=%1").arg(queryDispatchOk ? QStringLiteral("PASS") : QStringLiteral("FAIL")));
+        log.writeLine(QStringLiteral("gate_canonical_rows_generated=%1").arg(canonicalRowsOk ? QStringLiteral("PASS") : QStringLiteral("FAIL")));
+        log.writeLine(QStringLiteral("gate_filtering_works=%1").arg(filteringOk ? QStringLiteral("PASS") : QStringLiteral("FAIL")));
+        log.writeLine(QStringLiteral("gate_sorting_works=%1").arg(sortingOk ? QStringLiteral("PASS") : QStringLiteral("FAIL")));
+        log.writeLine(QStringLiteral("gate_graph_view_works=%1").arg(graphOk ? QStringLiteral("PASS") : QStringLiteral("FAIL")));
+        log.writeLine(QStringLiteral("gate_timeline_view_works=%1").arg(timelineOk ? QStringLiteral("PASS") : QStringLiteral("FAIL")));
+        log.writeLine(QStringLiteral("gate_export_works=%1").arg(exportOk ? QStringLiteral("PASS") : QStringLiteral("FAIL")));
+        log.writeLine(QStringLiteral("gate_autocomplete_works=%1").arg(autocompleteOk ? QStringLiteral("PASS") : QStringLiteral("FAIL")));
+        log.writeLine(QStringLiteral("gate_session_restore_works=%1").arg(sessionOk ? QStringLiteral("PASS") : QStringLiteral("FAIL")));
+        log.writeLine(QStringLiteral("gate_navigation_stable=%1").arg(navigationOk ? QStringLiteral("PASS") : QStringLiteral("FAIL")));
+
+        const bool pass = queryDispatchOk
+            && canonicalRowsOk
+            && filteringOk
+            && sortingOk
+            && graphOk
+            && timelineOk
+            && exportOk
+            && autocompleteOk
+            && sessionOk
+            && navigationOk;
+
+        if (!pass) {
+            return finishFail(889, QStringLiteral("system_certification_gate_failed"));
+        }
+
+        log.writeLine(QStringLiteral("SYSTEM_CERTIFICATION_STATUS=PASS"));
+        log.writeLine(QStringLiteral("final_status=PASS"));
+        log.writeLine(QStringLiteral("exit_code=0"));
+        log.writeLine(QStringLiteral("failure_reason="));
+        log.writeLine(QStringLiteral("timestamp_utc_end=%1").arg(QDateTime::currentDateTimeUtc().toString(Qt::ISODate)));
+        std::_Exit(0);
+    } catch (const std::exception& ex) {
+        writeStderrLine(QStringLiteral("system_certification_smoke_error=unexpected_exception"));
+        return finishFail(890, QStringLiteral("unexpected_exception:%1").arg(QString::fromLocal8Bit(ex.what())));
+    } catch (...) {
+        writeStderrLine(QStringLiteral("system_certification_smoke_error=unexpected_error"));
+        return finishFail(891, QStringLiteral("unexpected_error"));
+    }
+}
+
 int runArchiveSmokeCli(int argc, char* argv[])
 {
     QCoreApplication cliApp(argc, argv);
@@ -10868,6 +11367,10 @@ int main(int argc, char* argv[])
 
     if (hasSessionRestoreSmokeFlag(argc, argv)) {
         return runSessionRestoreSmokeCli(argc, argv);
+    }
+
+    if (hasSystemCertificationSmokeFlag(argc, argv)) {
+        return runSystemCertificationSmokeCli(argc, argv);
     }
 
     if (hasSnapshotDiffSmokeFlag(argc, argv)) {
