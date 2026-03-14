@@ -51,6 +51,8 @@
         "src/core/archive/ArchiveProvider.cpp",
         "src/core/archive/ArchiveReader.cpp",
         "src/core/archive/ArchiveSnapshotAdapter.cpp",
+        "src/ui/model/StructuralResultRow.cpp",
+        "src/ui/model/StructuralResultAdapter.cpp",
         "src/util/PathUtils.cpp"
       ],
       "include_dirs": [

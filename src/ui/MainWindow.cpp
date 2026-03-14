@@ -68,6 +68,7 @@
 #include "core/snapshot/SnapshotRepository.h"
 #include "model/DirectoryModel.h"
 #include "model/QueryResultAdapter.h"
+#include "model/StructuralResultAdapter.h"
 #include "query/QueryBarWidget.h"
 #include "query/QueryController.h"
 #include "core/services/RefreshTypes.h"
@@ -1795,22 +1796,8 @@ bool MainWindow::renderSnapshotListForRoot(const QString& rootPath,
         return false;
     }
 
-    QVector<FileEntry> displayRows;
-    displayRows.reserve(snapshots.size());
-    for (const SnapshotRecord& snapshot : snapshots) {
-        FileEntry row;
-        row.name = QStringLiteral("snapshot_id=%1 name=%2 type=%3")
-                       .arg(snapshot.id)
-                       .arg(snapshot.snapshotName)
-                       .arg(snapshot.snapshotType);
-        row.isDir = false;
-        row.size = snapshot.itemCount >= 0 ? static_cast<quint64>(snapshot.itemCount) : 0;
-        row.modified = QDateTime::fromString(snapshot.createdUtc, Qt::ISODate);
-        row.absolutePath = QStringLiteral("%1#snapshot_%2")
-                               .arg(normalizedRoot)
-                               .arg(snapshot.id);
-        displayRows.push_back(row);
-    }
+    const QVector<StructuralResultRow> structuralRows = StructuralResultAdapter::fromSnapshotRows(snapshots);
+    const QVector<FileEntry> displayRows = StructuralResultAdapter::toFileEntries(structuralRows);
 
     m_fileModel.clear();
     m_viewMode = FileViewMode::Standard;
@@ -2010,26 +1997,8 @@ bool MainWindow::renderSnapshotDiffForRoot(const QString& rootPath,
         }
     }
 
-    QVector<FileEntry> displayRows;
-    displayRows.reserve(effectiveDiff.rows.size());
-    for (const SnapshotDiffRow& rowData : effectiveDiff.rows) {
-        FileEntry row;
-        row.name = QStringLiteral("status=%1 path=%2")
-                       .arg(SnapshotDiffTypesUtil::statusToString(rowData.status))
-                       .arg(rowData.path);
-        row.isDir = rowData.newIsDir || rowData.oldIsDir;
-        if (rowData.newHasSizeBytes) {
-            row.size = static_cast<quint64>(rowData.newSizeBytes);
-        } else if (rowData.oldHasSizeBytes) {
-            row.size = static_cast<quint64>(rowData.oldSizeBytes);
-        } else {
-            row.size = 0;
-        }
-        const QString modifiedUtc = !rowData.newModifiedUtc.isEmpty() ? rowData.newModifiedUtc : rowData.oldModifiedUtc;
-        row.modified = QDateTime::fromString(modifiedUtc, Qt::ISODate);
-        row.absolutePath = rowData.path;
-        displayRows.push_back(row);
-    }
+    const QVector<StructuralResultRow> structuralRows = StructuralResultAdapter::fromDiffRows(effectiveDiff.rows);
+    const QVector<FileEntry> displayRows = StructuralResultAdapter::toFileEntries(structuralRows);
 
     m_fileModel.clear();
     m_viewMode = FileViewMode::Standard;
@@ -2135,25 +2104,15 @@ bool MainWindow::loadHistoryRowsForPath(const QString& selectedFilePath,
     }
     writeTrace(QStringLiteral("load_history:after_getPathHistory rows=%1").arg(historyRows.size()));
 
-    QVector<FileEntry> displayRows;
-    displayRows.reserve(historyRows.size());
+    const QVector<StructuralResultRow> structuralRows = StructuralResultAdapter::fromHistoryRows(historyRows,
+                                                                                                  normalizedFilePath);
+    QVector<FileEntry> displayRows = StructuralResultAdapter::toFileEntries(structuralRows);
     writeTrace(QStringLiteral("load_history:before_display_transform"));
-    for (int i = 0; i < historyRows.size(); ++i) {
-        const HistoryEntry& history = historyRows.at(i);
-        writeTrace(QStringLiteral("load_history:row_transform_begin i=%1 snapshot_id=%2").arg(i).arg(history.snapshotId));
-        FileEntry row;
-        row.name = QStringLiteral("snapshot_id=%1 status=%2 modified_utc=%3")
-                       .arg(history.snapshotId)
-                       .arg(HistoryEntryUtil::statusToString(history.status))
-                       .arg(history.modifiedUtc.isEmpty() ? QStringLiteral("null") : history.modifiedUtc);
-        row.isDir = false;
-        row.size = history.hasSizeBytes ? static_cast<quint64>(history.sizeBytes) : 0;
-        row.modified = QDateTime::fromString(history.snapshotCreatedUtc, Qt::ISODate);
-        row.absolutePath = QStringLiteral("%1#snapshot_%2")
-                               .arg(normalizedFilePath)
-                               .arg(history.snapshotId);
-        displayRows.push_back(row);
-        writeTrace(QStringLiteral("load_history:row_transform_end i=%1").arg(i));
+    for (int i = 0; i < structuralRows.size(); ++i) {
+        writeTrace(QStringLiteral("load_history:row_transform i=%1 category=%2 status=%3")
+                       .arg(i)
+                       .arg(StructuralResultRowUtil::categoryToString(structuralRows.at(i).category))
+                       .arg(structuralRows.at(i).status));
     }
     writeTrace(QStringLiteral("load_history:after_display_transform rows=%1").arg(displayRows.size()));
 
@@ -2692,25 +2651,8 @@ bool MainWindow::loadStructuralReferenceView(QueryGraphMode mode,
         return false;
     }
 
-    QVector<FileEntry> displayRows;
-    displayRows.reserve(queryResult.rows.size());
-    for (const QueryRow& rowData : queryResult.rows) {
-        const QString relation = rowData.graphReferenceType.isEmpty() ? QStringLiteral("reference") : rowData.graphReferenceType;
-        const QString sourcePath = rowData.graphSourcePath.isEmpty() ? rowData.path : rowData.graphSourcePath;
-        const QString symbol = rowData.name.isEmpty() ? QFileInfo(rowData.path).fileName() : rowData.name;
-
-        FileEntry entry;
-        entry.name = QStringLiteral("path=%1 | symbol=%2 | relation=%3 | source=%4")
-                         .arg(rowData.path)
-                         .arg(symbol)
-                         .arg(relation)
-                         .arg(sourcePath);
-        entry.isDir = false;
-        entry.size = static_cast<quint64>(qMax(0, rowData.graphSourceLine));
-        entry.modified = QDateTime();
-        entry.absolutePath = rowData.path;
-        displayRows.push_back(entry);
-    }
+    const QVector<StructuralResultRow> structuralRows = StructuralResultAdapter::fromReferenceRows(queryResult.rows);
+    const QVector<FileEntry> displayRows = StructuralResultAdapter::toFileEntries(structuralRows);
 
     m_fileModel.clear();
     m_viewMode = FileViewMode::Standard;
