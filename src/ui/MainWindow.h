@@ -26,6 +26,7 @@
 #include "model/StructuralFilterState.h"
 #include "model/StructuralResultRow.h"
 #include "model/StructuralSortEngine.h"
+#include "timeline/StructuralTimelineBuilder.h"
 #include "core/query/QueryTypes.h"
 #include "core/services/RefreshTypes.h"
 
@@ -41,6 +42,7 @@ class DirectoryModel;
 class QueryBarWidget;
 class QueryController;
 class StructuralGraphWidget;
+class StructuralTimelineWidget;
 
 class MainWindow : public QMainWindow
 {
@@ -282,8 +284,11 @@ private:
     void updateStructuralFilterStateFromControls();
     void updateStructuralSortStateFromControls();
     void updateStructuralGraphFromCanonicalRows();
+    void updateStructuralTimelineFromCanonicalRows();
+    void setStructuralViewMode(int mode);
     void setStructuralGraphModeEnabled(bool enabled);
     void onStructuralGraphNodeActivated(const QString& absolutePath);
+    void onStructuralTimelineEventActivated(const QString& absolutePath);
     void updateStructuralFilterControlChoices(const QVector<StructuralResultRow>& canonicalRows);
     void applyStructuralFiltersToCurrentRows(const QString& statusPrefix = QString());
     void clearStructuralFilters(bool applyNow = true);
@@ -425,9 +430,12 @@ private:
     QPushButton* m_structuralSortDirectionButton = nullptr;
     QPushButton* m_structuralTableViewButton = nullptr;
     QPushButton* m_structuralGraphViewButton = nullptr;
+    QPushButton* m_structuralTimelineViewButton = nullptr;
     QComboBox* m_structuralGraphModeCombo = nullptr;
     QLabel* m_structuralGraphStatusLabel = nullptr;
     StructuralGraphWidget* m_structuralGraphWidget = nullptr;
+    QLabel* m_structuralTimelineStatusLabel = nullptr;
+    StructuralTimelineWidget* m_structuralTimelineWidget = nullptr;
     QComboBox* m_structuralOldSnapshotCombo = nullptr;
     QComboBox* m_structuralNewSnapshotCombo = nullptr;
     QString m_structuralRootPath;
@@ -441,5 +449,7 @@ private:
     StructuralSortDirection m_structuralSortDirection = StructuralSortDirection::Ascending;
     StructuralGraphMode m_structuralGraphMode = StructuralGraphMode::Dependency;
     bool m_structuralGraphModeEnabled = false;
+    QVector<StructuralTimelineEvent> m_structuralTimelineEvents;
+    int m_structuralViewMode = 0;
     StructuralPanelState m_structuralPanelState;
 };

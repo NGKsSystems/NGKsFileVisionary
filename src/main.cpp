@@ -56,6 +56,8 @@
 #include "ui/MainWindow.h"
 #include "ui/graph/StructuralGraphBuilder.h"
 #include "ui/graph/StructuralGraphWidget.h"
+#include "ui/timeline/StructuralTimelineBuilder.h"
+#include "ui/timeline/StructuralTimelineWidget.h"
 #include "ui/model/DirectoryModel.h"
 #include "ui/model/QueryResultAdapter.h"
 #include "ui/model/StructuralFilterEngine.h"
@@ -203,6 +205,15 @@ struct GraphVisualSmokeCliOptions {
     QString historyDbPath;
     QString historyRoot;
     QString graphLogPath;
+    QStringList argsReceived;
+    QString parseError;
+};
+
+struct TimelineSmokeCliOptions {
+    bool enabled = false;
+    QString historyDbPath;
+    QString historyRoot;
+    QString timelineLogPath;
     QStringList argsReceived;
     QString parseError;
 };
@@ -478,6 +489,16 @@ bool hasGraphVisualSmokeFlag(int argc, char* argv[])
 {
     for (int i = 1; i < argc; ++i) {
         if (QString::fromLocal8Bit(argv[i]) == QStringLiteral("--graph-visual-smoke")) {
+            return true;
+        }
+    }
+    return false;
+}
+
+bool hasTimelineSmokeFlag(int argc, char* argv[])
+{
+    for (int i = 1; i < argc; ++i) {
+        if (QString::fromLocal8Bit(argv[i]) == QStringLiteral("--timeline-smoke")) {
             return true;
         }
     }
@@ -1379,6 +1400,59 @@ GraphVisualSmokeCliOptions parseGraphVisualSmokeOptions(int argc, char* argv[])
                 break;
             }
             options.graphLogPath = QDir::cleanPath(options.graphLogPath);
+            continue;
+        }
+    }
+
+    return options;
+}
+
+TimelineSmokeCliOptions parseTimelineSmokeOptions(int argc, char* argv[])
+{
+    TimelineSmokeCliOptions options;
+
+    for (int i = 0; i < argc; ++i) {
+        options.argsReceived << QString::fromLocal8Bit(argv[i]);
+    }
+
+    for (int i = 1; i < argc; ++i) {
+        const QString token = QString::fromLocal8Bit(argv[i]);
+        if (token == QStringLiteral("--timeline-smoke")) {
+            options.enabled = true;
+            continue;
+        }
+
+        auto consumeValue = [&](QString* out) {
+            if ((i + 1) >= argc) {
+                options.parseError = QStringLiteral("missing_value_for_%1").arg(token);
+                return false;
+            }
+            ++i;
+            *out = QString::fromLocal8Bit(argv[i]);
+            return true;
+        };
+
+        if (token == QStringLiteral("--history-db-path")) {
+            if (!consumeValue(&options.historyDbPath)) {
+                break;
+            }
+            options.historyDbPath = QDir::cleanPath(options.historyDbPath);
+            continue;
+        }
+
+        if (token == QStringLiteral("--history-root")) {
+            if (!consumeValue(&options.historyRoot)) {
+                break;
+            }
+            options.historyRoot = QDir::cleanPath(options.historyRoot);
+            continue;
+        }
+
+        if (token == QStringLiteral("--timeline-log")) {
+            if (!consumeValue(&options.timelineLogPath)) {
+                break;
+            }
+            options.timelineLogPath = QDir::cleanPath(options.timelineLogPath);
             continue;
         }
     }
@@ -5666,6 +5740,276 @@ int runGraphVisualSmokeCli(int argc, char* argv[])
     }
 }
 
+int runTimelineSmokeCli(int argc, char* argv[])
+{
+    QApplication cliApp(argc, argv);
+
+    const TimelineSmokeCliOptions options = parseTimelineSmokeOptions(argc, argv);
+    const QString exePath = QFileInfo(QString::fromLocal8Bit(argv[0])).absoluteFilePath();
+    const QString cwd = QDir::currentPath();
+
+    if (!options.parseError.isEmpty()) {
+        writeStderrLine(QStringLiteral("timeline_smoke_parse_error=%1").arg(options.parseError));
+        return 811;
+    }
+    if (options.timelineLogPath.trimmed().isEmpty()) {
+        writeStderrLine(QStringLiteral("timeline_smoke_error=missing_required_arg_--timeline-log"));
+        return 812;
+    }
+
+    IndexSmokeLogWriter log;
+    QString logOpenError;
+    if (!log.open(options.timelineLogPath, &logOpenError)) {
+        writeStderrLine(QStringLiteral("timeline_smoke_error=log_open_failed"));
+        writeStderrLine(QStringLiteral("timeline_smoke_log_path=%1").arg(QDir::toNativeSeparators(options.timelineLogPath)));
+        writeStderrLine(QStringLiteral("timeline_smoke_log_error=%1").arg(logOpenError));
+        return 813;
+    }
+
+    auto finishFail = [&](int exitCode, const QString& reason) {
+        log.writeLine(QStringLiteral("final_status=FAIL"));
+        log.writeLine(QStringLiteral("exit_code=%1").arg(exitCode));
+        log.writeLine(QStringLiteral("failure_reason=%1").arg(reason));
+        log.writeLine(QStringLiteral("timestamp_utc_end=%1").arg(QDateTime::currentDateTimeUtc().toString(Qt::ISODate)));
+        return exitCode;
+    };
+
+    auto writeTextFile = [](const QString& filePath, const QString& content, QString* errorText) {
+        const QFileInfo info(filePath);
+        if (!QDir().mkpath(info.absolutePath())) {
+            if (errorText) {
+                *errorText = QStringLiteral("create_parent_dir_failed:%1").arg(info.absolutePath());
+            }
+            return false;
+        }
+
+        QFile out(filePath);
+        if (!out.open(QIODevice::WriteOnly | QIODevice::Text | QIODevice::Truncate)) {
+            if (errorText) {
+                *errorText = QStringLiteral("open_write_failed:%1").arg(out.errorString());
+            }
+            return false;
+        }
+
+        QTextStream ts(&out);
+        ts << content;
+        ts.flush();
+        out.close();
+        return true;
+    };
+
+    try {
+        if (options.historyDbPath.trimmed().isEmpty()) {
+            return finishFail(814, QStringLiteral("missing_required_arg_--history-db-path"));
+        }
+        if (options.historyRoot.trimmed().isEmpty()) {
+            return finishFail(815, QStringLiteral("missing_required_arg_--history-root"));
+        }
+
+        const QString normalizedRoot = QDir::fromNativeSeparators(
+            QDir::cleanPath(QFileInfo(options.historyRoot).absoluteFilePath()));
+        const QString sampleRoot = QDir(normalizedRoot).filePath(QStringLiteral("sample_timeline_root"));
+
+        log.writeLine(QStringLiteral("mode=timeline_smoke"));
+        log.writeLine(QStringLiteral("startup_banner=TIMELINE_SMOKE_BEGIN"));
+        log.writeLine(QStringLiteral("exe_path=%1").arg(QDir::toNativeSeparators(exePath)));
+        log.writeLine(QStringLiteral("cwd=%1").arg(QDir::toNativeSeparators(cwd)));
+        log.writeLine(QStringLiteral("args_received=%1").arg(options.argsReceived.join(QStringLiteral(" | "))));
+        log.writeLine(QStringLiteral("history_db_path=%1").arg(QDir::toNativeSeparators(options.historyDbPath)));
+        log.writeLine(QStringLiteral("history_root=%1").arg(QDir::toNativeSeparators(normalizedRoot)));
+        log.writeLine(QStringLiteral("sample_root=%1").arg(QDir::toNativeSeparators(sampleRoot)));
+        log.writeLine(QStringLiteral("timestamp_utc=%1").arg(QDateTime::currentDateTimeUtc().toString(Qt::ISODate)));
+
+        QDir sampleDir(sampleRoot);
+        if (sampleDir.exists() && !sampleDir.removeRecursively()) {
+            return finishFail(816, QStringLiteral("sample_root_cleanup_failed"));
+        }
+        if (!QDir().mkpath(QDir(sampleRoot).filePath(QStringLiteral("src/network")))) {
+            return finishFail(817, QStringLiteral("sample_root_create_failed"));
+        }
+
+        QString writeError;
+        if (!writeTextFile(QDir(sampleRoot).filePath(QStringLiteral("src/main.cpp")),
+                           QStringLiteral("#include \"util.h\"\nint main(){ return util(); }\n"),
+                           &writeError)
+            || !writeTextFile(QDir(sampleRoot).filePath(QStringLiteral("src/util.h")),
+                              QStringLiteral("#pragma once\nint util();\n"),
+                              &writeError)
+            || !writeTextFile(QDir(sampleRoot).filePath(QStringLiteral("src/network/server.cpp")),
+                              QStringLiteral("#include \"../util.h\"\nint server(){ return util(); }\n"),
+                              &writeError)) {
+            return finishFail(818, QStringLiteral("sample_seed_failed:%1").arg(writeError));
+        }
+
+        const QString mainPath = QDir::fromNativeSeparators(QDir::cleanPath(QDir(sampleRoot).filePath(QStringLiteral("src/main.cpp"))));
+        const QString serverPath = QDir::fromNativeSeparators(QDir::cleanPath(QDir(sampleRoot).filePath(QStringLiteral("src/network/server.cpp"))));
+        const QString utilHeaderPath = QDir::fromNativeSeparators(QDir::cleanPath(QDir(sampleRoot).filePath(QStringLiteral("src/util.h"))));
+
+        auto makeRefRow = [&](qint64 snapshotId, const QString& timestamp, const QString& sourcePath) {
+            StructuralResultRow row;
+            row.category = StructuralResultCategory::Reference;
+            row.hasSnapshotId = true;
+            row.snapshotId = snapshotId;
+            row.timestamp = timestamp;
+            row.primaryPath = sourcePath;
+            row.sourceFile = sourcePath;
+            row.secondaryPath = utilHeaderPath;
+            row.relationship = QStringLiteral("include_ref");
+            row.status = QStringLiteral("include_ref");
+            row.symbol = QFileInfo(sourcePath).fileName();
+            row.note = QStringLiteral("resolved");
+            return row;
+        };
+
+        StructuralTimelineSnapshotRows snapshot1;
+        snapshot1.snapshotId = 1001;
+        snapshot1.timestamp = QStringLiteral("2026-03-10T10:00:00Z");
+        snapshot1.rows.push_back(makeRefRow(snapshot1.snapshotId, snapshot1.timestamp, mainPath));
+
+        StructuralTimelineSnapshotRows snapshot2;
+        snapshot2.snapshotId = 1002;
+        snapshot2.timestamp = QStringLiteral("2026-03-10T10:05:00Z");
+        snapshot2.rows.push_back(makeRefRow(snapshot2.snapshotId, snapshot2.timestamp, mainPath));
+        snapshot2.rows.push_back(makeRefRow(snapshot2.snapshotId, snapshot2.timestamp, serverPath));
+
+        StructuralTimelineSnapshotRows snapshot3;
+        snapshot3.snapshotId = 1003;
+        snapshot3.timestamp = QStringLiteral("2026-03-10T10:10:00Z");
+        snapshot3.rows.push_back(makeRefRow(snapshot3.snapshotId, snapshot3.timestamp, serverPath));
+
+        QVector<StructuralTimelineSnapshotRows> snapshots = {snapshot1, snapshot2, snapshot3};
+
+        log.writeLine(QStringLiteral("snapshot_inputs_begin"));
+        for (const StructuralTimelineSnapshotRows& snapshot : snapshots) {
+            log.writeLine(QStringLiteral("snapshot id=%1 timestamp=%2 rows=%3")
+                              .arg(snapshot.snapshotId)
+                              .arg(snapshot.timestamp)
+                              .arg(snapshot.rows.size()));
+        }
+        log.writeLine(QStringLiteral("snapshot_inputs_end"));
+
+        log.writeLine(QStringLiteral("structural_rows_begin"));
+        for (const StructuralTimelineSnapshotRows& snapshot : snapshots) {
+            for (const StructuralResultRow& row : snapshot.rows) {
+                log.writeLine(QStringLiteral("row snapshot=%1 source=%2 rel=%3 target=%4")
+                                  .arg(snapshot.snapshotId)
+                                  .arg(row.sourceFile)
+                                  .arg(row.relationship)
+                                  .arg(row.secondaryPath));
+            }
+        }
+        log.writeLine(QStringLiteral("structural_rows_end"));
+
+        QVector<StructuralTimelineEvent> events = StructuralTimelineBuilder::build(snapshots);
+        QVector<StructuralTimelineEvent> eventsRepeat = StructuralTimelineBuilder::build(snapshots);
+
+        log.writeLine(QStringLiteral("timeline_events_begin"));
+        for (const StructuralTimelineEvent& event : events) {
+            log.writeLine(QStringLiteral("event snapshot=%1 timestamp=%2 type=%3 file=%4 rel=%5 target=%6")
+                              .arg(event.snapshotId)
+                              .arg(event.timestamp)
+                              .arg(StructuralTimelineEventUtil::changeTypeToString(event.changeType))
+                              .arg(event.filePath)
+                              .arg(event.relationshipType)
+                              .arg(event.targetPath));
+        }
+        log.writeLine(QStringLiteral("timeline_events_end"));
+
+        StructuralTimelineWidget widget;
+        widget.setTimelineEvents(events);
+        widget.show();
+        cliApp.processEvents();
+
+        QString navigatedPath;
+        QObject::connect(&widget,
+                         &StructuralTimelineWidget::eventActivated,
+                         [&navigatedPath](const QString& path) {
+                             navigatedPath = path;
+                         });
+
+        const bool navSignal = widget.emitEventActivatedForTesting(serverPath,
+                                                                   QStringLiteral("include_ref"),
+                                                                   utilHeaderPath);
+        cliApp.processEvents();
+
+        QStringList orderLines;
+        orderLines.reserve(events.size());
+        for (const StructuralTimelineEvent& event : events) {
+            orderLines.push_back(QStringLiteral("%1|%2|%3|%4|%5")
+                                     .arg(event.snapshotId)
+                                     .arg(event.timestamp)
+                                     .arg(StructuralTimelineEventUtil::changeTypeToString(event.changeType))
+                                     .arg(event.filePath)
+                                     .arg(event.targetPath));
+        }
+        for (const QString& line : orderLines) {
+            log.writeLine(QStringLiteral("order_line=%1").arg(line));
+        }
+
+        int addedCount = 0;
+        int removedCount = 0;
+        for (const StructuralTimelineEvent& event : events) {
+            if (event.changeType == StructuralTimelineChangeType::Added
+                && event.filePath == serverPath
+                && event.targetPath == utilHeaderPath) {
+                ++addedCount;
+            }
+            if (event.changeType == StructuralTimelineChangeType::Removed
+                && event.filePath == mainPath
+                && event.targetPath == utilHeaderPath) {
+                ++removedCount;
+            }
+        }
+
+        bool deterministicOrder = (events.size() == eventsRepeat.size());
+        if (deterministicOrder) {
+            for (int i = 0; i < events.size(); ++i) {
+                const StructuralTimelineEvent& a = events.at(i);
+                const StructuralTimelineEvent& b = eventsRepeat.at(i);
+                if (a.snapshotId != b.snapshotId
+                    || a.timestamp != b.timestamp
+                    || a.filePath != b.filePath
+                    || a.relationshipType != b.relationshipType
+                    || a.targetPath != b.targetPath
+                    || a.changeType != b.changeType) {
+                    deterministicOrder = false;
+                    break;
+                }
+            }
+        }
+
+        const bool builderExists = true;
+        const bool eventsGenerated = !events.isEmpty() && (addedCount >= 1) && (removedCount >= 1);
+        const bool orderOk = deterministicOrder;
+        const bool widgetLoads = !widget.eventLinesForTesting().isEmpty();
+        const bool navigationOk = navSignal && (navigatedPath == serverPath);
+
+        log.writeLine(QStringLiteral("selected_event_path=%1").arg(navigatedPath));
+        log.writeLine(QStringLiteral("gate_timeline_builder_exists=%1").arg(builderExists ? QStringLiteral("PASS") : QStringLiteral("FAIL")));
+        log.writeLine(QStringLiteral("gate_timeline_events_generated=%1").arg(eventsGenerated ? QStringLiteral("PASS") : QStringLiteral("FAIL")));
+        log.writeLine(QStringLiteral("gate_timeline_ordering_deterministic=%1").arg(orderOk ? QStringLiteral("PASS") : QStringLiteral("FAIL")));
+        log.writeLine(QStringLiteral("gate_timeline_widget_loads=%1").arg(widgetLoads ? QStringLiteral("PASS") : QStringLiteral("FAIL")));
+        log.writeLine(QStringLiteral("gate_timeline_event_navigation=%1").arg(navigationOk ? QStringLiteral("PASS") : QStringLiteral("FAIL")));
+
+        const bool pass = builderExists && eventsGenerated && orderOk && widgetLoads && navigationOk;
+        if (!pass) {
+            return finishFail(819, QStringLiteral("timeline_gate_failed"));
+        }
+
+        log.writeLine(QStringLiteral("final_status=PASS"));
+        log.writeLine(QStringLiteral("exit_code=0"));
+        log.writeLine(QStringLiteral("failure_reason="));
+        log.writeLine(QStringLiteral("timestamp_utc_end=%1").arg(QDateTime::currentDateTimeUtc().toString(Qt::ISODate)));
+        std::_Exit(0);
+    } catch (const std::exception& ex) {
+        writeStderrLine(QStringLiteral("timeline_smoke_error=unexpected_exception"));
+        return finishFail(820, QStringLiteral("unexpected_exception:%1").arg(QString::fromLocal8Bit(ex.what())));
+    } catch (...) {
+        writeStderrLine(QStringLiteral("timeline_smoke_error=unexpected_error"));
+        return finishFail(821, QStringLiteral("unexpected_error"));
+    }
+}
+
 int runArchiveSmokeCli(int argc, char* argv[])
 {
     QCoreApplication cliApp(argc, argv);
@@ -9364,6 +9708,10 @@ int main(int argc, char* argv[])
 
     if (hasGraphVisualSmokeFlag(argc, argv)) {
         return runGraphVisualSmokeCli(argc, argv);
+    }
+
+    if (hasTimelineSmokeFlag(argc, argv)) {
+        return runTimelineSmokeCli(argc, argv);
     }
 
     if (hasSnapshotDiffSmokeFlag(argc, argv)) {

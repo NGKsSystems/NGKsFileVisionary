@@ -60,6 +60,7 @@
 #include "TreeSnapshotDialog.h"
 #include "TreeSnapshotPreviewDialog.h"
 #include "graph/StructuralGraphWidget.h"
+#include "timeline/StructuralTimelineWidget.h"
 #include "core/history/HistoryEntry.h"
 #include "core/history/HistoryViewEngine.h"
 #include "core/db/MetaStore.h"
@@ -441,14 +442,17 @@ void MainWindow::setupStructuralPanel()
     QLabel* viewModeLabel = new QLabel(QStringLiteral("View Mode:"), panelRoot);
     m_structuralTableViewButton = new QPushButton(QStringLiteral("Table"), panelRoot);
     m_structuralGraphViewButton = new QPushButton(QStringLiteral("Graph"), panelRoot);
+    m_structuralTimelineViewButton = new QPushButton(QStringLiteral("Timeline"), panelRoot);
     m_structuralGraphModeCombo = new QComboBox(panelRoot);
     m_structuralTableViewButton->setCheckable(true);
     m_structuralGraphViewButton->setCheckable(true);
+    m_structuralTimelineViewButton->setCheckable(true);
     m_structuralGraphModeCombo->addItem(QStringLiteral("Dependency Graph"), static_cast<int>(StructuralGraphMode::Dependency));
     m_structuralGraphModeCombo->addItem(QStringLiteral("Reverse Dependency Graph"), static_cast<int>(StructuralGraphMode::ReverseDependency));
     viewModeLayout->addWidget(viewModeLabel);
     viewModeLayout->addWidget(m_structuralTableViewButton);
     viewModeLayout->addWidget(m_structuralGraphViewButton);
+    viewModeLayout->addWidget(m_structuralTimelineViewButton);
     viewModeLayout->addWidget(m_structuralGraphModeCombo);
     viewModeLayout->addStretch(1);
     panelLayout->addLayout(viewModeLayout);
@@ -559,6 +563,13 @@ void MainWindow::setupStructuralPanel()
     m_structuralGraphWidget->setObjectName(QStringLiteral("structuralGraphWidget"));
     panelLayout->addWidget(m_structuralGraphWidget, 1);
 
+    m_structuralTimelineStatusLabel = new QLabel(QStringLiteral("Timeline view idle"), panelRoot);
+    panelLayout->addWidget(m_structuralTimelineStatusLabel);
+
+    m_structuralTimelineWidget = new StructuralTimelineWidget(panelRoot);
+    m_structuralTimelineWidget->setObjectName(QStringLiteral("structuralTimelineWidget"));
+    panelLayout->addWidget(m_structuralTimelineWidget, 1);
+
     m_structuralPanelDock->setWidget(panelRoot);
     addDockWidget(Qt::BottomDockWidgetArea, m_structuralPanelDock);
     m_structuralPanelDock->hide();
@@ -570,10 +581,13 @@ void MainWindow::setupStructuralPanel()
     connect(m_structuralShowUsedByButton, &QPushButton::clicked, this, &MainWindow::onStructuralShowUsedBy);
     connect(m_structuralTabWidget, &QTabWidget::currentChanged, this, &MainWindow::onStructuralPanelTabChanged);
     connect(m_structuralTableViewButton, &QPushButton::clicked, this, [this]() {
-        setStructuralGraphModeEnabled(false);
+        setStructuralViewMode(0);
     });
     connect(m_structuralGraphViewButton, &QPushButton::clicked, this, [this]() {
-        setStructuralGraphModeEnabled(true);
+        setStructuralViewMode(1);
+    });
+    connect(m_structuralTimelineViewButton, &QPushButton::clicked, this, [this]() {
+        setStructuralViewMode(2);
     });
     connect(m_structuralGraphModeCombo,
             &QComboBox::currentIndexChanged,
@@ -590,6 +604,7 @@ void MainWindow::setupStructuralPanel()
                 updateStructuralGraphFromCanonicalRows();
             });
     connect(m_structuralGraphWidget, &StructuralGraphWidget::nodeActivated, this, &MainWindow::onStructuralGraphNodeActivated);
+    connect(m_structuralTimelineWidget, &StructuralTimelineWidget::eventActivated, this, &MainWindow::onStructuralTimelineEventActivated);
     connect(m_structuralBackButton, &QPushButton::clicked, this, [this]() {
         QString errorText;
         if (!navigateStructuralBack(&errorText, nullptr, nullptr) && m_statusLabel && !errorText.isEmpty()) {
@@ -636,8 +651,9 @@ void MainWindow::setupStructuralPanel()
     });
 
     clearStructuralFilters(false);
-    setStructuralGraphModeEnabled(false);
+    setStructuralViewMode(0);
     updateStructuralGraphFromCanonicalRows();
+    updateStructuralTimelineFromCanonicalRows();
     updateStructuralNavigationButtons();
 }
 
@@ -2841,27 +2857,43 @@ void MainWindow::updateStructuralSortStateFromControls()
 
 void MainWindow::setStructuralGraphModeEnabled(bool enabled)
 {
-    m_structuralGraphModeEnabled = enabled;
+    setStructuralViewMode(enabled ? 1 : 0);
+}
+
+void MainWindow::setStructuralViewMode(int mode)
+{
+    m_structuralViewMode = mode;
+    m_structuralGraphModeEnabled = (mode == 1);
 
     if (m_structuralTableViewButton) {
         QSignalBlocker blocker(m_structuralTableViewButton);
-        m_structuralTableViewButton->setChecked(!enabled);
+        m_structuralTableViewButton->setChecked(mode == 0);
     }
     if (m_structuralGraphViewButton) {
         QSignalBlocker blocker(m_structuralGraphViewButton);
-        m_structuralGraphViewButton->setChecked(enabled);
+        m_structuralGraphViewButton->setChecked(mode == 1);
     }
+    if (m_structuralTimelineViewButton) {
+        QSignalBlocker blocker(m_structuralTimelineViewButton);
+        m_structuralTimelineViewButton->setChecked(mode == 2);
+    }
+
     if (m_structuralTabWidget) {
-        m_structuralTabWidget->setVisible(!enabled);
+        m_structuralTabWidget->setVisible(mode == 0);
     }
     if (m_structuralGraphWidget) {
-        m_structuralGraphWidget->setVisible(enabled);
+        m_structuralGraphWidget->setVisible(mode == 1);
+    }
+    if (m_structuralTimelineWidget) {
+        m_structuralTimelineWidget->setVisible(mode == 2);
     }
 
     if (m_structuralGraphStatusLabel) {
-        const QString modeLabel = enabled ? QStringLiteral("graph") : QStringLiteral("table");
+        const QString modeLabel = (mode == 0)
+            ? QStringLiteral("table")
+            : ((mode == 1) ? QStringLiteral("graph") : QStringLiteral("timeline"));
         m_structuralGraphStatusLabel->setText(
-            QStringLiteral("Structural graph mode=%1 nodes=%2 edges=%3")
+            QStringLiteral("Structural mode=%1 graph_nodes=%2 graph_edges=%3")
                 .arg(modeLabel)
                 .arg(m_structuralGraphWidget ? m_structuralGraphWidget->nodePathsForTesting().size() : 0)
                 .arg(m_structuralGraphWidget ? m_structuralGraphWidget->edgeKeysForTesting().size() : 0));
@@ -2892,6 +2924,54 @@ void MainWindow::updateStructuralGraphFromCanonicalRows()
     }
 }
 
+void MainWindow::updateStructuralTimelineFromCanonicalRows()
+{
+    if (!m_structuralTimelineWidget) {
+        return;
+    }
+
+    QHash<qint64, StructuralTimelineSnapshotRows> snapshotBuckets;
+    QVector<qint64> snapshotIds;
+
+    for (const StructuralResultRow& row : m_structuralCanonicalRows) {
+        if (!row.hasSnapshotId || row.snapshotId <= 0) {
+            continue;
+        }
+
+        if (!snapshotBuckets.contains(row.snapshotId)) {
+            StructuralTimelineSnapshotRows bucket;
+            bucket.snapshotId = row.snapshotId;
+            bucket.timestamp = row.timestamp;
+            snapshotBuckets.insert(row.snapshotId, bucket);
+            snapshotIds.push_back(row.snapshotId);
+        }
+
+        StructuralTimelineSnapshotRows& bucket = snapshotBuckets[row.snapshotId];
+        if (bucket.timestamp.trimmed().isEmpty() && !row.timestamp.trimmed().isEmpty()) {
+            bucket.timestamp = row.timestamp;
+        }
+        bucket.rows.push_back(row);
+    }
+
+    std::sort(snapshotIds.begin(), snapshotIds.end());
+
+    QVector<StructuralTimelineSnapshotRows> orderedSnapshots;
+    orderedSnapshots.reserve(snapshotIds.size());
+    for (qint64 snapshotId : snapshotIds) {
+        orderedSnapshots.push_back(snapshotBuckets.value(snapshotId));
+    }
+
+    m_structuralTimelineEvents = StructuralTimelineBuilder::build(orderedSnapshots);
+    m_structuralTimelineWidget->setTimelineEvents(m_structuralTimelineEvents);
+
+    if (m_structuralTimelineStatusLabel) {
+        m_structuralTimelineStatusLabel->setText(
+            QStringLiteral("Timeline snapshots=%1 events=%2 source=canonical")
+                .arg(orderedSnapshots.size())
+                .arg(m_structuralTimelineEvents.size()));
+    }
+}
+
 void MainWindow::onStructuralGraphNodeActivated(const QString& absolutePath)
 {
     const QString candidate = QDir::fromNativeSeparators(QDir::cleanPath(absolutePath));
@@ -2916,6 +2996,33 @@ void MainWindow::onStructuralGraphNodeActivated(const QString& absolutePath)
 
     if (m_statusLabel) {
         m_statusLabel->setText(QStringLiteral("Graph node selection skipped (not navigable): %1").arg(candidate));
+    }
+}
+
+void MainWindow::onStructuralTimelineEventActivated(const QString& absolutePath)
+{
+    const QString candidate = QDir::fromNativeSeparators(QDir::cleanPath(absolutePath));
+    const QFileInfo info(candidate);
+    QString destination = candidate;
+    if (!info.isDir()) {
+        destination = info.absolutePath();
+    }
+
+    if (!destination.isEmpty() && isNavigablePath(destination)) {
+        navigateToDirectory(destination);
+        m_structuralTargetPath = candidate;
+        updateStructuralPanelContextLabel();
+        if (m_statusLabel) {
+            m_statusLabel->setText(QStringLiteral("Timeline event selected: %1").arg(candidate));
+        }
+        appendRuntimeLog(QStringLiteral("StructuralTimeline event_selected path=%1 destination=%2")
+                             .arg(candidate)
+                             .arg(destination));
+        return;
+    }
+
+    if (m_statusLabel) {
+        m_statusLabel->setText(QStringLiteral("Timeline event selection skipped (not navigable): %1").arg(candidate));
     }
 }
 
@@ -3021,6 +3128,7 @@ void MainWindow::applyStructuralFiltersToCurrentRows(const QString& statusPrefix
     }
 
     updateStructuralGraphFromCanonicalRows();
+    updateStructuralTimelineFromCanonicalRows();
 }
 
 void MainWindow::clearStructuralFilters(bool applyNow)
@@ -3102,6 +3210,7 @@ void MainWindow::setStructuralCanonicalRows(const QVector<StructuralResultRow>& 
     updateStructuralFilterStateFromControls();
     updateStructuralSortStateFromControls();
     updateStructuralGraphFromCanonicalRows();
+    updateStructuralTimelineFromCanonicalRows();
     applyStructuralFiltersToCurrentRows(statusPrefix);
 }
 
