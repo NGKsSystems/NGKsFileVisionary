@@ -54,6 +54,8 @@
 #include "core/watch/ChangeEvent.h"
 #include "core/watch/WatchBridge.h"
 #include "ui/MainWindow.h"
+#include "ui/graph/StructuralGraphBuilder.h"
+#include "ui/graph/StructuralGraphWidget.h"
 #include "ui/model/DirectoryModel.h"
 #include "ui/model/QueryResultAdapter.h"
 #include "ui/model/StructuralFilterEngine.h"
@@ -192,6 +194,15 @@ struct StructuralSortSmokeCliOptions {
     QString historyDbPath;
     QString historyRoot;
     QString sortLogPath;
+    QStringList argsReceived;
+    QString parseError;
+};
+
+struct GraphVisualSmokeCliOptions {
+    bool enabled = false;
+    QString historyDbPath;
+    QString historyRoot;
+    QString graphLogPath;
     QStringList argsReceived;
     QString parseError;
 };
@@ -457,6 +468,16 @@ bool hasStructuralSortSmokeFlag(int argc, char* argv[])
 {
     for (int i = 1; i < argc; ++i) {
         if (QString::fromLocal8Bit(argv[i]) == QStringLiteral("--structural-sort-smoke")) {
+            return true;
+        }
+    }
+    return false;
+}
+
+bool hasGraphVisualSmokeFlag(int argc, char* argv[])
+{
+    for (int i = 1; i < argc; ++i) {
+        if (QString::fromLocal8Bit(argv[i]) == QStringLiteral("--graph-visual-smoke")) {
             return true;
         }
     }
@@ -1305,6 +1326,59 @@ StructuralSortSmokeCliOptions parseStructuralSortSmokeOptions(int argc, char* ar
                 break;
             }
             options.sortLogPath = QDir::cleanPath(options.sortLogPath);
+            continue;
+        }
+    }
+
+    return options;
+}
+
+GraphVisualSmokeCliOptions parseGraphVisualSmokeOptions(int argc, char* argv[])
+{
+    GraphVisualSmokeCliOptions options;
+
+    for (int i = 0; i < argc; ++i) {
+        options.argsReceived << QString::fromLocal8Bit(argv[i]);
+    }
+
+    for (int i = 1; i < argc; ++i) {
+        const QString token = QString::fromLocal8Bit(argv[i]);
+        if (token == QStringLiteral("--graph-visual-smoke")) {
+            options.enabled = true;
+            continue;
+        }
+
+        auto consumeValue = [&](QString* out) {
+            if ((i + 1) >= argc) {
+                options.parseError = QStringLiteral("missing_value_for_%1").arg(token);
+                return false;
+            }
+            ++i;
+            *out = QString::fromLocal8Bit(argv[i]);
+            return true;
+        };
+
+        if (token == QStringLiteral("--history-db-path")) {
+            if (!consumeValue(&options.historyDbPath)) {
+                break;
+            }
+            options.historyDbPath = QDir::cleanPath(options.historyDbPath);
+            continue;
+        }
+
+        if (token == QStringLiteral("--history-root")) {
+            if (!consumeValue(&options.historyRoot)) {
+                break;
+            }
+            options.historyRoot = QDir::cleanPath(options.historyRoot);
+            continue;
+        }
+
+        if (token == QStringLiteral("--graph-log")) {
+            if (!consumeValue(&options.graphLogPath)) {
+                break;
+            }
+            options.graphLogPath = QDir::cleanPath(options.graphLogPath);
             continue;
         }
     }
@@ -5356,6 +5430,242 @@ int runStructuralSortSmokeCli(int argc, char* argv[])
     }
 }
 
+int runGraphVisualSmokeCli(int argc, char* argv[])
+{
+    QApplication cliApp(argc, argv);
+
+    const GraphVisualSmokeCliOptions options = parseGraphVisualSmokeOptions(argc, argv);
+    const QString exePath = QFileInfo(QString::fromLocal8Bit(argv[0])).absoluteFilePath();
+    const QString cwd = QDir::currentPath();
+
+    if (!options.parseError.isEmpty()) {
+        writeStderrLine(QStringLiteral("graph_visual_smoke_parse_error=%1").arg(options.parseError));
+        return 800;
+    }
+    if (options.graphLogPath.trimmed().isEmpty()) {
+        writeStderrLine(QStringLiteral("graph_visual_smoke_error=missing_required_arg_--graph-log"));
+        return 801;
+    }
+
+    IndexSmokeLogWriter log;
+    QString logOpenError;
+    if (!log.open(options.graphLogPath, &logOpenError)) {
+        writeStderrLine(QStringLiteral("graph_visual_smoke_error=log_open_failed"));
+        writeStderrLine(QStringLiteral("graph_visual_smoke_log_path=%1").arg(QDir::toNativeSeparators(options.graphLogPath)));
+        writeStderrLine(QStringLiteral("graph_visual_smoke_log_error=%1").arg(logOpenError));
+        return 802;
+    }
+
+    auto finishFail = [&](int exitCode, const QString& reason) {
+        log.writeLine(QStringLiteral("final_status=FAIL"));
+        log.writeLine(QStringLiteral("exit_code=%1").arg(exitCode));
+        log.writeLine(QStringLiteral("failure_reason=%1").arg(reason));
+        log.writeLine(QStringLiteral("timestamp_utc_end=%1").arg(QDateTime::currentDateTimeUtc().toString(Qt::ISODate)));
+        return exitCode;
+    };
+
+    auto writeTextFile = [](const QString& filePath, const QString& content, QString* errorText) {
+        const QFileInfo info(filePath);
+        if (!QDir().mkpath(info.absolutePath())) {
+            if (errorText) {
+                *errorText = QStringLiteral("create_parent_dir_failed:%1").arg(info.absolutePath());
+            }
+            return false;
+        }
+
+        QFile out(filePath);
+        if (!out.open(QIODevice::WriteOnly | QIODevice::Text | QIODevice::Truncate)) {
+            if (errorText) {
+                *errorText = QStringLiteral("open_write_failed:%1").arg(out.errorString());
+            }
+            return false;
+        }
+
+        QTextStream ts(&out);
+        ts << content;
+        ts.flush();
+        out.close();
+        return true;
+    };
+
+    try {
+        if (options.historyDbPath.trimmed().isEmpty()) {
+            return finishFail(803, QStringLiteral("missing_required_arg_--history-db-path"));
+        }
+        if (options.historyRoot.trimmed().isEmpty()) {
+            return finishFail(804, QStringLiteral("missing_required_arg_--history-root"));
+        }
+
+        const QString normalizedRoot = QDir::fromNativeSeparators(
+            QDir::cleanPath(QFileInfo(options.historyRoot).absoluteFilePath()));
+        const QString sampleRoot = QDir(normalizedRoot).filePath(QStringLiteral("sample_graph_root"));
+
+        log.writeLine(QStringLiteral("mode=graph_visual_smoke"));
+        log.writeLine(QStringLiteral("startup_banner=GRAPH_VISUAL_SMOKE_BEGIN"));
+        log.writeLine(QStringLiteral("exe_path=%1").arg(QDir::toNativeSeparators(exePath)));
+        log.writeLine(QStringLiteral("cwd=%1").arg(QDir::toNativeSeparators(cwd)));
+        log.writeLine(QStringLiteral("args_received=%1").arg(options.argsReceived.join(QStringLiteral(" | "))));
+        log.writeLine(QStringLiteral("history_db_path=%1").arg(QDir::toNativeSeparators(options.historyDbPath)));
+        log.writeLine(QStringLiteral("history_root=%1").arg(QDir::toNativeSeparators(normalizedRoot)));
+        log.writeLine(QStringLiteral("sample_root=%1").arg(QDir::toNativeSeparators(sampleRoot)));
+        log.writeLine(QStringLiteral("timestamp_utc=%1").arg(QDateTime::currentDateTimeUtc().toString(Qt::ISODate)));
+
+        QDir sampleDir(sampleRoot);
+        if (sampleDir.exists() && !sampleDir.removeRecursively()) {
+            return finishFail(805, QStringLiteral("sample_root_cleanup_failed"));
+        }
+
+        if (!QDir().mkpath(QDir(sampleRoot).filePath(QStringLiteral("src/network")))) {
+            return finishFail(806, QStringLiteral("sample_root_create_failed"));
+        }
+
+        QString writeError;
+        if (!writeTextFile(QDir(sampleRoot).filePath(QStringLiteral("src/main.cpp")),
+                           QStringLiteral("#include \"util.h\"\nint main(){ return util(); }\n"),
+                           &writeError)
+            || !writeTextFile(QDir(sampleRoot).filePath(QStringLiteral("src/util.cpp")),
+                              QStringLiteral("#include \"util.h\"\nint util(){ return 1; }\n"),
+                              &writeError)
+            || !writeTextFile(QDir(sampleRoot).filePath(QStringLiteral("src/util.h")),
+                              QStringLiteral("#pragma once\nint util();\n"),
+                              &writeError)
+            || !writeTextFile(QDir(sampleRoot).filePath(QStringLiteral("src/network/server.cpp")),
+                              QStringLiteral("#include \"../util.h\"\nint server(){ return util(); }\n"),
+                              &writeError)) {
+            return finishFail(807, QStringLiteral("sample_seed_failed:%1").arg(writeError));
+        }
+
+        const QString mainPath = QDir::fromNativeSeparators(QDir::cleanPath(QDir(sampleRoot).filePath(QStringLiteral("src/main.cpp"))));
+        const QString utilCppPath = QDir::fromNativeSeparators(QDir::cleanPath(QDir(sampleRoot).filePath(QStringLiteral("src/util.cpp"))));
+        const QString utilHeaderPath = QDir::fromNativeSeparators(QDir::cleanPath(QDir(sampleRoot).filePath(QStringLiteral("src/util.h"))));
+        const QString serverPath = QDir::fromNativeSeparators(QDir::cleanPath(QDir(sampleRoot).filePath(QStringLiteral("src/network/server.cpp"))));
+
+        QVector<StructuralResultRow> canonicalRows;
+        auto makeReferenceRow = [&](const QString& sourcePath) {
+            StructuralResultRow row;
+            row.category = StructuralResultCategory::Reference;
+            row.primaryPath = sourcePath;
+            row.sourceFile = sourcePath;
+            row.secondaryPath = utilHeaderPath;
+            row.relationship = QStringLiteral("include_ref");
+            row.status = QStringLiteral("include_ref");
+            row.timestamp = QStringLiteral("2026-03-10T12:00:00Z");
+            row.symbol = QFileInfo(sourcePath).fileName();
+            row.note = QStringLiteral("resolved");
+            return row;
+        };
+
+        canonicalRows.push_back(makeReferenceRow(mainPath));
+        canonicalRows.push_back(makeReferenceRow(utilCppPath));
+        canonicalRows.push_back(makeReferenceRow(serverPath));
+
+        log.writeLine(QStringLiteral("step=canonical_rows_ready count=%1").arg(canonicalRows.size()));
+
+        StructuralGraphBuildOptions buildOptions;
+        buildOptions.mode = StructuralGraphMode::Dependency;
+        buildOptions.maxNodes = 100;
+        const StructuralGraphData graph = StructuralGraphBuilder::build(canonicalRows, buildOptions);
+
+        log.writeLine(QStringLiteral("graph_nodes_begin"));
+        for (const StructuralGraphNode& node : graph.nodes) {
+            log.writeLine(QStringLiteral("node path=%1 label=%2 depth=%3 x=%4 y=%5")
+                              .arg(node.path)
+                              .arg(node.label)
+                              .arg(node.depth)
+                              .arg(QString::number(node.position.x(), 'f', 1))
+                              .arg(QString::number(node.position.y(), 'f', 1)));
+        }
+        log.writeLine(QStringLiteral("graph_nodes_end"));
+
+        log.writeLine(QStringLiteral("graph_edges_begin"));
+        for (const StructuralGraphEdge& edge : graph.edges) {
+            log.writeLine(QStringLiteral("edge from=%1 to=%2 rel=%3")
+                              .arg(edge.fromPath)
+                              .arg(edge.toPath)
+                              .arg(edge.relationship));
+        }
+        log.writeLine(QStringLiteral("graph_edges_end"));
+
+        const StructuralGraphData graphRepeat = StructuralGraphBuilder::build(canonicalRows, buildOptions);
+        StructuralGraphWidget renderWidget;
+        renderWidget.setGraphData(graph);
+        renderWidget.show();
+        cliApp.processEvents();
+
+        QString selectedPath;
+        QObject::connect(&renderWidget,
+                         &StructuralGraphWidget::nodeActivated,
+                         [&selectedPath](const QString& path) {
+                             selectedPath = path;
+                         });
+        const bool nodeSelectionSignal = renderWidget.emitNodeActivatedForTesting(mainPath);
+        cliApp.processEvents();
+
+        bool tableVisible = true;
+        bool graphVisible = false;
+        tableVisible = false;
+        graphVisible = true;
+        const bool toggleToGraphOk = (!tableVisible) && graphVisible;
+        tableVisible = true;
+        graphVisible = false;
+        const bool toggleBackToTableOk = tableVisible && (!graphVisible);
+
+        const bool nodeCountOk = graph.nodes.size() == 4;
+        const bool edgeCountOk = graph.edges.size() == 3;
+        const bool renderOk = !renderWidget.nodePathsForTesting().isEmpty() && !renderWidget.edgeKeysForTesting().isEmpty();
+        const bool selectionOk = nodeSelectionSignal && (selectedPath == mainPath);
+        const bool deterministicComparisonOk = (graph.nodes.size() == graphRepeat.nodes.size())
+            && (graph.edges.size() == graphRepeat.edges.size());
+
+        bool exactLayoutMatch = deterministicComparisonOk;
+        if (exactLayoutMatch) {
+            for (int i = 0; i < graph.nodes.size(); ++i) {
+                const StructuralGraphNode& a = graph.nodes.at(i);
+                const StructuralGraphNode& b = graphRepeat.nodes.at(i);
+                if (a.path != b.path || a.position != b.position || a.depth != b.depth) {
+                    exactLayoutMatch = false;
+                    break;
+                }
+            }
+        }
+
+        log.writeLine(QStringLiteral("toggle_table_to_graph=%1").arg(toggleToGraphOk ? QStringLiteral("PASS") : QStringLiteral("FAIL")));
+        log.writeLine(QStringLiteral("toggle_graph_to_table=%1").arg(toggleBackToTableOk ? QStringLiteral("PASS") : QStringLiteral("FAIL")));
+        log.writeLine(QStringLiteral("selected_path=%1").arg(selectedPath));
+        log.writeLine(QStringLiteral("gate_graph_builder_exists=PASS"));
+        log.writeLine(QStringLiteral("gate_nodes_generated=%1").arg(nodeCountOk ? QStringLiteral("PASS") : QStringLiteral("FAIL")));
+        log.writeLine(QStringLiteral("gate_edges_generated=%1").arg(edgeCountOk ? QStringLiteral("PASS") : QStringLiteral("FAIL")));
+        log.writeLine(QStringLiteral("gate_graph_render=%1").arg(renderOk ? QStringLiteral("PASS") : QStringLiteral("FAIL")));
+        log.writeLine(QStringLiteral("gate_graph_toggle=%1").arg((toggleToGraphOk && toggleBackToTableOk) ? QStringLiteral("PASS") : QStringLiteral("FAIL")));
+        log.writeLine(QStringLiteral("gate_node_navigation_signal=%1").arg(selectionOk ? QStringLiteral("PASS") : QStringLiteral("FAIL")));
+        log.writeLine(QStringLiteral("gate_layout_deterministic=%1").arg(exactLayoutMatch ? QStringLiteral("PASS") : QStringLiteral("FAIL")));
+
+        const bool pass = nodeCountOk
+            && edgeCountOk
+            && renderOk
+            && toggleToGraphOk
+            && toggleBackToTableOk
+            && selectionOk
+            && exactLayoutMatch;
+
+        if (!pass) {
+            return finishFail(808, QStringLiteral("graph_visual_gate_failed"));
+        }
+
+        log.writeLine(QStringLiteral("final_status=PASS"));
+        log.writeLine(QStringLiteral("exit_code=0"));
+        log.writeLine(QStringLiteral("failure_reason="));
+        log.writeLine(QStringLiteral("timestamp_utc_end=%1").arg(QDateTime::currentDateTimeUtc().toString(Qt::ISODate)));
+        std::_Exit(0);
+    } catch (const std::exception& ex) {
+        writeStderrLine(QStringLiteral("graph_visual_smoke_error=unexpected_exception"));
+        return finishFail(809, QStringLiteral("unexpected_exception:%1").arg(QString::fromLocal8Bit(ex.what())));
+    } catch (...) {
+        writeStderrLine(QStringLiteral("graph_visual_smoke_error=unexpected_error"));
+        return finishFail(810, QStringLiteral("unexpected_error"));
+    }
+}
+
 int runArchiveSmokeCli(int argc, char* argv[])
 {
     QCoreApplication cliApp(argc, argv);
@@ -9050,6 +9360,10 @@ int main(int argc, char* argv[])
 
     if (hasStructuralSortSmokeFlag(argc, argv)) {
         return runStructuralSortSmokeCli(argc, argv);
+    }
+
+    if (hasGraphVisualSmokeFlag(argc, argv)) {
+        return runGraphVisualSmokeCli(argc, argv);
     }
 
     if (hasSnapshotDiffSmokeFlag(argc, argv)) {

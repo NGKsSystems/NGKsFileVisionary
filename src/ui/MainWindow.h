@@ -21,6 +21,7 @@
 #include "../core/FileScanner.h"
 #include "../core/TreeSnapshotService.h"
 #include "ArchiveExplorer.h"
+#include "graph/StructuralGraphBuilder.h"
 #include "model/ViewModeController.h"
 #include "model/StructuralFilterState.h"
 #include "model/StructuralResultRow.h"
@@ -39,6 +40,7 @@ class QTreeWidgetItem;
 class DirectoryModel;
 class QueryBarWidget;
 class QueryController;
+class StructuralGraphWidget;
 
 class MainWindow : public QMainWindow
 {
@@ -279,6 +281,9 @@ private:
     void updateStructuralNavigationButtons();
     void updateStructuralFilterStateFromControls();
     void updateStructuralSortStateFromControls();
+    void updateStructuralGraphFromCanonicalRows();
+    void setStructuralGraphModeEnabled(bool enabled);
+    void onStructuralGraphNodeActivated(const QString& absolutePath);
     void updateStructuralFilterControlChoices(const QVector<StructuralResultRow>& canonicalRows);
     void applyStructuralFiltersToCurrentRows(const QString& statusPrefix = QString());
     void clearStructuralFilters(bool applyNow = true);
@@ -418,6 +423,11 @@ private:
     QPushButton* m_structuralClearFiltersButton = nullptr;
     QComboBox* m_structuralSortFieldCombo = nullptr;
     QPushButton* m_structuralSortDirectionButton = nullptr;
+    QPushButton* m_structuralTableViewButton = nullptr;
+    QPushButton* m_structuralGraphViewButton = nullptr;
+    QComboBox* m_structuralGraphModeCombo = nullptr;
+    QLabel* m_structuralGraphStatusLabel = nullptr;
+    StructuralGraphWidget* m_structuralGraphWidget = nullptr;
     QComboBox* m_structuralOldSnapshotCombo = nullptr;
     QComboBox* m_structuralNewSnapshotCombo = nullptr;
     QString m_structuralRootPath;
@@ -429,5 +439,7 @@ private:
     StructuralFilterState m_structuralFilterState;
     StructuralSortField m_structuralSortField = StructuralSortField::PrimaryPath;
     StructuralSortDirection m_structuralSortDirection = StructuralSortDirection::Ascending;
+    StructuralGraphMode m_structuralGraphMode = StructuralGraphMode::Dependency;
+    bool m_structuralGraphModeEnabled = false;
     StructuralPanelState m_structuralPanelState;
 };

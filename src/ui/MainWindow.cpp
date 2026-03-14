@@ -59,6 +59,7 @@
 
 #include "TreeSnapshotDialog.h"
 #include "TreeSnapshotPreviewDialog.h"
+#include "graph/StructuralGraphWidget.h"
 #include "core/history/HistoryEntry.h"
 #include "core/history/HistoryViewEngine.h"
 #include "core/db/MetaStore.h"
@@ -436,6 +437,22 @@ void MainWindow::setupStructuralPanel()
     structuralNavigationLayout->addStretch(1);
     panelLayout->addLayout(structuralNavigationLayout);
 
+    QHBoxLayout* viewModeLayout = new QHBoxLayout();
+    QLabel* viewModeLabel = new QLabel(QStringLiteral("View Mode:"), panelRoot);
+    m_structuralTableViewButton = new QPushButton(QStringLiteral("Table"), panelRoot);
+    m_structuralGraphViewButton = new QPushButton(QStringLiteral("Graph"), panelRoot);
+    m_structuralGraphModeCombo = new QComboBox(panelRoot);
+    m_structuralTableViewButton->setCheckable(true);
+    m_structuralGraphViewButton->setCheckable(true);
+    m_structuralGraphModeCombo->addItem(QStringLiteral("Dependency Graph"), static_cast<int>(StructuralGraphMode::Dependency));
+    m_structuralGraphModeCombo->addItem(QStringLiteral("Reverse Dependency Graph"), static_cast<int>(StructuralGraphMode::ReverseDependency));
+    viewModeLayout->addWidget(viewModeLabel);
+    viewModeLayout->addWidget(m_structuralTableViewButton);
+    viewModeLayout->addWidget(m_structuralGraphViewButton);
+    viewModeLayout->addWidget(m_structuralGraphModeCombo);
+    viewModeLayout->addStretch(1);
+    panelLayout->addLayout(viewModeLayout);
+
     QHBoxLayout* filterLayout = new QHBoxLayout();
     m_structuralCategoryFilterCombo = new QComboBox(panelRoot);
     m_structuralStatusFilterCombo = new QComboBox(panelRoot);
@@ -534,6 +551,14 @@ void MainWindow::setupStructuralPanel()
     m_structuralTabWidget->addTab(referenceTab, QStringLiteral("References"));
 
     panelLayout->addWidget(m_structuralTabWidget);
+
+    m_structuralGraphStatusLabel = new QLabel(QStringLiteral("Graph view idle"), panelRoot);
+    panelLayout->addWidget(m_structuralGraphStatusLabel);
+
+    m_structuralGraphWidget = new StructuralGraphWidget(panelRoot);
+    m_structuralGraphWidget->setObjectName(QStringLiteral("structuralGraphWidget"));
+    panelLayout->addWidget(m_structuralGraphWidget, 1);
+
     m_structuralPanelDock->setWidget(panelRoot);
     addDockWidget(Qt::BottomDockWidgetArea, m_structuralPanelDock);
     m_structuralPanelDock->hide();
@@ -544,6 +569,27 @@ void MainWindow::setupStructuralPanel()
     connect(m_structuralShowReferencesButton, &QPushButton::clicked, this, &MainWindow::onStructuralShowReferences);
     connect(m_structuralShowUsedByButton, &QPushButton::clicked, this, &MainWindow::onStructuralShowUsedBy);
     connect(m_structuralTabWidget, &QTabWidget::currentChanged, this, &MainWindow::onStructuralPanelTabChanged);
+    connect(m_structuralTableViewButton, &QPushButton::clicked, this, [this]() {
+        setStructuralGraphModeEnabled(false);
+    });
+    connect(m_structuralGraphViewButton, &QPushButton::clicked, this, [this]() {
+        setStructuralGraphModeEnabled(true);
+    });
+    connect(m_structuralGraphModeCombo,
+            &QComboBox::currentIndexChanged,
+            this,
+            [this](int) {
+                if (!m_structuralGraphModeCombo || m_structuralGraphModeCombo->currentIndex() < 0) {
+                    return;
+                }
+                bool ok = false;
+                const int token = m_structuralGraphModeCombo->currentData().toInt(&ok);
+                if (ok) {
+                    m_structuralGraphMode = static_cast<StructuralGraphMode>(token);
+                }
+                updateStructuralGraphFromCanonicalRows();
+            });
+    connect(m_structuralGraphWidget, &StructuralGraphWidget::nodeActivated, this, &MainWindow::onStructuralGraphNodeActivated);
     connect(m_structuralBackButton, &QPushButton::clicked, this, [this]() {
         QString errorText;
         if (!navigateStructuralBack(&errorText, nullptr, nullptr) && m_statusLabel && !errorText.isEmpty()) {
@@ -590,6 +636,8 @@ void MainWindow::setupStructuralPanel()
     });
 
     clearStructuralFilters(false);
+    setStructuralGraphModeEnabled(false);
+    updateStructuralGraphFromCanonicalRows();
     updateStructuralNavigationButtons();
 }
 
@@ -2791,6 +2839,86 @@ void MainWindow::updateStructuralSortStateFromControls()
     }
 }
 
+void MainWindow::setStructuralGraphModeEnabled(bool enabled)
+{
+    m_structuralGraphModeEnabled = enabled;
+
+    if (m_structuralTableViewButton) {
+        QSignalBlocker blocker(m_structuralTableViewButton);
+        m_structuralTableViewButton->setChecked(!enabled);
+    }
+    if (m_structuralGraphViewButton) {
+        QSignalBlocker blocker(m_structuralGraphViewButton);
+        m_structuralGraphViewButton->setChecked(enabled);
+    }
+    if (m_structuralTabWidget) {
+        m_structuralTabWidget->setVisible(!enabled);
+    }
+    if (m_structuralGraphWidget) {
+        m_structuralGraphWidget->setVisible(enabled);
+    }
+
+    if (m_structuralGraphStatusLabel) {
+        const QString modeLabel = enabled ? QStringLiteral("graph") : QStringLiteral("table");
+        m_structuralGraphStatusLabel->setText(
+            QStringLiteral("Structural graph mode=%1 nodes=%2 edges=%3")
+                .arg(modeLabel)
+                .arg(m_structuralGraphWidget ? m_structuralGraphWidget->nodePathsForTesting().size() : 0)
+                .arg(m_structuralGraphWidget ? m_structuralGraphWidget->edgeKeysForTesting().size() : 0));
+    }
+}
+
+void MainWindow::updateStructuralGraphFromCanonicalRows()
+{
+    if (!m_structuralGraphWidget) {
+        return;
+    }
+
+    StructuralGraphBuildOptions options;
+    options.mode = m_structuralGraphMode;
+    options.maxNodes = 100;
+    const StructuralGraphData graph = StructuralGraphBuilder::build(m_structuralCanonicalRows, options);
+    m_structuralGraphWidget->setGraphData(graph);
+
+    if (m_structuralGraphStatusLabel) {
+        const QString modeLabel = (m_structuralGraphMode == StructuralGraphMode::Dependency)
+            ? QStringLiteral("dependency")
+            : QStringLiteral("reverse_dependency");
+        m_structuralGraphStatusLabel->setText(
+            QStringLiteral("Graph mode=%1 nodes=%2 edges=%3 source=canonical")
+                .arg(modeLabel)
+                .arg(graph.nodes.size())
+                .arg(graph.edges.size()));
+    }
+}
+
+void MainWindow::onStructuralGraphNodeActivated(const QString& absolutePath)
+{
+    const QString candidate = QDir::fromNativeSeparators(QDir::cleanPath(absolutePath));
+    const QFileInfo info(candidate);
+    QString destination = candidate;
+    if (!info.isDir()) {
+        destination = info.absolutePath();
+    }
+
+    if (!destination.isEmpty() && isNavigablePath(destination)) {
+        navigateToDirectory(destination);
+        m_structuralTargetPath = candidate;
+        updateStructuralPanelContextLabel();
+        if (m_statusLabel) {
+            m_statusLabel->setText(QStringLiteral("Graph node selected: %1").arg(candidate));
+        }
+        appendRuntimeLog(QStringLiteral("StructuralGraph node_selected path=%1 destination=%2")
+                             .arg(candidate)
+                             .arg(destination));
+        return;
+    }
+
+    if (m_statusLabel) {
+        m_statusLabel->setText(QStringLiteral("Graph node selection skipped (not navigable): %1").arg(candidate));
+    }
+}
+
 void MainWindow::updateStructuralFilterControlChoices(const QVector<StructuralResultRow>& canonicalRows)
 {
     if (!m_structuralExtensionFilterCombo || !m_structuralRelationshipFilterCombo) {
@@ -2891,6 +3019,8 @@ void MainWindow::applyStructuralFiltersToCurrentRows(const QString& statusPrefix
                                    .arg(activeFilters)
                                    .arg(sortDirection));
     }
+
+    updateStructuralGraphFromCanonicalRows();
 }
 
 void MainWindow::clearStructuralFilters(bool applyNow)
@@ -2971,6 +3101,7 @@ void MainWindow::setStructuralCanonicalRows(const QVector<StructuralResultRow>& 
     updateStructuralFilterControlChoices(rows);
     updateStructuralFilterStateFromControls();
     updateStructuralSortStateFromControls();
+    updateStructuralGraphFromCanonicalRows();
     applyStructuralFiltersToCurrentRows(statusPrefix);
 }
 
