@@ -84,6 +84,14 @@ public:
                                          QStringList* usedByRowsOut = nullptr,
                                          QString* navigationPathOut = nullptr,
                                          QString* errorText = nullptr);
+    bool triggerStructuralQueryDispatchForTesting(const QString& rootPath,
+                                                  const QString& queryText,
+                                                  int* activeTabIndex = nullptr,
+                                                  QString* activeTabLabel = nullptr,
+                                                  int* rowCount = nullptr,
+                                                  QStringList* rowsOut = nullptr,
+                                                  QString* navigationPathOut = nullptr,
+                                                  QString* errorText = nullptr);
 
 private slots:
     void onBrowseRoot();
@@ -207,6 +215,10 @@ private:
     bool loadStructuralReferenceView(QueryGraphMode mode,
                                     QString* errorText = nullptr,
                                     int* rowCount = nullptr);
+    bool dispatchStructuralQueryToPanel(const QString& queryText,
+                                        QString* errorText = nullptr,
+                                        int* activeTabIndex = nullptr,
+                                        int* rowCount = nullptr);
     bool navigateFromCurrentModelRow(int rowIndex, QString* navigatedPathOut = nullptr);
     QStringList collectCurrentModelRows(int maxRows = 200) const;
     bool loadHistoryRowsForPath(const QString& selectedFilePath,

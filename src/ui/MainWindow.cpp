@@ -977,6 +977,28 @@ void MainWindow::onQuerySubmitted(const QString& text)
         return;
     }
 
+    QString structuralError;
+    int structuralTab = -1;
+    int structuralRows = 0;
+    if (dispatchStructuralQueryToPanel(query, &structuralError, &structuralTab, &structuralRows)) {
+        m_queryModeActive = false;
+        m_activeQueryString.clear();
+        appendRuntimeLog(QStringLiteral("querybar_structural_dispatch_ok query=%1 tab=%2 rows=%3")
+                             .arg(query)
+                             .arg(structuralTab)
+                             .arg(structuralRows));
+        return;
+    }
+    if (!structuralError.isEmpty()) {
+        m_queryModeActive = false;
+        m_activeQueryString.clear();
+        m_statusLabel->setText(QStringLiteral("Structural query error: %1").arg(structuralError));
+        appendRuntimeLog(QStringLiteral("querybar_structural_dispatch_failed query=%1 error=%2")
+                             .arg(query)
+                             .arg(structuralError));
+        return;
+    }
+
     m_activeQueryString = query;
     m_queryModeActive = true;
 
@@ -2724,6 +2746,234 @@ bool MainWindow::loadStructuralReferenceView(QueryGraphMode mode,
     return true;
 }
 
+bool MainWindow::dispatchStructuralQueryToPanel(const QString& queryText,
+                                                QString* errorText,
+                                                int* activeTabIndex,
+                                                int* rowCount)
+{
+    const QString query = queryText.trimmed();
+    const QString lower = query.toLower();
+
+    auto setError = [&](const QString& value) {
+        if (errorText) {
+            *errorText = value;
+        }
+    };
+
+    auto resolveRootAndTarget = [&](const QString& rawTarget,
+                                    QString* resolvedRoot,
+                                    QString* resolvedTarget,
+                                    QString* resolveError) {
+        QString root = QDir::fromNativeSeparators(QDir::cleanPath(currentRootPath()));
+        QString target;
+
+        const QString hint = QDir::fromNativeSeparators(QDir::cleanPath(rawTarget.trimmed()));
+        if (!hint.isEmpty()) {
+            QFileInfo hintInfo(hint);
+            if (hintInfo.isAbsolute()) {
+                target = QDir::fromNativeSeparators(QDir::cleanPath(hintInfo.absoluteFilePath()));
+            } else if (!root.isEmpty()) {
+                target = QDir::fromNativeSeparators(QDir::cleanPath(QDir(root).filePath(hint)));
+            } else {
+                target = hint;
+            }
+        }
+
+        if (!target.isEmpty()) {
+            const QFileInfo targetInfo(target);
+            if (targetInfo.exists() && targetInfo.isDir()) {
+                root = QDir::fromNativeSeparators(QDir::cleanPath(targetInfo.absoluteFilePath()));
+                target.clear();
+            } else {
+                root = resolveSnapshotRootForAction(target);
+            }
+        }
+
+        if (root.trimmed().isEmpty()) {
+            if (resolveError) {
+                *resolveError = QStringLiteral("invalid_root_for_structural_query");
+            }
+            return false;
+        }
+
+        if (target.isEmpty()) {
+            const QString preferred = QDir(root).filePath(QStringLiteral("src/main.cpp"));
+            const QFileInfo preferredInfo(preferred);
+            if (preferredInfo.exists() && preferredInfo.isFile()) {
+                target = QDir::fromNativeSeparators(QDir::cleanPath(preferredInfo.absoluteFilePath()));
+            } else {
+                QDirIterator it(root,
+                                QDir::Files | QDir::NoDotAndDotDot | QDir::Hidden | QDir::System,
+                                QDirIterator::Subdirectories);
+                if (it.hasNext()) {
+                    target = QDir::fromNativeSeparators(QDir::cleanPath(it.next()));
+                }
+            }
+        }
+
+        if (target.trimmed().isEmpty()) {
+            if (resolveError) {
+                *resolveError = QStringLiteral("no_structural_target_file");
+            }
+            return false;
+        }
+
+        if (resolvedRoot) {
+            *resolvedRoot = root;
+        }
+        if (resolvedTarget) {
+            *resolvedTarget = target;
+        }
+        return true;
+    };
+
+    auto activatePanel = [&](int tabIndex) {
+        if (!m_structuralPanelDock || !m_structuralTabWidget) {
+            return false;
+        }
+        updateStructuralPanelContextLabel();
+        m_structuralPanelDock->show();
+        m_structuralPanelDock->raise();
+        m_structuralTabWidget->setCurrentIndex(tabIndex);
+        if (activeTabIndex) {
+            *activeTabIndex = tabIndex;
+        }
+        return true;
+    };
+
+    if (lower.startsWith(QStringLiteral("history:"))) {
+        const QString targetHint = query.mid(QStringLiteral("history:").size()).trimmed();
+        QString localError;
+        if (!resolveRootAndTarget(targetHint, &m_structuralRootPath, &m_structuralTargetPath, &localError)) {
+            setError(localError);
+            return false;
+        }
+        if (m_rootEdit) {
+            m_rootEdit->setText(m_structuralRootPath);
+        }
+        if (!activatePanel(0)) {
+            setError(QStringLiteral("structural_panel_unavailable"));
+            return false;
+        }
+        int rows = 0;
+        if (!loadStructuralHistoryView(&localError, &rows)) {
+            setError(localError);
+            return false;
+        }
+        if (rowCount) {
+            *rowCount = rows;
+        }
+        return true;
+    }
+
+    if (lower.startsWith(QStringLiteral("snapshots:"))) {
+        const QString targetHint = query.mid(QStringLiteral("snapshots:").size()).trimmed();
+        QString localError;
+        if (!resolveRootAndTarget(targetHint, &m_structuralRootPath, &m_structuralTargetPath, &localError)) {
+            setError(localError);
+            return false;
+        }
+        if (m_rootEdit) {
+            m_rootEdit->setText(m_structuralRootPath);
+        }
+        if (!activatePanel(1)) {
+            setError(QStringLiteral("structural_panel_unavailable"));
+            return false;
+        }
+        int rows = 0;
+        if (!loadStructuralSnapshotView(&localError, &rows)) {
+            setError(localError);
+            return false;
+        }
+        if (rowCount) {
+            *rowCount = rows;
+        }
+        return true;
+    }
+
+    if (lower.startsWith(QStringLiteral("references:")) || lower.startsWith(QStringLiteral("usedby:"))) {
+        const bool referencesMode = lower.startsWith(QStringLiteral("references:"));
+        const QString prefix = referencesMode ? QStringLiteral("references:") : QStringLiteral("usedby:");
+        const QString targetHint = query.mid(prefix.size()).trimmed();
+        QString localError;
+        if (!resolveRootAndTarget(targetHint, &m_structuralRootPath, &m_structuralTargetPath, &localError)) {
+            setError(localError);
+            return false;
+        }
+        if (m_rootEdit) {
+            m_rootEdit->setText(m_structuralRootPath);
+        }
+        if (!activatePanel(3)) {
+            setError(QStringLiteral("structural_panel_unavailable"));
+            return false;
+        }
+
+        int rows = 0;
+        const QueryGraphMode graphMode = referencesMode ? QueryGraphMode::References : QueryGraphMode::UsedBy;
+        if (!loadStructuralReferenceView(graphMode, &localError, &rows)) {
+            setError(localError);
+            return false;
+        }
+        if (rowCount) {
+            *rowCount = rows;
+        }
+        return true;
+    }
+
+    if (lower.startsWith(QStringLiteral("diff:"))) {
+        const QString payload = query.mid(QStringLiteral("diff:").size()).trimmed();
+        const QStringList tokens = payload.split(':', Qt::KeepEmptyParts);
+        if (tokens.size() != 2) {
+            setError(QStringLiteral("invalid_diff_query_expected=diff:<snapshotA>:<snapshotB>"));
+            return false;
+        }
+
+        bool oldOk = false;
+        bool newOk = false;
+        const qint64 oldSnapshotId = tokens.at(0).trimmed().toLongLong(&oldOk);
+        const qint64 newSnapshotId = tokens.at(1).trimmed().toLongLong(&newOk);
+        if (!oldOk || !newOk || oldSnapshotId <= 0 || newSnapshotId <= 0 || oldSnapshotId == newSnapshotId) {
+            setError(QStringLiteral("invalid_diff_snapshot_ids"));
+            return false;
+        }
+
+        QString localError;
+        if (!resolveRootAndTarget(QString(), &m_structuralRootPath, &m_structuralTargetPath, &localError)) {
+            setError(localError);
+            return false;
+        }
+        if (m_rootEdit) {
+            m_rootEdit->setText(m_structuralRootPath);
+        }
+        if (!activatePanel(2)) {
+            setError(QStringLiteral("structural_panel_unavailable"));
+            return false;
+        }
+
+        int rows = 0;
+        int added = 0;
+        int removed = 0;
+        int changed = 0;
+        if (!loadStructuralDiffView(oldSnapshotId,
+                                    newSnapshotId,
+                                    &localError,
+                                    &rows,
+                                    &added,
+                                    &removed,
+                                    &changed)) {
+            setError(localError);
+            return false;
+        }
+
+        if (rowCount) {
+            *rowCount = rows;
+        }
+        return true;
+    }
+
+    return false;
+}
+
 bool MainWindow::navigateFromCurrentModelRow(int rowIndex, QString* navigatedPathOut)
 {
     if (rowIndex < 0 || rowIndex >= m_proxyModel.rowCount()) {
@@ -2969,6 +3219,83 @@ bool MainWindow::triggerReferencePanelForTesting(const QString& rootPath,
         *navigationPathOut = navigatedPath;
     }
     return referenceRows > 0 && usedByRows > 0 && !navigatedPath.isEmpty();
+}
+
+bool MainWindow::triggerStructuralQueryDispatchForTesting(const QString& rootPath,
+                                                          const QString& queryText,
+                                                          int* activeTabIndex,
+                                                          QString* activeTabLabel,
+                                                          int* rowCount,
+                                                          QStringList* rowsOut,
+                                                          QString* navigationPathOut,
+                                                          QString* errorText)
+{
+    if (!m_structuralPanelDock || !m_structuralTabWidget) {
+        if (errorText) {
+            *errorText = QStringLiteral("structural_panel_not_initialized");
+        }
+        return false;
+    }
+
+    if (m_rootEdit) {
+        m_rootEdit->setText(QDir::fromNativeSeparators(QDir::cleanPath(rootPath)));
+    }
+    setActionContext({QDir(rootPath).filePath(QStringLiteral("src/main.cpp"))}, QStringLiteral("structural_query_smoke"));
+
+    QString dispatchError;
+    int dispatchTab = -1;
+    int dispatchRows = 0;
+    const bool handled = dispatchStructuralQueryToPanel(queryText, &dispatchError, &dispatchTab, &dispatchRows);
+    if (!handled) {
+        if (errorText) {
+            *errorText = dispatchError.isEmpty() ? QStringLiteral("query_not_structural") : dispatchError;
+        }
+        if (activeTabIndex) {
+            *activeTabIndex = dispatchTab;
+        }
+        if (activeTabLabel) {
+            *activeTabLabel = (m_structuralTabWidget && dispatchTab >= 0)
+                ? m_structuralTabWidget->tabText(dispatchTab)
+                : QString();
+        }
+        if (rowCount) {
+            *rowCount = dispatchRows;
+        }
+        return false;
+    }
+
+    const int tabIndex = m_structuralTabWidget->currentIndex();
+    const QString tabLabel = m_structuralTabWidget->tabText(tabIndex);
+    const int rows = m_proxyModel.rowCount();
+
+    if (activeTabIndex) {
+        *activeTabIndex = tabIndex;
+    }
+    if (activeTabLabel) {
+        *activeTabLabel = tabLabel;
+    }
+    if (rowCount) {
+        *rowCount = rows;
+    }
+    if (rowsOut) {
+        *rowsOut = collectCurrentModelRows();
+    }
+
+    QString navigationPath;
+    if (rows > 0) {
+        navigateFromCurrentModelRow(0, &navigationPath);
+    }
+    if (navigationPathOut) {
+        *navigationPathOut = navigationPath;
+    }
+
+    if (errorText) {
+        *errorText = (rows <= 0)
+            ? QStringLiteral("structural_query_returned_zero_rows")
+            : QString();
+    }
+
+    return rows > 0;
 }
 
 void MainWindow::onActionCopyPath()
