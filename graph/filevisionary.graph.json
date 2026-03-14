@@ -60,6 +60,8 @@
         "src/ui/timeline/StructuralTimelineWidget.cpp",
         "src/ui/export/StructuralExportFormat.cpp",
         "src/ui/export/StructuralExportEngine.cpp",
+        "src/ui/session/StructuralSessionState.cpp",
+        "src/ui/session/StructuralSessionStore.cpp",
         "src/ui/query/StructuralQueryAutocomplete.cpp",
         "src/ui/query/StructuralSuggestionModel.cpp",
         "src/ui/model/StructuralResultRow.cpp",

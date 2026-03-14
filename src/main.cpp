@@ -239,6 +239,15 @@ struct ExportSmokeCliOptions {
     QString parseError;
 };
 
+struct SessionRestoreSmokeCliOptions {
+    bool enabled = false;
+    QString historyDbPath;
+    QString historyRoot;
+    QString sessionLogPath;
+    QStringList argsReceived;
+    QString parseError;
+};
+
 struct ArchiveSmokeCliOptions {
     bool enabled = false;
     QString archiveRoot;
@@ -540,6 +549,16 @@ bool hasExportSmokeFlag(int argc, char* argv[])
 {
     for (int i = 1; i < argc; ++i) {
         if (QString::fromLocal8Bit(argv[i]) == QStringLiteral("--export-smoke")) {
+            return true;
+        }
+    }
+    return false;
+}
+
+bool hasSessionRestoreSmokeFlag(int argc, char* argv[])
+{
+    for (int i = 1; i < argc; ++i) {
+        if (QString::fromLocal8Bit(argv[i]) == QStringLiteral("--session-restore-smoke")) {
             return true;
         }
     }
@@ -1600,6 +1619,59 @@ ExportSmokeCliOptions parseExportSmokeOptions(int argc, char* argv[])
                 break;
             }
             options.exportLogPath = QDir::cleanPath(options.exportLogPath);
+            continue;
+        }
+    }
+
+    return options;
+}
+
+SessionRestoreSmokeCliOptions parseSessionRestoreSmokeOptions(int argc, char* argv[])
+{
+    SessionRestoreSmokeCliOptions options;
+
+    for (int i = 0; i < argc; ++i) {
+        options.argsReceived << QString::fromLocal8Bit(argv[i]);
+    }
+
+    for (int i = 1; i < argc; ++i) {
+        const QString token = QString::fromLocal8Bit(argv[i]);
+        if (token == QStringLiteral("--session-restore-smoke")) {
+            options.enabled = true;
+            continue;
+        }
+
+        auto consumeValue = [&](QString* out) {
+            if ((i + 1) >= argc) {
+                options.parseError = QStringLiteral("missing_value_for_%1").arg(token);
+                return false;
+            }
+            ++i;
+            *out = QString::fromLocal8Bit(argv[i]);
+            return true;
+        };
+
+        if (token == QStringLiteral("--history-db-path")) {
+            if (!consumeValue(&options.historyDbPath)) {
+                break;
+            }
+            options.historyDbPath = QDir::cleanPath(options.historyDbPath);
+            continue;
+        }
+
+        if (token == QStringLiteral("--history-root")) {
+            if (!consumeValue(&options.historyRoot)) {
+                break;
+            }
+            options.historyRoot = QDir::cleanPath(options.historyRoot);
+            continue;
+        }
+
+        if (token == QStringLiteral("--session-log")) {
+            if (!consumeValue(&options.sessionLogPath)) {
+                break;
+            }
+            options.sessionLogPath = QDir::cleanPath(options.sessionLogPath);
             continue;
         }
     }
@@ -6799,6 +6871,289 @@ int runExportSmokeCli(int argc, char* argv[])
     }
 }
 
+int runSessionRestoreSmokeCli(int argc, char* argv[])
+{
+    QApplication cliApp(argc, argv);
+
+    const SessionRestoreSmokeCliOptions options = parseSessionRestoreSmokeOptions(argc, argv);
+    const QString exePath = QFileInfo(QString::fromLocal8Bit(argv[0])).absoluteFilePath();
+    const QString cwd = QDir::currentPath();
+
+    if (!options.parseError.isEmpty()) {
+        writeStderrLine(QStringLiteral("session_restore_smoke_parse_error=%1").arg(options.parseError));
+        return 853;
+    }
+    if (options.sessionLogPath.trimmed().isEmpty()) {
+        writeStderrLine(QStringLiteral("session_restore_smoke_error=missing_required_arg_--session-log"));
+        return 854;
+    }
+
+    IndexSmokeLogWriter log;
+    QString logOpenError;
+    if (!log.open(options.sessionLogPath, &logOpenError)) {
+        writeStderrLine(QStringLiteral("session_restore_smoke_error=log_open_failed"));
+        writeStderrLine(QStringLiteral("session_restore_smoke_log_path=%1").arg(QDir::toNativeSeparators(options.sessionLogPath)));
+        writeStderrLine(QStringLiteral("session_restore_smoke_log_error=%1").arg(logOpenError));
+        return 855;
+    }
+
+    auto finishFail = [&](int exitCode, const QString& reason) {
+        log.writeLine(QStringLiteral("final_status=FAIL"));
+        log.writeLine(QStringLiteral("exit_code=%1").arg(exitCode));
+        log.writeLine(QStringLiteral("failure_reason=%1").arg(reason));
+        log.writeLine(QStringLiteral("timestamp_utc_end=%1").arg(QDateTime::currentDateTimeUtc().toString(Qt::ISODate)));
+        return exitCode;
+    };
+
+    auto writeTextFile = [](const QString& filePath, const QString& content, QString* errorText) {
+        const QFileInfo info(filePath);
+        if (!QDir().mkpath(info.absolutePath())) {
+            if (errorText) {
+                *errorText = QStringLiteral("create_parent_dir_failed:%1").arg(info.absolutePath());
+            }
+            return false;
+        }
+
+        QFile out(filePath);
+        if (!out.open(QIODevice::WriteOnly | QIODevice::Text | QIODevice::Truncate)) {
+            if (errorText) {
+                *errorText = QStringLiteral("open_write_failed:%1").arg(out.errorString());
+            }
+            return false;
+        }
+
+        QTextStream ts(&out);
+        ts << content;
+        ts.flush();
+        out.close();
+        return true;
+    };
+
+    try {
+        if (options.historyDbPath.trimmed().isEmpty()) {
+            return finishFail(856, QStringLiteral("missing_required_arg_--history-db-path"));
+        }
+        if (options.historyRoot.trimmed().isEmpty()) {
+            return finishFail(857, QStringLiteral("missing_required_arg_--history-root"));
+        }
+
+        const QString normalizedRoot = QDir::fromNativeSeparators(
+            QDir::cleanPath(QFileInfo(options.historyRoot).absoluteFilePath()));
+        const QString sampleRoot = QDir(normalizedRoot).filePath(QStringLiteral("sample_session_root"));
+        const QString sessionStatePath = QDir(normalizedRoot).filePath(QStringLiteral("session_restore_state.json"));
+
+        log.writeLine(QStringLiteral("mode=session_restore_smoke"));
+        log.writeLine(QStringLiteral("startup_banner=SESSION_RESTORE_SMOKE_BEGIN"));
+        log.writeLine(QStringLiteral("exe_path=%1").arg(QDir::toNativeSeparators(exePath)));
+        log.writeLine(QStringLiteral("cwd=%1").arg(QDir::toNativeSeparators(cwd)));
+        log.writeLine(QStringLiteral("args_received=%1").arg(options.argsReceived.join(QStringLiteral(" | "))));
+        log.writeLine(QStringLiteral("history_db_path=%1").arg(QDir::toNativeSeparators(options.historyDbPath)));
+        log.writeLine(QStringLiteral("history_root=%1").arg(QDir::toNativeSeparators(normalizedRoot)));
+        log.writeLine(QStringLiteral("sample_root=%1").arg(QDir::toNativeSeparators(sampleRoot)));
+        log.writeLine(QStringLiteral("session_state_path=%1").arg(QDir::toNativeSeparators(sessionStatePath)));
+        log.writeLine(QStringLiteral("timestamp_utc=%1").arg(QDateTime::currentDateTimeUtc().toString(Qt::ISODate)));
+
+        QDir sampleDir(sampleRoot);
+        if (sampleDir.exists() && !sampleDir.removeRecursively()) {
+            return finishFail(858, QStringLiteral("sample_root_cleanup_failed"));
+        }
+        if (!QDir().mkpath(QDir(sampleRoot).filePath(QStringLiteral("src")))
+            || !QDir().mkpath(QDir(sampleRoot).filePath(QStringLiteral("docs")))) {
+            return finishFail(859, QStringLiteral("sample_root_create_failed"));
+        }
+
+        QString writeError;
+        if (!writeTextFile(QDir(sampleRoot).filePath(QStringLiteral("src/main.cpp")),
+                           QStringLiteral("#include \"util.h\"\nint main(){ return util(); }\n"),
+                           &writeError)
+            || !writeTextFile(QDir(sampleRoot).filePath(QStringLiteral("src/util.cpp")),
+                              QStringLiteral("#include \"util.h\"\nint util(){ return 1; }\n"),
+                              &writeError)
+            || !writeTextFile(QDir(sampleRoot).filePath(QStringLiteral("src/util.h")),
+                              QStringLiteral("#pragma once\nint util();\n"),
+                              &writeError)
+            || !writeTextFile(QDir(sampleRoot).filePath(QStringLiteral("docs/readme.md")),
+                              QStringLiteral("session restore sample\n"),
+                              &writeError)) {
+            return finishFail(860, QStringLiteral("sample_seed_failed:%1").arg(writeError));
+        }
+
+        const QString mainPath = QDir::fromNativeSeparators(QDir::cleanPath(QDir(sampleRoot).filePath(QStringLiteral("src/main.cpp"))));
+        const QString structuralQuery = QStringLiteral("history:%1").arg(mainPath);
+
+        MainWindow firstWindow(true,
+                               normalizedRoot,
+                               QString(),
+                               QString(),
+                               options.historyDbPath,
+                               nullptr);
+        firstWindow.show();
+        cliApp.processEvents();
+
+        QString snapshotError;
+        int snapshotRows = 0;
+        qint64 createdSnapshotId = 0;
+        if (!firstWindow.triggerSnapshotsForTesting(sampleRoot,
+                                                    &snapshotRows,
+                                                    &createdSnapshotId,
+                                                    &snapshotError)) {
+            return finishFail(861, QStringLiteral("snapshot_seed_failed:%1").arg(snapshotError));
+        }
+
+        int initialTab = -1;
+        QString initialTabLabel;
+        int initialRows = 0;
+        QStringList initialRowsOut;
+        QString initialNavPath;
+        QString initialError;
+        const bool queryOk = firstWindow.triggerStructuralQueryDispatchForTesting(sampleRoot,
+                                                                                   structuralQuery,
+                                                                                   &initialTab,
+                                                                                   &initialTabLabel,
+                                                                                   &initialRows,
+                                                                                   &initialRowsOut,
+                                                                                   &initialNavPath,
+                                                                                   &initialError);
+        if (!queryOk) {
+            return finishFail(862, QStringLiteral("initial_query_dispatch_failed:%1").arg(initialError));
+        }
+
+        QString configError;
+        const bool configured = firstWindow.configureStructuralSessionStateForTesting(0,
+                                                                                       2,
+                                                                                       QStringLiteral("history"),
+                                                                                       QStringLiteral("changed"),
+                                                                                       QStringLiteral("main"),
+                                                                                       StructuralSortField::Timestamp,
+                                                                                       StructuralSortDirection::Descending,
+                                                                                       &configError);
+        if (!configured) {
+            return finishFail(863, QStringLiteral("initial_state_config_failed:%1").arg(configError));
+        }
+
+        QString saveError;
+        if (!firstWindow.saveStructuralSessionForTesting(sessionStatePath, &saveError)) {
+            return finishFail(864, QStringLiteral("session_save_failed:%1").arg(saveError));
+        }
+
+        const QString savedSummary = firstWindow.structuralSessionSummaryForTesting();
+        log.writeLine(QStringLiteral("saved_summary=%1").arg(savedSummary));
+
+        QByteArray savedStateText;
+        {
+            QFile stateFile(sessionStatePath);
+            if (!stateFile.open(QIODevice::ReadOnly | QIODevice::Text)) {
+                return finishFail(865, QStringLiteral("saved_state_read_failed:%1").arg(stateFile.errorString()));
+            }
+            savedStateText = stateFile.readAll();
+        }
+        log.writeLine(QStringLiteral("saved_state_json=%1").arg(QString::fromUtf8(savedStateText).simplified()));
+
+        MainWindow restoredWindow(true,
+                                  normalizedRoot,
+                                  QString(),
+                                  QString(),
+                                  options.historyDbPath,
+                                  nullptr);
+        restoredWindow.show();
+        cliApp.processEvents();
+
+        QString restoreError;
+        if (!restoredWindow.restoreStructuralSessionForTesting(sessionStatePath, &restoreError)) {
+            return finishFail(866, QStringLiteral("session_restore_failed:%1").arg(restoreError));
+        }
+
+        const QString restoredSummary = restoredWindow.structuralSessionSummaryForTesting();
+        log.writeLine(QStringLiteral("restored_summary=%1").arg(restoredSummary));
+
+        QJsonParseError savedParse;
+        const QJsonDocument savedDoc = QJsonDocument::fromJson(savedSummary.toUtf8(), &savedParse);
+        QJsonParseError restoredParse;
+        const QJsonDocument restoredDoc = QJsonDocument::fromJson(restoredSummary.toUtf8(), &restoredParse);
+        if (savedParse.error != QJsonParseError::NoError || restoredParse.error != QJsonParseError::NoError
+            || !savedDoc.isObject() || !restoredDoc.isObject()) {
+            return finishFail(867, QStringLiteral("session_summary_parse_failed"));
+        }
+
+        const QJsonObject savedObj = savedDoc.object();
+        const QJsonObject restoredObj = restoredDoc.object();
+
+        const bool panelOpenOk = savedObj.value(QStringLiteral("panelOpen")).toBool() == restoredObj.value(QStringLiteral("panelOpen")).toBool();
+        const bool activeTabOk = savedObj.value(QStringLiteral("activeTab")).toInt() == restoredObj.value(QStringLiteral("activeTab")).toInt();
+        const bool viewModeOk = savedObj.value(QStringLiteral("viewMode")).toInt() == restoredObj.value(QStringLiteral("viewMode")).toInt();
+        const bool queryOkRestored = savedObj.value(QStringLiteral("currentQuery")).toString() == restoredObj.value(QStringLiteral("currentQuery")).toString();
+        const bool filterOk = savedObj.value(QStringLiteral("categoryFilter")).toString() == restoredObj.value(QStringLiteral("categoryFilter")).toString()
+            && savedObj.value(QStringLiteral("statusFilter")).toString() == restoredObj.value(QStringLiteral("statusFilter")).toString()
+            && savedObj.value(QStringLiteral("textFilter")).toString() == restoredObj.value(QStringLiteral("textFilter")).toString();
+        const bool sortOk = savedObj.value(QStringLiteral("sortField")).toInt() == restoredObj.value(QStringLiteral("sortField")).toInt()
+            && savedObj.value(QStringLiteral("sortDirection")).toInt() == restoredObj.value(QStringLiteral("sortDirection")).toInt();
+
+        int refreshTab = -1;
+        QString refreshLabel;
+        int refreshRows = 0;
+        QString refreshQuery;
+        int historySize = 0;
+        int historyIndex = -1;
+        QString refreshError;
+        const bool refreshOk = restoredWindow.triggerStructuralRefreshForTesting(&refreshTab,
+                                                                                  &refreshLabel,
+                                                                                  &refreshRows,
+                                                                                  &refreshQuery,
+                                                                                  &historySize,
+                                                                                  &historyIndex,
+                                                                                  &refreshError);
+        const bool restoredQueryPathOk = refreshOk && refreshRows > 0;
+
+        log.writeLine(QStringLiteral("restored_refresh_ok=%1").arg(refreshOk ? QStringLiteral("true") : QStringLiteral("false")));
+        log.writeLine(QStringLiteral("restored_refresh_rows=%1").arg(refreshRows));
+        log.writeLine(QStringLiteral("restored_refresh_tab=%1").arg(refreshTab));
+        log.writeLine(QStringLiteral("restored_refresh_label=%1").arg(refreshLabel));
+        log.writeLine(QStringLiteral("restored_refresh_query=%1").arg(refreshQuery));
+        log.writeLine(QStringLiteral("restored_refresh_error=%1").arg(refreshError));
+
+        const bool sessionModelExists = QFileInfo::exists(sessionStatePath)
+            && savedObj.contains(QStringLiteral("panelOpen"))
+            && savedObj.contains(QStringLiteral("activeTab"))
+            && savedObj.contains(QStringLiteral("viewMode"))
+            && savedObj.contains(QStringLiteral("currentQuery"))
+            && savedObj.contains(QStringLiteral("queryHistory"));
+
+        log.writeLine(QStringLiteral("gate_session_state_model_exists=%1").arg(sessionModelExists ? QStringLiteral("PASS") : QStringLiteral("FAIL")));
+        log.writeLine(QStringLiteral("gate_panel_open_restores=%1").arg(panelOpenOk ? QStringLiteral("PASS") : QStringLiteral("FAIL")));
+        log.writeLine(QStringLiteral("gate_active_tab_restores=%1").arg(activeTabOk ? QStringLiteral("PASS") : QStringLiteral("FAIL")));
+        log.writeLine(QStringLiteral("gate_view_mode_restores=%1").arg(viewModeOk ? QStringLiteral("PASS") : QStringLiteral("FAIL")));
+        log.writeLine(QStringLiteral("gate_structural_query_restores=%1").arg(queryOkRestored ? QStringLiteral("PASS") : QStringLiteral("FAIL")));
+        log.writeLine(QStringLiteral("gate_filter_state_restores=%1").arg(filterOk ? QStringLiteral("PASS") : QStringLiteral("FAIL")));
+        log.writeLine(QStringLiteral("gate_sort_state_restores=%1").arg(sortOk ? QStringLiteral("PASS") : QStringLiteral("FAIL")));
+        log.writeLine(QStringLiteral("gate_restored_query_path_works=%1").arg(restoredQueryPathOk ? QStringLiteral("PASS") : QStringLiteral("FAIL")));
+
+        const bool pass = sessionModelExists
+            && panelOpenOk
+            && activeTabOk
+            && viewModeOk
+            && queryOkRestored
+            && filterOk
+            && sortOk
+            && restoredQueryPathOk;
+
+        if (!pass) {
+            return finishFail(868, QStringLiteral("session_restore_gate_failed"));
+        }
+
+        log.writeLine(QStringLiteral("final_status=PASS"));
+        log.writeLine(QStringLiteral("exit_code=0"));
+        log.writeLine(QStringLiteral("failure_reason="));
+        log.writeLine(QStringLiteral("timestamp_utc_end=%1").arg(QDateTime::currentDateTimeUtc().toString(Qt::ISODate)));
+        std::_Exit(0);
+    } catch (const std::exception& ex) {
+        writeStderrLine(QStringLiteral("session_restore_smoke_error=unexpected_exception"));
+        return finishFail(869, QStringLiteral("unexpected_exception:%1").arg(QString::fromLocal8Bit(ex.what())));
+    } catch (...) {
+        writeStderrLine(QStringLiteral("session_restore_smoke_error=unexpected_error"));
+        return finishFail(870, QStringLiteral("unexpected_error"));
+    }
+}
+
 int runArchiveSmokeCli(int argc, char* argv[])
 {
     QCoreApplication cliApp(argc, argv);
@@ -10509,6 +10864,10 @@ int main(int argc, char* argv[])
 
     if (hasExportSmokeFlag(argc, argv)) {
         return runExportSmokeCli(argc, argv);
+    }
+
+    if (hasSessionRestoreSmokeFlag(argc, argv)) {
+        return runSessionRestoreSmokeCli(argc, argv);
     }
 
     if (hasSnapshotDiffSmokeFlag(argc, argv)) {

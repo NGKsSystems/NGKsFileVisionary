@@ -4,6 +4,7 @@
 #include <QAction>
 #include <QClipboard>
 #include <QCheckBox>
+#include <QCloseEvent>
 #include <QCoreApplication>
 #include <QComboBox>
 #include <QCryptographicHash>
@@ -74,6 +75,8 @@
 #include "model/StructuralRankingEngine.h"
 #include "model/StructuralResultAdapter.h"
 #include "model/StructuralSortEngine.h"
+#include "session/StructuralSessionState.h"
+#include "session/StructuralSessionStore.h"
 #include "export/StructuralExportEngine.h"
 #include "export/StructuralExportFormat.h"
 #include "query/QueryBarWidget.h"
@@ -128,6 +131,7 @@ MainWindow::MainWindow(bool testMode,
     m_uiDbPath = uiDbPathOverride.trimmed().isEmpty() ? resolveUiDbPath() : QDir::cleanPath(uiDbPathOverride);
     configureObjectNames();
     ensureUiActionTracePath();
+    restoreStructuralSessionStateIfAvailable();
     maybeOpenStartupRoot();
 
     m_publishTimer.setInterval(16);
@@ -143,6 +147,7 @@ MainWindow::MainWindow(bool testMode,
 
 MainWindow::~MainWindow()
 {
+    persistStructuralSessionState();
     m_snapshotCancelRequested.store(true);
     if (m_snapshotWatcher) {
         m_snapshotWatcher->waitForFinished();
@@ -166,6 +171,12 @@ MainWindow::~MainWindow()
 
     delete m_directoryModel;
     m_directoryModel = nullptr;
+}
+
+void MainWindow::closeEvent(QCloseEvent* event)
+{
+    persistStructuralSessionState();
+    QMainWindow::closeEvent(event);
 }
 
 bool MainWindow::triggerShowHistoryForTesting(const QString& rootPath,
@@ -596,6 +607,9 @@ void MainWindow::setupStructuralPanel()
     connect(m_structuralShowReferencesButton, &QPushButton::clicked, this, &MainWindow::onStructuralShowReferences);
     connect(m_structuralShowUsedByButton, &QPushButton::clicked, this, &MainWindow::onStructuralShowUsedBy);
     connect(m_structuralTabWidget, &QTabWidget::currentChanged, this, &MainWindow::onStructuralPanelTabChanged);
+    connect(m_structuralPanelDock, &QDockWidget::visibilityChanged, this, [this](bool) {
+        persistStructuralSessionState();
+    });
     connect(m_structuralTableViewButton, &QPushButton::clicked, this, [this]() {
         setStructuralViewMode(0);
     });
@@ -644,6 +658,7 @@ void MainWindow::setupStructuralPanel()
         updateStructuralFilterStateFromControls();
         updateStructuralSortStateFromControls();
         applyStructuralFiltersToCurrentRows(m_structuralStatusPrefix);
+        persistStructuralSessionState();
     };
     connect(m_structuralCategoryFilterCombo, &QComboBox::currentIndexChanged, this, [applyFilters](int) { applyFilters(); });
     connect(m_structuralStatusFilterCombo, &QComboBox::currentIndexChanged, this, [applyFilters](int) { applyFilters(); });
@@ -1176,6 +1191,7 @@ void MainWindow::onQuerySubmitted(const QString& text)
     if (dispatchQueryToExistingPanel(query, &structuralError, &structuralTab, &structuralRows, true, false)) {
         m_queryModeActive = false;
         m_activeQueryString.clear();
+        persistStructuralSessionState();
         appendRuntimeLog(QStringLiteral("querybar_structural_dispatch_ok query=%1 tab=%2 rows=%3")
                              .arg(query)
                              .arg(structuralTab)
@@ -2370,6 +2386,7 @@ void MainWindow::onActionOpenStructuralPanel()
     }
     m_structuralPanelState.activeTab = m_structuralTabWidget ? m_structuralTabWidget->currentIndex() : 0;
     updateStructuralNavigationButtons();
+    persistStructuralSessionState();
 
     logUiAction(QStringLiteral("Open Structural Panel"),
                 QStringLiteral("onActionOpenStructuralPanel"),
@@ -2385,6 +2402,7 @@ void MainWindow::onStructuralPanelTabChanged(int index)
         m_structuralReferenceStatusLabel->setText(QStringLiteral("References tab ready"));
     }
     updateStructuralNavigationButtons();
+    persistStructuralSessionState();
 }
 
 void MainWindow::onStructuralCompareSnapshots()
@@ -2954,6 +2972,8 @@ void MainWindow::setStructuralViewMode(int mode)
                 .arg(m_structuralGraphWidget ? m_structuralGraphWidget->nodePathsForTesting().size() : 0)
                 .arg(m_structuralGraphWidget ? m_structuralGraphWidget->edgeKeysForTesting().size() : 0));
     }
+
+    persistStructuralSessionState();
 }
 
 void MainWindow::updateStructuralGraphFromCanonicalRows()
@@ -3459,9 +3479,151 @@ bool MainWindow::dispatchQueryToExistingPanel(const QString& queryText,
                                                         forceRefresh);
     if (handled) {
         m_structuralPanelState.lastResults = collectCurrentModelRows();
+        persistStructuralSessionState();
     }
     updateStructuralNavigationButtons();
     return handled;
+}
+
+void MainWindow::persistStructuralSessionState()
+{
+    if (m_restoringStructuralSession) {
+        return;
+    }
+
+    QString errorText;
+    saveStructuralSessionToPath(StructuralSessionStore::defaultStatePath(), &errorText);
+}
+
+void MainWindow::restoreStructuralSessionStateIfAvailable()
+{
+    QString errorText;
+    restoreStructuralSessionFromPath(StructuralSessionStore::defaultStatePath(), &errorText);
+}
+
+bool MainWindow::saveStructuralSessionToPath(const QString& path, QString* errorText) const
+{
+    StructuralSessionState state;
+    state.panelOpen = m_structuralPanelDock && m_structuralPanelDock->isVisible();
+    state.activeTab = m_structuralTabWidget ? qMax(0, m_structuralTabWidget->currentIndex()) : 0;
+    state.viewMode = m_structuralViewMode;
+    state.currentQuery = m_structuralPanelState.currentQuery;
+    state.rootPath = m_structuralRootPath;
+    state.targetPath = m_structuralTargetPath;
+
+    auto comboData = [](QComboBox* combo) {
+        if (!combo || combo->currentIndex() < 0) {
+            return QString();
+        }
+        return combo->currentData().toString();
+    };
+
+    state.categoryFilter = comboData(m_structuralCategoryFilterCombo);
+    state.statusFilter = comboData(m_structuralStatusFilterCombo);
+    state.extensionFilter = comboData(m_structuralExtensionFilterCombo);
+    state.relationshipFilter = comboData(m_structuralRelationshipFilterCombo);
+    state.textFilter = m_structuralTextFilterEdit ? m_structuralTextFilterEdit->text() : QString();
+    state.sortField = static_cast<int>(m_structuralSortField);
+    state.sortDirection = static_cast<int>(m_structuralSortDirection);
+    state.historyIndex = m_structuralPanelState.queryHistoryIndex;
+    state.queryHistory = m_structuralPanelState.queryHistory;
+
+    return StructuralSessionStore::saveToPath(path, state, errorText);
+}
+
+bool MainWindow::restoreStructuralSessionFromPath(const QString& path, QString* errorText)
+{
+    StructuralSessionState state;
+    QString localError;
+    if (!StructuralSessionStore::loadFromPath(path, &state, &localError)) {
+        if (errorText) {
+            *errorText = localError;
+        }
+        return false;
+    }
+
+    if (!ensureStructuralPanel()) {
+        if (errorText) {
+            *errorText = QStringLiteral("structural_panel_unavailable");
+        }
+        return false;
+    }
+
+    m_restoringStructuralSession = true;
+
+    if (!state.rootPath.trimmed().isEmpty()) {
+        m_structuralRootPath = QDir::fromNativeSeparators(QDir::cleanPath(state.rootPath));
+        if (m_rootEdit) {
+            m_rootEdit->setText(m_structuralRootPath);
+        }
+    }
+    if (!state.targetPath.trimmed().isEmpty()) {
+        m_structuralTargetPath = QDir::fromNativeSeparators(QDir::cleanPath(state.targetPath));
+    }
+
+    auto setComboByData = [](QComboBox* combo, const QString& token) {
+        if (!combo) {
+            return;
+        }
+        const int idx = combo->findData(token);
+        combo->setCurrentIndex(idx >= 0 ? idx : 0);
+    };
+
+    setComboByData(m_structuralCategoryFilterCombo, state.categoryFilter);
+    setComboByData(m_structuralStatusFilterCombo, state.statusFilter);
+    setComboByData(m_structuralExtensionFilterCombo, state.extensionFilter);
+    setComboByData(m_structuralRelationshipFilterCombo, state.relationshipFilter);
+    if (m_structuralTextFilterEdit) {
+        m_structuralTextFilterEdit->setText(state.textFilter);
+    }
+
+    m_structuralSortField = static_cast<StructuralSortField>(state.sortField);
+    m_structuralSortDirection = static_cast<StructuralSortDirection>(state.sortDirection);
+    if (m_structuralSortFieldCombo) {
+        const int sortIndex = m_structuralSortFieldCombo->findData(static_cast<int>(m_structuralSortField));
+        m_structuralSortFieldCombo->setCurrentIndex(sortIndex >= 0 ? sortIndex : 0);
+    }
+    if (m_structuralSortDirectionButton) {
+        m_structuralSortDirectionButton->setText(m_structuralSortDirection == StructuralSortDirection::Ascending
+                                                     ? QStringLiteral("Sort: Asc")
+                                                     : QStringLiteral("Sort: Desc"));
+    }
+
+    if (m_structuralTabWidget && m_structuralTabWidget->count() > 0) {
+        m_structuralTabWidget->setCurrentIndex(qBound(0, state.activeTab, m_structuralTabWidget->count() - 1));
+    }
+    setStructuralViewMode(qBound(0, state.viewMode, 2));
+
+    m_structuralPanelState.queryHistory = state.queryHistory;
+    m_structuralPanelState.queryHistoryIndex = state.historyIndex;
+    m_structuralPanelState.currentQuery = state.currentQuery;
+
+    if (!state.currentQuery.trimmed().isEmpty()) {
+        int tab = -1;
+        int rows = 0;
+        QString dispatchError;
+        dispatchQueryToExistingPanel(state.currentQuery, &dispatchError, &tab, &rows, false, true);
+    } else {
+        updateStructuralFilterStateFromControls();
+        updateStructuralSortStateFromControls();
+        if (!m_structuralCanonicalRows.isEmpty()) {
+            applyStructuralFiltersToCurrentRows(m_structuralStatusPrefix);
+        }
+    }
+
+    if (m_structuralPanelDock) {
+        if (state.panelOpen) {
+            m_structuralPanelDock->show();
+            m_structuralPanelDock->raise();
+        } else {
+            m_structuralPanelDock->hide();
+        }
+    }
+
+    updateStructuralNavigationButtons();
+    m_restoringStructuralSession = false;
+    persistStructuralSessionState();
+    return true;
 }
 
 bool MainWindow::navigateStructuralBack(QString* errorText,
@@ -4235,6 +4397,105 @@ int MainWindow::structuralQueryHistoryIndexForTesting() const
 QString MainWindow::structuralCurrentQueryForTesting() const
 {
     return m_structuralPanelState.currentQuery;
+}
+
+bool MainWindow::saveStructuralSessionForTesting(const QString& path, QString* errorText) const
+{
+    return saveStructuralSessionToPath(path, errorText);
+}
+
+bool MainWindow::restoreStructuralSessionForTesting(const QString& path, QString* errorText)
+{
+    return restoreStructuralSessionFromPath(path, errorText);
+}
+
+bool MainWindow::configureStructuralSessionStateForTesting(int activeTab,
+                                                           int viewMode,
+                                                           const QString& categoryFilter,
+                                                           const QString& statusFilter,
+                                                           const QString& textFilter,
+                                                           StructuralSortField sortField,
+                                                           StructuralSortDirection sortDirection,
+                                                           QString* errorText)
+{
+    if (!ensureStructuralPanel()) {
+        if (errorText) {
+            *errorText = QStringLiteral("structural_panel_unavailable");
+        }
+        return false;
+    }
+
+    if (m_structuralPanelDock) {
+        m_structuralPanelDock->show();
+    }
+
+    if (m_structuralTabWidget && m_structuralTabWidget->count() > 0) {
+        m_structuralTabWidget->setCurrentIndex(qBound(0, activeTab, m_structuralTabWidget->count() - 1));
+    }
+    setStructuralViewMode(qBound(0, viewMode, 2));
+
+    auto setComboByData = [](QComboBox* combo, const QString& token) {
+        if (!combo) {
+            return;
+        }
+        const int idx = combo->findData(token);
+        combo->setCurrentIndex(idx >= 0 ? idx : 0);
+    };
+    setComboByData(m_structuralCategoryFilterCombo, categoryFilter);
+    setComboByData(m_structuralStatusFilterCombo, statusFilter);
+    if (m_structuralTextFilterEdit) {
+        m_structuralTextFilterEdit->setText(textFilter);
+    }
+
+    m_structuralSortField = sortField;
+    m_structuralSortDirection = sortDirection;
+    if (m_structuralSortFieldCombo) {
+        const int sortIndex = m_structuralSortFieldCombo->findData(static_cast<int>(sortField));
+        m_structuralSortFieldCombo->setCurrentIndex(sortIndex >= 0 ? sortIndex : 0);
+    }
+    if (m_structuralSortDirectionButton) {
+        m_structuralSortDirectionButton->setText(sortDirection == StructuralSortDirection::Ascending
+                                                     ? QStringLiteral("Sort: Asc")
+                                                     : QStringLiteral("Sort: Desc"));
+    }
+
+    updateStructuralFilterStateFromControls();
+    updateStructuralSortStateFromControls();
+    if (!m_structuralCanonicalRows.isEmpty()) {
+        applyStructuralFiltersToCurrentRows(m_structuralStatusPrefix);
+    }
+    persistStructuralSessionState();
+    return true;
+}
+
+QString MainWindow::structuralSessionSummaryForTesting() const
+{
+    StructuralSessionState state;
+    state.panelOpen = m_structuralPanelDock && m_structuralPanelDock->isVisible();
+    state.activeTab = m_structuralTabWidget ? m_structuralTabWidget->currentIndex() : 0;
+    state.viewMode = m_structuralViewMode;
+    state.currentQuery = m_structuralPanelState.currentQuery;
+    state.rootPath = m_structuralRootPath;
+    state.targetPath = m_structuralTargetPath;
+    state.categoryFilter = (m_structuralCategoryFilterCombo && m_structuralCategoryFilterCombo->currentIndex() >= 0)
+        ? m_structuralCategoryFilterCombo->currentData().toString()
+        : QString();
+    state.statusFilter = (m_structuralStatusFilterCombo && m_structuralStatusFilterCombo->currentIndex() >= 0)
+        ? m_structuralStatusFilterCombo->currentData().toString()
+        : QString();
+    state.extensionFilter = (m_structuralExtensionFilterCombo && m_structuralExtensionFilterCombo->currentIndex() >= 0)
+        ? m_structuralExtensionFilterCombo->currentData().toString()
+        : QString();
+    state.relationshipFilter = (m_structuralRelationshipFilterCombo && m_structuralRelationshipFilterCombo->currentIndex() >= 0)
+        ? m_structuralRelationshipFilterCombo->currentData().toString()
+        : QString();
+    state.textFilter = m_structuralTextFilterEdit ? m_structuralTextFilterEdit->text() : QString();
+    state.sortField = static_cast<int>(m_structuralSortField);
+    state.sortDirection = static_cast<int>(m_structuralSortDirection);
+    state.historyIndex = m_structuralPanelState.queryHistoryIndex;
+    state.queryHistory = m_structuralPanelState.queryHistory;
+
+    return QString::fromUtf8(QJsonDocument(state.toJson()).toJson(QJsonDocument::Compact));
 }
 
 void MainWindow::onActionCopyPath()

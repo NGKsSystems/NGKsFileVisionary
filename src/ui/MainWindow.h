@@ -31,6 +31,7 @@
 #include "core/services/RefreshTypes.h"
 
 class QCheckBox;
+class QCloseEvent;
 class QComboBox;
 class QDockWidget;
 class QLabel;
@@ -134,6 +135,20 @@ public:
     int structuralQueryHistorySizeForTesting() const;
     int structuralQueryHistoryIndexForTesting() const;
     QString structuralCurrentQueryForTesting() const;
+    bool saveStructuralSessionForTesting(const QString& path, QString* errorText = nullptr) const;
+    bool restoreStructuralSessionForTesting(const QString& path, QString* errorText = nullptr);
+    bool configureStructuralSessionStateForTesting(int activeTab,
+                                                   int viewMode,
+                                                   const QString& categoryFilter,
+                                                   const QString& statusFilter,
+                                                   const QString& textFilter,
+                                                   StructuralSortField sortField,
+                                                   StructuralSortDirection sortDirection,
+                                                   QString* errorText = nullptr);
+    QString structuralSessionSummaryForTesting() const;
+
+protected:
+    void closeEvent(QCloseEvent* event) override;
 
 private slots:
     void onBrowseRoot();
@@ -324,6 +339,10 @@ private:
                                    int* removedCount = nullptr,
                                    int* changedCount = nullptr,
                                    QString* errorText = nullptr);
+    void persistStructuralSessionState();
+    void restoreStructuralSessionStateIfAvailable();
+    bool saveStructuralSessionToPath(const QString& path, QString* errorText = nullptr) const;
+    bool restoreStructuralSessionFromPath(const QString& path, QString* errorText = nullptr);
 
 private:
     FileModel m_fileModel;
@@ -462,4 +481,5 @@ private:
     QVector<StructuralTimelineEvent> m_structuralTimelineEvents;
     int m_structuralViewMode = 0;
     StructuralPanelState m_structuralPanelState;
+    bool m_restoringStructuralSession = false;
 };
