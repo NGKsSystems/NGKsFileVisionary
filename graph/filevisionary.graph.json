@@ -58,6 +58,8 @@
         "src/ui/timeline/StructuralTimelineEvent.cpp",
         "src/ui/timeline/StructuralTimelineBuilder.cpp",
         "src/ui/timeline/StructuralTimelineWidget.cpp",
+        "src/ui/query/StructuralQueryAutocomplete.cpp",
+        "src/ui/query/StructuralSuggestionModel.cpp",
         "src/ui/model/StructuralResultRow.cpp",
         "src/ui/model/StructuralResultAdapter.cpp",
         "src/ui/model/StructuralFilterState.cpp",

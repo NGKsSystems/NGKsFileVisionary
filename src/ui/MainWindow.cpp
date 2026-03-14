@@ -654,6 +654,7 @@ void MainWindow::setupStructuralPanel()
     setStructuralViewMode(0);
     updateStructuralGraphFromCanonicalRows();
     updateStructuralTimelineFromCanonicalRows();
+    refreshQueryAutocompleteContext();
     updateStructuralNavigationButtons();
 }
 
@@ -1562,23 +1563,39 @@ void MainWindow::onTreeActivated(const QModelIndex& index)
     const bool modelSaysFolder = QString::compare(type, QStringLiteral("Folder"), Qt::CaseInsensitive) == 0;
     const QFileInfo fileInfo(path);
 
+    auto rememberPathForAutocomplete = [this](const QString& rawPath) {
+        const QString normalized = QDir::fromNativeSeparators(QDir::cleanPath(rawPath));
+        if (normalized.trimmed().isEmpty()) {
+            return;
+        }
+        m_recentStructuralPaths.push_back(normalized);
+        m_recentStructuralPaths.removeDuplicates();
+        while (m_recentStructuralPaths.size() > 200) {
+            m_recentStructuralPaths.removeFirst();
+        }
+        refreshQueryAutocompleteContext();
+    };
+
     if (PathUtils::isArchiveVirtualPath(path)) {
         if (modelSaysFolder) {
             appendRuntimeLog(QStringLiteral("tree_activated_archive_virtual_dir path=%1").arg(path));
             navigateToDirectory(path);
         }
+        rememberPathForAutocomplete(path);
         return;
     }
 
     if (PathUtils::isArchivePath(path)) {
         appendRuntimeLog(QStringLiteral("tree_activated_archive_file path=%1").arg(path));
         navigateToDirectory(path);
+        rememberPathForAutocomplete(path);
         return;
     }
 
     if (isInternalNavigableDirectory(fileInfo)) {
         appendRuntimeLog(QStringLiteral("tree_activated_internal_dir path=%1").arg(path));
         navigateToDirectory(path);
+        rememberPathForAutocomplete(path);
         return;
     }
 
@@ -1587,6 +1604,7 @@ void MainWindow::onTreeActivated(const QModelIndex& index)
                              .arg(path)
                              .arg(fileInfo.suffix())
                              .arg(fileInfo.isSymLink() ? QStringLiteral("true") : QStringLiteral("false")));
+        rememberPathForAutocomplete(path);
         QDesktopServices::openUrl(QUrl::fromLocalFile(path));
     }
 }
@@ -2553,6 +2571,16 @@ void MainWindow::updateStructuralPanelContextLabel()
         QStringLiteral("Root: %1 | Target: %2")
             .arg(m_structuralRootPath.isEmpty() ? QStringLiteral("(none)") : m_structuralRootPath)
             .arg(m_structuralTargetPath.isEmpty() ? QStringLiteral("(none)") : m_structuralTargetPath));
+
+    if (!m_structuralTargetPath.trimmed().isEmpty()) {
+        const QString normalized = QDir::fromNativeSeparators(QDir::cleanPath(m_structuralTargetPath));
+        m_recentStructuralPaths.push_back(normalized);
+        m_recentStructuralPaths.removeDuplicates();
+        while (m_recentStructuralPaths.size() > 200) {
+            m_recentStructuralPaths.removeFirst();
+        }
+    }
+    refreshQueryAutocompleteContext();
 }
 
 bool MainWindow::refreshStructuralSnapshotSelectors(QString* errorText)
@@ -2600,7 +2628,18 @@ bool MainWindow::refreshStructuralSnapshotSelectors(QString* errorText)
         const QString label = QStringLiteral("%1 (%2)").arg(snapshot.snapshotName, QString::number(snapshot.id));
         m_structuralOldSnapshotCombo->addItem(label, snapshot.id);
         m_structuralNewSnapshotCombo->addItem(label, snapshot.id);
+        m_recentSnapshotTokens.push_back(QString::number(snapshot.id));
+        if (!snapshot.snapshotName.trimmed().isEmpty()) {
+            m_recentSnapshotTokens.push_back(QStringLiteral("%1:%2").arg(snapshot.id).arg(snapshot.snapshotName));
+        }
     }
+
+    m_recentSnapshotTokens.removeDuplicates();
+    while (m_recentSnapshotTokens.size() > 200) {
+        m_recentSnapshotTokens.removeFirst();
+    }
+
+    refreshQueryAutocompleteContext();
 
     if (snapshots.size() >= 2) {
         m_structuralOldSnapshotCombo->setCurrentIndex(1);
@@ -3026,6 +3065,60 @@ void MainWindow::onStructuralTimelineEventActivated(const QString& absolutePath)
     }
 }
 
+void MainWindow::refreshQueryAutocompleteContext()
+{
+    if (!m_queryBarWidget) {
+        return;
+    }
+
+    StructuralAutocompleteContext context;
+    context.currentTargetPath = m_structuralTargetPath;
+
+    QStringList knownPaths = m_recentStructuralPaths;
+    if (!m_structuralTargetPath.trimmed().isEmpty()) {
+        knownPaths.push_back(QDir::fromNativeSeparators(QDir::cleanPath(m_structuralTargetPath)));
+    }
+
+    for (const StructuralResultRow& row : m_structuralCanonicalRows) {
+        if (!row.primaryPath.trimmed().isEmpty()) {
+            knownPaths.push_back(QDir::fromNativeSeparators(QDir::cleanPath(row.primaryPath)));
+        }
+        if (!row.secondaryPath.trimmed().isEmpty()) {
+            knownPaths.push_back(QDir::fromNativeSeparators(QDir::cleanPath(row.secondaryPath)));
+        }
+        if (!row.sourceFile.trimmed().isEmpty()) {
+            knownPaths.push_back(QDir::fromNativeSeparators(QDir::cleanPath(row.sourceFile)));
+        }
+        if (row.hasSnapshotId && row.snapshotId > 0) {
+            m_recentSnapshotTokens.push_back(QString::number(row.snapshotId));
+        }
+    }
+
+    if (m_structuralOldSnapshotCombo) {
+        for (int i = 0; i < m_structuralOldSnapshotCombo->count(); ++i) {
+            const qint64 id = m_structuralOldSnapshotCombo->itemData(i).toLongLong();
+            if (id > 0) {
+                m_recentSnapshotTokens.push_back(QString::number(id));
+                m_recentSnapshotTokens.push_back(QStringLiteral("%1:%2").arg(id).arg(m_structuralOldSnapshotCombo->itemText(i)));
+            }
+        }
+    }
+
+    knownPaths.removeDuplicates();
+    while (knownPaths.size() > 300) {
+        knownPaths.removeFirst();
+    }
+
+    m_recentSnapshotTokens.removeDuplicates();
+    while (m_recentSnapshotTokens.size() > 300) {
+        m_recentSnapshotTokens.removeFirst();
+    }
+
+    context.knownPaths = knownPaths;
+    context.snapshotTokens = m_recentSnapshotTokens;
+    m_queryBarWidget->setAutocompleteContext(context);
+}
+
 void MainWindow::updateStructuralFilterControlChoices(const QVector<StructuralResultRow>& canonicalRows)
 {
     if (!m_structuralExtensionFilterCombo || !m_structuralRelationshipFilterCombo) {
@@ -3211,6 +3304,7 @@ void MainWindow::setStructuralCanonicalRows(const QVector<StructuralResultRow>& 
     updateStructuralSortStateFromControls();
     updateStructuralGraphFromCanonicalRows();
     updateStructuralTimelineFromCanonicalRows();
+    refreshQueryAutocompleteContext();
     applyStructuralFiltersToCurrentRows(statusPrefix);
 }
 

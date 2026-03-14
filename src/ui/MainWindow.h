@@ -289,6 +289,7 @@ private:
     void setStructuralGraphModeEnabled(bool enabled);
     void onStructuralGraphNodeActivated(const QString& absolutePath);
     void onStructuralTimelineEventActivated(const QString& absolutePath);
+    void refreshQueryAutocompleteContext();
     void updateStructuralFilterControlChoices(const QVector<StructuralResultRow>& canonicalRows);
     void applyStructuralFiltersToCurrentRows(const QString& statusPrefix = QString());
     void clearStructuralFilters(bool applyNow = true);
@@ -385,6 +386,8 @@ private:
     QueryController* m_queryController = nullptr;
     QString m_activeQueryString;
     bool m_queryModeActive = false;
+    QStringList m_recentStructuralPaths;
+    QStringList m_recentSnapshotTokens;
     QStringList m_actionContextPaths;
     QString m_actionContextType;
     QDateTime m_lastRefreshRequeryAt;

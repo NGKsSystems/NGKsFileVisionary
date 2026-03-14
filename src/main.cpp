@@ -60,6 +60,7 @@
 #include "ui/timeline/StructuralTimelineWidget.h"
 #include "ui/model/DirectoryModel.h"
 #include "ui/model/QueryResultAdapter.h"
+#include "ui/query/StructuralQueryAutocomplete.h"
 #include "ui/model/StructuralFilterEngine.h"
 #include "ui/model/StructuralFilterState.h"
 #include "ui/model/StructuralRankingEngine.h"
@@ -214,6 +215,15 @@ struct TimelineSmokeCliOptions {
     QString historyDbPath;
     QString historyRoot;
     QString timelineLogPath;
+    QStringList argsReceived;
+    QString parseError;
+};
+
+struct QueryAutocompleteSmokeCliOptions {
+    bool enabled = false;
+    QString historyDbPath;
+    QString historyRoot;
+    QString autocompleteLogPath;
     QStringList argsReceived;
     QString parseError;
 };
@@ -499,6 +509,16 @@ bool hasTimelineSmokeFlag(int argc, char* argv[])
 {
     for (int i = 1; i < argc; ++i) {
         if (QString::fromLocal8Bit(argv[i]) == QStringLiteral("--timeline-smoke")) {
+            return true;
+        }
+    }
+    return false;
+}
+
+bool hasQueryAutocompleteSmokeFlag(int argc, char* argv[])
+{
+    for (int i = 1; i < argc; ++i) {
+        if (QString::fromLocal8Bit(argv[i]) == QStringLiteral("--query-autocomplete-smoke")) {
             return true;
         }
     }
@@ -1453,6 +1473,59 @@ TimelineSmokeCliOptions parseTimelineSmokeOptions(int argc, char* argv[])
                 break;
             }
             options.timelineLogPath = QDir::cleanPath(options.timelineLogPath);
+            continue;
+        }
+    }
+
+    return options;
+}
+
+QueryAutocompleteSmokeCliOptions parseQueryAutocompleteSmokeOptions(int argc, char* argv[])
+{
+    QueryAutocompleteSmokeCliOptions options;
+
+    for (int i = 0; i < argc; ++i) {
+        options.argsReceived << QString::fromLocal8Bit(argv[i]);
+    }
+
+    for (int i = 1; i < argc; ++i) {
+        const QString token = QString::fromLocal8Bit(argv[i]);
+        if (token == QStringLiteral("--query-autocomplete-smoke")) {
+            options.enabled = true;
+            continue;
+        }
+
+        auto consumeValue = [&](QString* out) {
+            if ((i + 1) >= argc) {
+                options.parseError = QStringLiteral("missing_value_for_%1").arg(token);
+                return false;
+            }
+            ++i;
+            *out = QString::fromLocal8Bit(argv[i]);
+            return true;
+        };
+
+        if (token == QStringLiteral("--history-db-path")) {
+            if (!consumeValue(&options.historyDbPath)) {
+                break;
+            }
+            options.historyDbPath = QDir::cleanPath(options.historyDbPath);
+            continue;
+        }
+
+        if (token == QStringLiteral("--history-root")) {
+            if (!consumeValue(&options.historyRoot)) {
+                break;
+            }
+            options.historyRoot = QDir::cleanPath(options.historyRoot);
+            continue;
+        }
+
+        if (token == QStringLiteral("--autocomplete-log")) {
+            if (!consumeValue(&options.autocompleteLogPath)) {
+                break;
+            }
+            options.autocompleteLogPath = QDir::cleanPath(options.autocompleteLogPath);
             continue;
         }
     }
@@ -6010,6 +6083,238 @@ int runTimelineSmokeCli(int argc, char* argv[])
     }
 }
 
+int runQueryAutocompleteSmokeCli(int argc, char* argv[])
+{
+    QApplication cliApp(argc, argv);
+
+    const QueryAutocompleteSmokeCliOptions options = parseQueryAutocompleteSmokeOptions(argc, argv);
+    const QString exePath = QFileInfo(QString::fromLocal8Bit(argv[0])).absoluteFilePath();
+    const QString cwd = QDir::currentPath();
+
+    if (!options.parseError.isEmpty()) {
+        writeStderrLine(QStringLiteral("query_autocomplete_smoke_parse_error=%1").arg(options.parseError));
+        return 822;
+    }
+    if (options.autocompleteLogPath.trimmed().isEmpty()) {
+        writeStderrLine(QStringLiteral("query_autocomplete_smoke_error=missing_required_arg_--autocomplete-log"));
+        return 823;
+    }
+
+    IndexSmokeLogWriter log;
+    QString logOpenError;
+    if (!log.open(options.autocompleteLogPath, &logOpenError)) {
+        writeStderrLine(QStringLiteral("query_autocomplete_smoke_error=log_open_failed"));
+        writeStderrLine(QStringLiteral("query_autocomplete_smoke_log_path=%1").arg(QDir::toNativeSeparators(options.autocompleteLogPath)));
+        writeStderrLine(QStringLiteral("query_autocomplete_smoke_log_error=%1").arg(logOpenError));
+        return 824;
+    }
+
+    auto finishFail = [&](int exitCode, const QString& reason) {
+        log.writeLine(QStringLiteral("final_status=FAIL"));
+        log.writeLine(QStringLiteral("exit_code=%1").arg(exitCode));
+        log.writeLine(QStringLiteral("failure_reason=%1").arg(reason));
+        log.writeLine(QStringLiteral("timestamp_utc_end=%1").arg(QDateTime::currentDateTimeUtc().toString(Qt::ISODate)));
+        return exitCode;
+    };
+
+    auto writeTextFile = [](const QString& filePath, const QString& content, QString* errorText) {
+        const QFileInfo info(filePath);
+        if (!QDir().mkpath(info.absolutePath())) {
+            if (errorText) {
+                *errorText = QStringLiteral("create_parent_dir_failed:%1").arg(info.absolutePath());
+            }
+            return false;
+        }
+
+        QFile out(filePath);
+        if (!out.open(QIODevice::WriteOnly | QIODevice::Text | QIODevice::Truncate)) {
+            if (errorText) {
+                *errorText = QStringLiteral("open_write_failed:%1").arg(out.errorString());
+            }
+            return false;
+        }
+
+        QTextStream ts(&out);
+        ts << content;
+        ts.flush();
+        out.close();
+        return true;
+    };
+
+    try {
+        if (options.historyDbPath.trimmed().isEmpty()) {
+            return finishFail(825, QStringLiteral("missing_required_arg_--history-db-path"));
+        }
+        if (options.historyRoot.trimmed().isEmpty()) {
+            return finishFail(826, QStringLiteral("missing_required_arg_--history-root"));
+        }
+
+        const QString normalizedRoot = QDir::fromNativeSeparators(
+            QDir::cleanPath(QFileInfo(options.historyRoot).absoluteFilePath()));
+        const QString sampleRoot = QDir(normalizedRoot).filePath(QStringLiteral("sample_autocomplete_root"));
+
+        log.writeLine(QStringLiteral("mode=query_autocomplete_smoke"));
+        log.writeLine(QStringLiteral("startup_banner=QUERY_AUTOCOMPLETE_SMOKE_BEGIN"));
+        log.writeLine(QStringLiteral("exe_path=%1").arg(QDir::toNativeSeparators(exePath)));
+        log.writeLine(QStringLiteral("cwd=%1").arg(QDir::toNativeSeparators(cwd)));
+        log.writeLine(QStringLiteral("args_received=%1").arg(options.argsReceived.join(QStringLiteral(" | "))));
+        log.writeLine(QStringLiteral("history_db_path=%1").arg(QDir::toNativeSeparators(options.historyDbPath)));
+        log.writeLine(QStringLiteral("history_root=%1").arg(QDir::toNativeSeparators(normalizedRoot)));
+        log.writeLine(QStringLiteral("sample_root=%1").arg(QDir::toNativeSeparators(sampleRoot)));
+        log.writeLine(QStringLiteral("timestamp_utc=%1").arg(QDateTime::currentDateTimeUtc().toString(Qt::ISODate)));
+
+        QDir sampleDir(sampleRoot);
+        if (sampleDir.exists() && !sampleDir.removeRecursively()) {
+            return finishFail(827, QStringLiteral("sample_root_cleanup_failed"));
+        }
+        if (!QDir().mkpath(QDir(sampleRoot).filePath(QStringLiteral("src")))
+            || !QDir().mkpath(QDir(sampleRoot).filePath(QStringLiteral("docs")))) {
+            return finishFail(828, QStringLiteral("sample_root_create_failed"));
+        }
+
+        QString writeError;
+        if (!writeTextFile(QDir(sampleRoot).filePath(QStringLiteral("src/main.cpp")),
+                           QStringLiteral("#include \"util.h\"\nint main(){ return util(); }\n"),
+                           &writeError)
+            || !writeTextFile(QDir(sampleRoot).filePath(QStringLiteral("src/util.cpp")),
+                              QStringLiteral("#include \"util.h\"\nint util(){ return 1; }\n"),
+                              &writeError)
+            || !writeTextFile(QDir(sampleRoot).filePath(QStringLiteral("src/util.h")),
+                              QStringLiteral("#pragma once\nint util();\n"),
+                              &writeError)
+            || !writeTextFile(QDir(sampleRoot).filePath(QStringLiteral("docs/readme.md")),
+                              QStringLiteral("autocomplete sample\n"),
+                              &writeError)) {
+            return finishFail(829, QStringLiteral("sample_seed_failed:%1").arg(writeError));
+        }
+
+        const QString mainPath = QDir::fromNativeSeparators(QDir::cleanPath(QDir(sampleRoot).filePath(QStringLiteral("src/main.cpp"))));
+        const QString utilHeaderPath = QDir::fromNativeSeparators(QDir::cleanPath(QDir(sampleRoot).filePath(QStringLiteral("src/util.h"))));
+
+        StructuralAutocompleteContext context;
+        context.knownPaths = {
+            mainPath,
+            QDir::fromNativeSeparators(QDir::cleanPath(QDir(sampleRoot).filePath(QStringLiteral("src/util.cpp")))),
+            utilHeaderPath,
+            QDir::fromNativeSeparators(QDir::cleanPath(QDir(sampleRoot).filePath(QStringLiteral("docs/readme.md"))))
+        };
+        context.currentTargetPath = mainPath;
+        context.snapshotTokens = {
+            QStringLiteral("1001"),
+            QStringLiteral("1002"),
+            QStringLiteral("1003"),
+            QStringLiteral("1001:snap_a"),
+            QStringLiteral("1002:snap_b"),
+            QStringLiteral("1003:snap_c")
+        };
+
+        QueryBarWidget queryBar;
+        queryBar.show();
+        queryBar.setAutocompleteContext(context);
+        cliApp.processEvents();
+
+        const QStringList prefixHis = queryBar.suggestionsForInputForTesting(QStringLiteral("his"));
+        const QStringList prefixRef = queryBar.suggestionsForInputForTesting(QStringLiteral("ref"));
+        const QStringList pathRef = queryBar.suggestionsForInputForTesting(QStringLiteral("references:"));
+        const QStringList snapshotDiff = queryBar.suggestionsForInputForTesting(QStringLiteral("diff:"));
+
+        log.writeLine(QStringLiteral("prefix_his=%1").arg(prefixHis.join(QStringLiteral(" | "))));
+        log.writeLine(QStringLiteral("prefix_ref=%1").arg(prefixRef.join(QStringLiteral(" | "))));
+        log.writeLine(QStringLiteral("path_ref=%1").arg(pathRef.join(QStringLiteral(" | "))));
+        log.writeLine(QStringLiteral("snapshot_diff=%1").arg(snapshotDiff.join(QStringLiteral(" | "))));
+
+        queryBar.setQueryText(QStringLiteral("ref"));
+        const bool accepted = queryBar.acceptFirstSuggestionForTesting();
+        const QString acceptedText = queryBar.queryText();
+        queryBar.setQueryText(QStringLiteral("references:"));
+        const bool acceptedPath = queryBar.acceptFirstSuggestionForTesting();
+        const QString acceptedPathText = queryBar.queryText();
+
+        queryBar.setQueryText(QStringLiteral("used"));
+        const QString beforeDismiss = queryBar.queryText();
+        queryBar.dismissSuggestionsForTesting();
+        const QString afterDismiss = queryBar.queryText();
+        const bool dismissalKeepsText = (beforeDismiss == afterDismiss);
+
+        QString submittedQuery;
+        QObject::connect(&queryBar,
+                         &QueryBarWidget::querySubmitted,
+                         [&submittedQuery](const QString& query) {
+                             submittedQuery = query;
+                         });
+        queryBar.setQueryText(QStringLiteral("references:%1").arg(mainPath));
+        QMetaObject::invokeMethod(&queryBar, "onExecutePressed", Qt::DirectConnection);
+
+        MainWindow mainWindow(true,
+                              normalizedRoot,
+                              QString(),
+                              QString(),
+                              options.historyDbPath,
+                              nullptr);
+        int routedTab = -1;
+        QString routedLabel;
+        int routedRows = 0;
+        QStringList routedRowsOut;
+        QString routedPath;
+        QString routedError;
+        const bool routedOk = mainWindow.triggerStructuralQueryDispatchForTesting(normalizedRoot,
+                                                                                   submittedQuery,
+                                                                                   &routedTab,
+                                                                                   &routedLabel,
+                                                                                   &routedRows,
+                                                                                   &routedRowsOut,
+                                                                                   &routedPath,
+                                                                                   &routedError);
+
+        const bool prefixOk = prefixHis.contains(QStringLiteral("history:"))
+            && prefixRef.contains(QStringLiteral("references:"));
+        const bool pathOk = !pathRef.isEmpty();
+        const bool snapshotOk = !snapshotDiff.isEmpty();
+        const bool acceptanceOk = accepted && acceptedPath && acceptedText.startsWith(QStringLiteral("ref"));
+        const bool dismissalOk = dismissalKeepsText;
+        const bool routedQueryOk = !submittedQuery.trimmed().isEmpty()
+            && routedTab >= 0
+            && !routedLabel.trimmed().isEmpty();
+
+        log.writeLine(QStringLiteral("accepted_prefix=%1").arg(accepted ? QStringLiteral("true") : QStringLiteral("false")));
+        log.writeLine(QStringLiteral("accepted_prefix_text=%1").arg(acceptedText));
+        log.writeLine(QStringLiteral("accepted_path=%1").arg(acceptedPath ? QStringLiteral("true") : QStringLiteral("false")));
+        log.writeLine(QStringLiteral("accepted_path_text=%1").arg(acceptedPathText));
+        log.writeLine(QStringLiteral("dismiss_before=%1").arg(beforeDismiss));
+        log.writeLine(QStringLiteral("dismiss_after=%1").arg(afterDismiss));
+        log.writeLine(QStringLiteral("submitted_query=%1").arg(submittedQuery));
+        log.writeLine(QStringLiteral("routed_ok=%1").arg(routedOk ? QStringLiteral("true") : QStringLiteral("false")));
+        log.writeLine(QStringLiteral("routed_tab=%1").arg(routedTab));
+        log.writeLine(QStringLiteral("routed_label=%1").arg(routedLabel));
+        log.writeLine(QStringLiteral("routed_rows=%1").arg(routedRows));
+        log.writeLine(QStringLiteral("routed_error=%1").arg(routedError));
+
+        log.writeLine(QStringLiteral("gate_prefix_autocomplete=%1").arg(prefixOk ? QStringLiteral("PASS") : QStringLiteral("FAIL")));
+        log.writeLine(QStringLiteral("gate_path_autocomplete=%1").arg(pathOk ? QStringLiteral("PASS") : QStringLiteral("FAIL")));
+        log.writeLine(QStringLiteral("gate_snapshot_autocomplete=%1").arg(snapshotOk ? QStringLiteral("PASS") : QStringLiteral("FAIL")));
+        log.writeLine(QStringLiteral("gate_acceptance=%1").arg(acceptanceOk ? QStringLiteral("PASS") : QStringLiteral("FAIL")));
+        log.writeLine(QStringLiteral("gate_dismissal=%1").arg(dismissalOk ? QStringLiteral("PASS") : QStringLiteral("FAIL")));
+        log.writeLine(QStringLiteral("gate_submitted_query_routes=%1").arg(routedQueryOk ? QStringLiteral("PASS") : QStringLiteral("FAIL")));
+
+        const bool pass = prefixOk && pathOk && snapshotOk && acceptanceOk && dismissalOk && routedQueryOk;
+        if (!pass) {
+            return finishFail(830, QStringLiteral("query_autocomplete_gate_failed"));
+        }
+
+        log.writeLine(QStringLiteral("final_status=PASS"));
+        log.writeLine(QStringLiteral("exit_code=0"));
+        log.writeLine(QStringLiteral("failure_reason="));
+        log.writeLine(QStringLiteral("timestamp_utc_end=%1").arg(QDateTime::currentDateTimeUtc().toString(Qt::ISODate)));
+        std::_Exit(0);
+    } catch (const std::exception& ex) {
+        writeStderrLine(QStringLiteral("query_autocomplete_smoke_error=unexpected_exception"));
+        return finishFail(831, QStringLiteral("unexpected_exception:%1").arg(QString::fromLocal8Bit(ex.what())));
+    } catch (...) {
+        writeStderrLine(QStringLiteral("query_autocomplete_smoke_error=unexpected_error"));
+        return finishFail(832, QStringLiteral("unexpected_error"));
+    }
+}
+
 int runArchiveSmokeCli(int argc, char* argv[])
 {
     QCoreApplication cliApp(argc, argv);
@@ -9712,6 +10017,10 @@ int main(int argc, char* argv[])
 
     if (hasTimelineSmokeFlag(argc, argv)) {
         return runTimelineSmokeCli(argc, argv);
+    }
+
+    if (hasQueryAutocompleteSmokeFlag(argc, argv)) {
+        return runQueryAutocompleteSmokeCli(argc, argv);
     }
 
     if (hasSnapshotDiffSmokeFlag(argc, argv)) {
