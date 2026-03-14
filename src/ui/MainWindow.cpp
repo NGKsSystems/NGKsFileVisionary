@@ -68,6 +68,7 @@
 #include "core/snapshot/SnapshotRepository.h"
 #include "model/DirectoryModel.h"
 #include "model/QueryResultAdapter.h"
+#include "model/StructuralFilterEngine.h"
 #include "model/StructuralResultAdapter.h"
 #include "query/QueryBarWidget.h"
 #include "query/QueryController.h"
@@ -433,6 +434,44 @@ void MainWindow::setupStructuralPanel()
     structuralNavigationLayout->addStretch(1);
     panelLayout->addLayout(structuralNavigationLayout);
 
+    QHBoxLayout* filterLayout = new QHBoxLayout();
+    m_structuralCategoryFilterCombo = new QComboBox(panelRoot);
+    m_structuralStatusFilterCombo = new QComboBox(panelRoot);
+    m_structuralExtensionFilterCombo = new QComboBox(panelRoot);
+    m_structuralRelationshipFilterCombo = new QComboBox(panelRoot);
+    m_structuralTextFilterEdit = new QLineEdit(panelRoot);
+    m_structuralClearFiltersButton = new QPushButton(QStringLiteral("Clear Filters"), panelRoot);
+
+    m_structuralCategoryFilterCombo->addItem(QStringLiteral("Category: All"), QString());
+    m_structuralCategoryFilterCombo->addItem(QStringLiteral("history"), QStringLiteral("history"));
+    m_structuralCategoryFilterCombo->addItem(QStringLiteral("snapshot"), QStringLiteral("snapshot"));
+    m_structuralCategoryFilterCombo->addItem(QStringLiteral("diff"), QStringLiteral("diff"));
+    m_structuralCategoryFilterCombo->addItem(QStringLiteral("reference"), QStringLiteral("reference"));
+
+    m_structuralStatusFilterCombo->addItem(QStringLiteral("Status: All"), QString());
+    m_structuralStatusFilterCombo->addItem(QStringLiteral("added"), QStringLiteral("added"));
+    m_structuralStatusFilterCombo->addItem(QStringLiteral("changed"), QStringLiteral("changed"));
+    m_structuralStatusFilterCombo->addItem(QStringLiteral("removed"), QStringLiteral("removed"));
+    m_structuralStatusFilterCombo->addItem(QStringLiteral("unchanged"), QStringLiteral("unchanged"));
+    m_structuralStatusFilterCombo->addItem(QStringLiteral("absent"), QStringLiteral("absent"));
+
+    m_structuralExtensionFilterCombo->addItem(QStringLiteral("Ext: All"), QString());
+    m_structuralRelationshipFilterCombo->addItem(QStringLiteral("Rel: All"), QString());
+    m_structuralRelationshipFilterCombo->addItem(QStringLiteral("include_ref"), QStringLiteral("include_ref"));
+    m_structuralRelationshipFilterCombo->addItem(QStringLiteral("require_ref"), QStringLiteral("require_ref"));
+    m_structuralRelationshipFilterCombo->addItem(QStringLiteral("import_ref"), QStringLiteral("import_ref"));
+    m_structuralRelationshipFilterCombo->addItem(QStringLiteral("path_ref"), QStringLiteral("path_ref"));
+
+    m_structuralTextFilterEdit->setPlaceholderText(QStringLiteral("Path / note text filter"));
+
+    filterLayout->addWidget(m_structuralCategoryFilterCombo);
+    filterLayout->addWidget(m_structuralStatusFilterCombo);
+    filterLayout->addWidget(m_structuralExtensionFilterCombo);
+    filterLayout->addWidget(m_structuralRelationshipFilterCombo);
+    filterLayout->addWidget(m_structuralTextFilterEdit, 1);
+    filterLayout->addWidget(m_structuralClearFiltersButton);
+    panelLayout->addLayout(filterLayout);
+
     m_structuralTabWidget = new QTabWidget(panelRoot);
     m_structuralTabWidget->setObjectName(QStringLiteral("structuralTabWidget"));
 
@@ -509,6 +548,21 @@ void MainWindow::setupStructuralPanel()
             m_statusLabel->setText(QStringLiteral("Structural refresh failed: %1").arg(errorText));
         }
     });
+
+    auto applyFilters = [this]() {
+        updateStructuralFilterStateFromControls();
+        applyStructuralFiltersToCurrentRows(m_structuralStatusPrefix);
+    };
+    connect(m_structuralCategoryFilterCombo, &QComboBox::currentIndexChanged, this, [applyFilters](int) { applyFilters(); });
+    connect(m_structuralStatusFilterCombo, &QComboBox::currentIndexChanged, this, [applyFilters](int) { applyFilters(); });
+    connect(m_structuralExtensionFilterCombo, &QComboBox::currentIndexChanged, this, [applyFilters](int) { applyFilters(); });
+    connect(m_structuralRelationshipFilterCombo, &QComboBox::currentIndexChanged, this, [applyFilters](int) { applyFilters(); });
+    connect(m_structuralTextFilterEdit, &QLineEdit::textChanged, this, [applyFilters](const QString&) { applyFilters(); });
+    connect(m_structuralClearFiltersButton, &QPushButton::clicked, this, [this]() {
+        clearStructuralFilters(true);
+    });
+
+    clearStructuralFilters(false);
     updateStructuralNavigationButtons();
 }
 
@@ -1797,31 +1851,12 @@ bool MainWindow::renderSnapshotListForRoot(const QString& rootPath,
     }
 
     const QVector<StructuralResultRow> structuralRows = StructuralResultAdapter::fromSnapshotRows(snapshots);
-    const QVector<FileEntry> displayRows = StructuralResultAdapter::toFileEntries(structuralRows);
-
-    m_fileModel.clear();
-    m_viewMode = FileViewMode::Standard;
-    m_viewModeController.setModeFromIndex(0);
-    if (m_viewModeCombo) {
-        QSignalBlocker blocker(m_viewModeCombo);
-        m_viewModeCombo->setCurrentIndex(0);
-    }
-    m_fileModel.setViewMode(FileViewMode::Standard, normalizedRoot);
-    if (!displayRows.isEmpty()) {
-        m_fileModel.appendBatch(displayRows);
-    }
-    if (m_treeView) {
-        m_treeView->setSortingEnabled(true);
-    }
-
-    if (m_statusLabel) {
-        m_statusLabel->setText(QStringLiteral("Snapshots view: %1 rows").arg(displayRows.size()));
-    }
+    setStructuralCanonicalRows(structuralRows, normalizedRoot, QStringLiteral("Snapshots view"));
 
     store.shutdown();
 
     if (rowCount) {
-        *rowCount = displayRows.size();
+        *rowCount = m_structuralFilteredRows.size();
     }
     if (createdSnapshotId) {
         *createdSnapshotId = createdId;
@@ -1998,31 +2033,12 @@ bool MainWindow::renderSnapshotDiffForRoot(const QString& rootPath,
     }
 
     const QVector<StructuralResultRow> structuralRows = StructuralResultAdapter::fromDiffRows(effectiveDiff.rows);
-    const QVector<FileEntry> displayRows = StructuralResultAdapter::toFileEntries(structuralRows);
-
-    m_fileModel.clear();
-    m_viewMode = FileViewMode::Standard;
-    m_viewModeController.setModeFromIndex(0);
-    if (m_viewModeCombo) {
-        QSignalBlocker blocker(m_viewModeCombo);
-        m_viewModeCombo->setCurrentIndex(0);
-    }
-    m_fileModel.setViewMode(FileViewMode::Standard, normalizedRoot);
-    if (!displayRows.isEmpty()) {
-        m_fileModel.appendBatch(displayRows);
-    }
-    if (m_treeView) {
-        m_treeView->setSortingEnabled(true);
-    }
-
-    if (m_statusLabel) {
-        m_statusLabel->setText(QStringLiteral("Snapshot diff view: %1 rows").arg(displayRows.size()));
-    }
+    setStructuralCanonicalRows(structuralRows, normalizedRoot, QStringLiteral("Snapshot diff view"));
 
     store.shutdown();
 
     if (rowCount) {
-        *rowCount = displayRows.size();
+        *rowCount = m_structuralFilteredRows.size();
     }
     if (addedCount) {
         *addedCount = static_cast<int>(effectiveDiff.summary.added);
@@ -2106,7 +2122,6 @@ bool MainWindow::loadHistoryRowsForPath(const QString& selectedFilePath,
 
     const QVector<StructuralResultRow> structuralRows = StructuralResultAdapter::fromHistoryRows(historyRows,
                                                                                                   normalizedFilePath);
-    QVector<FileEntry> displayRows = StructuralResultAdapter::toFileEntries(structuralRows);
     writeTrace(QStringLiteral("load_history:before_display_transform"));
     for (int i = 0; i < structuralRows.size(); ++i) {
         writeTrace(QStringLiteral("load_history:row_transform i=%1 category=%2 status=%3")
@@ -2114,48 +2129,20 @@ bool MainWindow::loadHistoryRowsForPath(const QString& selectedFilePath,
                        .arg(StructuralResultRowUtil::categoryToString(structuralRows.at(i).category))
                        .arg(structuralRows.at(i).status));
     }
-    writeTrace(QStringLiteral("load_history:after_display_transform rows=%1").arg(displayRows.size()));
+    setStructuralCanonicalRows(structuralRows, rootPath, QStringLiteral("History view"));
+    writeTrace(QStringLiteral("load_history:after_display_transform rows=%1").arg(m_structuralFilteredRows.size()));
 
-    writeTrace(QStringLiteral("load_history:before_model_clear"));
-    m_fileModel.clear();
-    m_viewMode = FileViewMode::Standard;
-    m_viewModeController.setModeFromIndex(0);
-    if (m_viewModeCombo) {
-        QSignalBlocker blocker(m_viewModeCombo);
-        m_viewModeCombo->setCurrentIndex(0);
-    }
-    m_fileModel.setViewMode(FileViewMode::Standard, rootPath);
-    writeTrace(QStringLiteral("load_history:after_model_clear"));
-
-    m_publishQueue.clear();
-    m_publishTimer.stop();
-    m_scanBatchCount = 1;
-    m_scanEntryCount = static_cast<quint64>(displayRows.size());
-    m_scanEnumeratedCount = static_cast<quint64>(displayRows.size());
-    m_scanInProgress = false;
-    if (!displayRows.isEmpty()) {
-        writeTrace(QStringLiteral("load_history:before_append_batch rows=%1").arg(displayRows.size()));
-        m_fileModel.appendBatch(displayRows);
-        writeTrace(QStringLiteral("load_history:after_append_batch"));
-    }
-    if (m_treeView) {
-        m_treeView->setSortingEnabled(true);
-    }
-
-    if (m_statusLabel) {
-        m_statusLabel->setText(QStringLiteral("History view: %1 rows").arg(displayRows.size()));
-    }
     appendRuntimeLog(QStringLiteral("history_view_loaded root=%1 target=%2 rows=%3")
                          .arg(rootPath)
                          .arg(normalizedTarget)
-                         .arg(displayRows.size()));
+                         .arg(m_structuralFilteredRows.size()));
 
     writeTrace(QStringLiteral("load_history:before_store_shutdown"));
     store.shutdown();
     writeTrace(QStringLiteral("load_history:after_store_shutdown"));
 
     if (rowCount) {
-        *rowCount = displayRows.size();
+        *rowCount = m_structuralFilteredRows.size();
     }
     if (resolvedRoot) {
         *resolvedRoot = rootPath;
@@ -2163,7 +2150,7 @@ bool MainWindow::loadHistoryRowsForPath(const QString& selectedFilePath,
     if (resolvedTarget) {
         *resolvedTarget = normalizedTarget;
     }
-    writeTrace(QStringLiteral("load_history:end ok=true rows=%1").arg(displayRows.size()));
+    writeTrace(QStringLiteral("load_history:end ok=true rows=%1").arg(m_structuralFilteredRows.size()));
     return true;
 }
 
@@ -2652,36 +2639,20 @@ bool MainWindow::loadStructuralReferenceView(QueryGraphMode mode,
     }
 
     const QVector<StructuralResultRow> structuralRows = StructuralResultAdapter::fromReferenceRows(queryResult.rows);
-    const QVector<FileEntry> displayRows = StructuralResultAdapter::toFileEntries(structuralRows);
-
-    m_fileModel.clear();
-    m_viewMode = FileViewMode::Standard;
-    m_viewModeController.setModeFromIndex(0);
-    if (m_viewModeCombo) {
-        QSignalBlocker blocker(m_viewModeCombo);
-        m_viewModeCombo->setCurrentIndex(0);
-    }
-    m_fileModel.setViewMode(FileViewMode::Standard, m_structuralRootPath);
-    if (!displayRows.isEmpty()) {
-        m_fileModel.appendBatch(displayRows);
-    }
-    if (m_treeView) {
-        m_treeView->setSortingEnabled(true);
-    }
 
     const QString modeText = (mode == QueryGraphMode::References)
         ? QStringLiteral("References")
         : QStringLiteral("Used By");
+    setStructuralCanonicalRows(structuralRows,
+                               m_structuralRootPath,
+                               QStringLiteral("%1 view").arg(modeText));
     if (m_structuralReferenceStatusLabel) {
-        m_structuralReferenceStatusLabel->setText(QStringLiteral("%1 rows: %2").arg(modeText).arg(displayRows.size()));
-    }
-    if (m_statusLabel) {
-        m_statusLabel->setText(QStringLiteral("%1 view: %2 rows").arg(modeText).arg(displayRows.size()));
+        m_structuralReferenceStatusLabel->setText(QStringLiteral("%1 rows: %2").arg(modeText).arg(m_structuralFilteredRows.size()));
     }
 
     store.shutdown();
     if (rowCount) {
-        *rowCount = displayRows.size();
+        *rowCount = m_structuralFilteredRows.size();
     }
     return true;
 }
@@ -2736,6 +2707,178 @@ void MainWindow::updateStructuralNavigationButtons()
     if (m_structuralRefreshButton) {
         m_structuralRefreshButton->setEnabled(hasCurrentQuery);
     }
+}
+
+void MainWindow::updateStructuralFilterStateFromControls()
+{
+    m_structuralFilterState.clear();
+
+    auto readComboToken = [](QComboBox* combo) {
+        if (!combo || combo->currentIndex() < 0) {
+            return QString();
+        }
+        return StructuralFilterStateUtil::normalizeToken(combo->currentData().toString());
+    };
+
+    const QString category = readComboToken(m_structuralCategoryFilterCombo);
+    if (!category.isEmpty()) {
+        m_structuralFilterState.categories.insert(category);
+    }
+
+    const QString status = readComboToken(m_structuralStatusFilterCombo);
+    if (!status.isEmpty()) {
+        m_structuralFilterState.statuses.insert(status);
+    }
+
+    const QString extension = readComboToken(m_structuralExtensionFilterCombo);
+    if (!extension.isEmpty()) {
+        m_structuralFilterState.extensions.insert(extension);
+    }
+
+    const QString relationship = readComboToken(m_structuralRelationshipFilterCombo);
+    if (!relationship.isEmpty()) {
+        m_structuralFilterState.relationships.insert(relationship);
+    }
+
+    if (m_structuralTextFilterEdit) {
+        m_structuralFilterState.substring = m_structuralTextFilterEdit->text().trimmed();
+    }
+}
+
+void MainWindow::updateStructuralFilterControlChoices(const QVector<StructuralResultRow>& canonicalRows)
+{
+    if (!m_structuralExtensionFilterCombo || !m_structuralRelationshipFilterCombo) {
+        return;
+    }
+
+    QString previousExtension = StructuralFilterStateUtil::normalizeToken(m_structuralExtensionFilterCombo->currentData().toString());
+    QString previousRelationship = StructuralFilterStateUtil::normalizeToken(m_structuralRelationshipFilterCombo->currentData().toString());
+
+    QSet<QString> extensions;
+    QSet<QString> relationships;
+    for (const StructuralResultRow& row : canonicalRows) {
+        const QString extension = StructuralFilterEngine::extensionForPath(row.primaryPath);
+        if (!extension.isEmpty()) {
+            extensions.insert(StructuralFilterStateUtil::normalizeToken(extension));
+        }
+
+        const QString relationship = StructuralFilterStateUtil::normalizeToken(row.relationship);
+        if (!relationship.isEmpty()) {
+            relationships.insert(relationship);
+        }
+    }
+
+    QStringList sortedExtensions = extensions.values();
+    QStringList sortedRelationships = relationships.values();
+    std::sort(sortedExtensions.begin(), sortedExtensions.end());
+    std::sort(sortedRelationships.begin(), sortedRelationships.end());
+
+    {
+        QSignalBlocker blocker(m_structuralExtensionFilterCombo);
+        m_structuralExtensionFilterCombo->clear();
+        m_structuralExtensionFilterCombo->addItem(QStringLiteral("Ext: All"), QString());
+        for (const QString& extension : sortedExtensions) {
+            m_structuralExtensionFilterCombo->addItem(extension, extension);
+        }
+        int targetIndex = m_structuralExtensionFilterCombo->findData(previousExtension);
+        if (targetIndex < 0) {
+            targetIndex = 0;
+        }
+        m_structuralExtensionFilterCombo->setCurrentIndex(targetIndex);
+    }
+
+    {
+        QSignalBlocker blocker(m_structuralRelationshipFilterCombo);
+        m_structuralRelationshipFilterCombo->clear();
+        m_structuralRelationshipFilterCombo->addItem(QStringLiteral("Rel: All"), QString());
+        for (const QString& relationship : sortedRelationships) {
+            m_structuralRelationshipFilterCombo->addItem(relationship, relationship);
+        }
+        int targetIndex = m_structuralRelationshipFilterCombo->findData(previousRelationship);
+        if (targetIndex < 0) {
+            targetIndex = 0;
+        }
+        m_structuralRelationshipFilterCombo->setCurrentIndex(targetIndex);
+    }
+}
+
+void MainWindow::applyStructuralFiltersToCurrentRows(const QString& statusPrefix)
+{
+    m_structuralFilteredRows = StructuralFilterEngine::apply(m_structuralCanonicalRows, m_structuralFilterState);
+    const QVector<FileEntry> displayRows = StructuralResultAdapter::toFileEntries(m_structuralFilteredRows);
+
+    m_fileModel.clear();
+    m_viewMode = FileViewMode::Standard;
+    m_viewModeController.setModeFromIndex(0);
+    if (m_viewModeCombo) {
+        QSignalBlocker blocker(m_viewModeCombo);
+        m_viewModeCombo->setCurrentIndex(0);
+    }
+    m_fileModel.setViewMode(FileViewMode::Standard, m_structuralViewRoot);
+    if (!displayRows.isEmpty()) {
+        m_fileModel.appendBatch(displayRows);
+    }
+    if (m_treeView) {
+        m_treeView->setSortingEnabled(true);
+    }
+
+    m_publishQueue.clear();
+    m_publishTimer.stop();
+    m_scanBatchCount = 1;
+    m_scanEntryCount = static_cast<quint64>(displayRows.size());
+    m_scanEnumeratedCount = static_cast<quint64>(displayRows.size());
+    m_scanInProgress = false;
+
+    const QString statusBase = statusPrefix.trimmed().isEmpty() ? QStringLiteral("Structural view") : statusPrefix;
+    const QString activeFilters = m_structuralFilterState.isEmpty() ? QStringLiteral("none") : QStringLiteral("active");
+    if (m_statusLabel) {
+        m_statusLabel->setText(QStringLiteral("%1: %2/%3 rows (filters=%4)")
+                                   .arg(statusBase)
+                                   .arg(displayRows.size())
+                                   .arg(m_structuralCanonicalRows.size())
+                                   .arg(activeFilters));
+    }
+}
+
+void MainWindow::clearStructuralFilters(bool applyNow)
+{
+    m_structuralFilterState.clear();
+    if (m_structuralCategoryFilterCombo) {
+        QSignalBlocker blocker(m_structuralCategoryFilterCombo);
+        m_structuralCategoryFilterCombo->setCurrentIndex(0);
+    }
+    if (m_structuralStatusFilterCombo) {
+        QSignalBlocker blocker(m_structuralStatusFilterCombo);
+        m_structuralStatusFilterCombo->setCurrentIndex(0);
+    }
+    if (m_structuralExtensionFilterCombo) {
+        QSignalBlocker blocker(m_structuralExtensionFilterCombo);
+        m_structuralExtensionFilterCombo->setCurrentIndex(0);
+    }
+    if (m_structuralRelationshipFilterCombo) {
+        QSignalBlocker blocker(m_structuralRelationshipFilterCombo);
+        m_structuralRelationshipFilterCombo->setCurrentIndex(0);
+    }
+    if (m_structuralTextFilterEdit) {
+        QSignalBlocker blocker(m_structuralTextFilterEdit);
+        m_structuralTextFilterEdit->clear();
+    }
+
+    if (applyNow) {
+        applyStructuralFiltersToCurrentRows(m_structuralStatusPrefix);
+    }
+}
+
+void MainWindow::setStructuralCanonicalRows(const QVector<StructuralResultRow>& rows,
+                                            const QString& viewRoot,
+                                            const QString& statusPrefix)
+{
+    m_structuralCanonicalRows = rows;
+    m_structuralViewRoot = viewRoot;
+    m_structuralStatusPrefix = statusPrefix;
+    updateStructuralFilterControlChoices(rows);
+    updateStructuralFilterStateFromControls();
+    applyStructuralFiltersToCurrentRows(statusPrefix);
 }
 
 bool MainWindow::dispatchQueryToExistingPanel(const QString& queryText,

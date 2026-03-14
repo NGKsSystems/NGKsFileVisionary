@@ -13,6 +13,7 @@
 #include <QTreeView>
 #include <QTreeWidget>
 #include <QDateTime>
+#include <QVector>
 
 #include <atomic>
 
@@ -21,6 +22,8 @@
 #include "../core/TreeSnapshotService.h"
 #include "ArchiveExplorer.h"
 #include "model/ViewModeController.h"
+#include "model/StructuralFilterState.h"
+#include "model/StructuralResultRow.h"
 #include "core/query/QueryTypes.h"
 #include "core/services/RefreshTypes.h"
 
@@ -273,6 +276,13 @@ private:
                                        int* activeTabIndex = nullptr,
                                        int* rowCount = nullptr);
     void updateStructuralNavigationButtons();
+    void updateStructuralFilterStateFromControls();
+    void updateStructuralFilterControlChoices(const QVector<StructuralResultRow>& canonicalRows);
+    void applyStructuralFiltersToCurrentRows(const QString& statusPrefix = QString());
+    void clearStructuralFilters(bool applyNow = true);
+    void setStructuralCanonicalRows(const QVector<StructuralResultRow>& rows,
+                                    const QString& viewRoot,
+                                    const QString& statusPrefix);
     bool navigateFromCurrentModelRow(int rowIndex, QString* navigatedPathOut = nullptr);
     QStringList collectCurrentModelRows(int maxRows = 200) const;
     bool loadHistoryRowsForPath(const QString& selectedFilePath,
@@ -398,9 +408,20 @@ private:
     QPushButton* m_structuralBackButton = nullptr;
     QPushButton* m_structuralForwardButton = nullptr;
     QPushButton* m_structuralRefreshButton = nullptr;
+    QComboBox* m_structuralCategoryFilterCombo = nullptr;
+    QComboBox* m_structuralStatusFilterCombo = nullptr;
+    QComboBox* m_structuralExtensionFilterCombo = nullptr;
+    QComboBox* m_structuralRelationshipFilterCombo = nullptr;
+    QLineEdit* m_structuralTextFilterEdit = nullptr;
+    QPushButton* m_structuralClearFiltersButton = nullptr;
     QComboBox* m_structuralOldSnapshotCombo = nullptr;
     QComboBox* m_structuralNewSnapshotCombo = nullptr;
     QString m_structuralRootPath;
     QString m_structuralTargetPath;
+    QString m_structuralStatusPrefix;
+    QString m_structuralViewRoot;
+    QVector<StructuralResultRow> m_structuralCanonicalRows;
+    QVector<StructuralResultRow> m_structuralFilteredRows;
+    StructuralFilterState m_structuralFilterState;
     StructuralPanelState m_structuralPanelState;
 };

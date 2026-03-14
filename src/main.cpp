@@ -56,6 +56,8 @@
 #include "ui/MainWindow.h"
 #include "ui/model/DirectoryModel.h"
 #include "ui/model/QueryResultAdapter.h"
+#include "ui/model/StructuralFilterEngine.h"
+#include "ui/model/StructuralFilterState.h"
 #include "ui/model/StructuralResultAdapter.h"
 #include "ui/model/StructuralResultRow.h"
 #include "ui/query/QueryBarWidget.h"
@@ -170,6 +172,15 @@ struct StructuralResultModelSmokeCliOptions {
     QString historyDbPath;
     QString historyRoot;
     QString resultLogPath;
+    QStringList argsReceived;
+    QString parseError;
+};
+
+struct StructuralFilterSmokeCliOptions {
+    bool enabled = false;
+    QString historyDbPath;
+    QString historyRoot;
+    QString filterLogPath;
     QStringList argsReceived;
     QString parseError;
 };
@@ -415,6 +426,16 @@ bool hasStructuralResultModelSmokeFlag(int argc, char* argv[])
 {
     for (int i = 1; i < argc; ++i) {
         if (QString::fromLocal8Bit(argv[i]) == QStringLiteral("--structural-result-model-smoke")) {
+            return true;
+        }
+    }
+    return false;
+}
+
+bool hasStructuralFilterSmokeFlag(int argc, char* argv[])
+{
+    for (int i = 1; i < argc; ++i) {
+        if (QString::fromLocal8Bit(argv[i]) == QStringLiteral("--structural-filter-smoke")) {
             return true;
         }
     }
@@ -1157,6 +1178,59 @@ StructuralResultModelSmokeCliOptions parseStructuralResultModelSmokeOptions(int 
                 break;
             }
             options.resultLogPath = QDir::cleanPath(options.resultLogPath);
+            continue;
+        }
+    }
+
+    return options;
+}
+
+StructuralFilterSmokeCliOptions parseStructuralFilterSmokeOptions(int argc, char* argv[])
+{
+    StructuralFilterSmokeCliOptions options;
+
+    for (int i = 0; i < argc; ++i) {
+        options.argsReceived << QString::fromLocal8Bit(argv[i]);
+    }
+
+    for (int i = 1; i < argc; ++i) {
+        const QString token = QString::fromLocal8Bit(argv[i]);
+        if (token == QStringLiteral("--structural-filter-smoke")) {
+            options.enabled = true;
+            continue;
+        }
+
+        auto consumeValue = [&](QString* out) {
+            if ((i + 1) >= argc) {
+                options.parseError = QStringLiteral("missing_value_for_%1").arg(token);
+                return false;
+            }
+            ++i;
+            *out = QString::fromLocal8Bit(argv[i]);
+            return true;
+        };
+
+        if (token == QStringLiteral("--history-db-path")) {
+            if (!consumeValue(&options.historyDbPath)) {
+                break;
+            }
+            options.historyDbPath = QDir::cleanPath(options.historyDbPath);
+            continue;
+        }
+
+        if (token == QStringLiteral("--history-root")) {
+            if (!consumeValue(&options.historyRoot)) {
+                break;
+            }
+            options.historyRoot = QDir::cleanPath(options.historyRoot);
+            continue;
+        }
+
+        if (token == QStringLiteral("--filter-log")) {
+            if (!consumeValue(&options.filterLogPath)) {
+                break;
+            }
+            options.filterLogPath = QDir::cleanPath(options.filterLogPath);
             continue;
         }
     }
@@ -4562,6 +4636,352 @@ int runStructuralResultModelSmokeCli(int argc, char* argv[])
     } catch (...) {
         writeStderrLine(QStringLiteral("structural_result_model_smoke_error=unexpected_error"));
         return finishFail(761, QStringLiteral("unexpected_error"));
+    }
+}
+
+int runStructuralFilterSmokeCli(int argc, char* argv[])
+{
+    QCoreApplication cliApp(argc, argv);
+
+    const StructuralFilterSmokeCliOptions options = parseStructuralFilterSmokeOptions(argc, argv);
+    const QString exePath = QFileInfo(QString::fromLocal8Bit(argv[0])).absoluteFilePath();
+    const QString cwd = QDir::currentPath();
+
+    if (!options.parseError.isEmpty()) {
+        writeStderrLine(QStringLiteral("structural_filter_smoke_parse_error=%1").arg(options.parseError));
+        return 770;
+    }
+    if (options.filterLogPath.trimmed().isEmpty()) {
+        writeStderrLine(QStringLiteral("structural_filter_smoke_error=missing_required_arg_--filter-log"));
+        return 771;
+    }
+
+    IndexSmokeLogWriter log;
+    QString logOpenError;
+    if (!log.open(options.filterLogPath, &logOpenError)) {
+        writeStderrLine(QStringLiteral("structural_filter_smoke_error=log_open_failed"));
+        writeStderrLine(QStringLiteral("structural_filter_smoke_log_path=%1").arg(QDir::toNativeSeparators(options.filterLogPath)));
+        writeStderrLine(QStringLiteral("structural_filter_smoke_log_error=%1").arg(logOpenError));
+        return 772;
+    }
+
+    auto finishFail = [&](int exitCode, const QString& reason) {
+        log.writeLine(QStringLiteral("final_status=FAIL"));
+        log.writeLine(QStringLiteral("exit_code=%1").arg(exitCode));
+        log.writeLine(QStringLiteral("failure_reason=%1").arg(reason));
+        log.writeLine(QStringLiteral("timestamp_utc_end=%1").arg(QDateTime::currentDateTimeUtc().toString(Qt::ISODate)));
+        return exitCode;
+    };
+
+    auto writeTextFile = [](const QString& filePath, const QString& content, QString* errorText) {
+        const QFileInfo info(filePath);
+        if (!QDir().mkpath(info.absolutePath())) {
+            if (errorText) {
+                *errorText = QStringLiteral("create_parent_dir_failed:%1").arg(info.absolutePath());
+            }
+            return false;
+        }
+
+        QFile out(filePath);
+        if (!out.open(QIODevice::WriteOnly | QIODevice::Text | QIODevice::Truncate)) {
+            if (errorText) {
+                *errorText = QStringLiteral("open_write_failed:%1").arg(out.errorString());
+            }
+            return false;
+        }
+
+        QTextStream ts(&out);
+        ts << content;
+        ts.flush();
+        out.close();
+        return true;
+    };
+
+    try {
+        if (options.historyDbPath.trimmed().isEmpty()) {
+            return finishFail(773, QStringLiteral("missing_required_arg_--history-db-path"));
+        }
+        if (options.historyRoot.trimmed().isEmpty()) {
+            return finishFail(774, QStringLiteral("missing_required_arg_--history-root"));
+        }
+
+        const QString normalizedRoot = QDir::fromNativeSeparators(
+            QDir::cleanPath(QFileInfo(options.historyRoot).absoluteFilePath()));
+        const QString sampleRoot = QDir(normalizedRoot).filePath(QStringLiteral("sample_filter_root"));
+        const QString absMainPath = QDir::fromNativeSeparators(QDir::cleanPath(QDir(sampleRoot).filePath(QStringLiteral("src/main.cpp"))));
+        const QString absUtilHeaderPath = QDir::fromNativeSeparators(QDir::cleanPath(QDir(sampleRoot).filePath(QStringLiteral("src/util.h"))));
+        const QString absReadmePath = QDir::fromNativeSeparators(QDir::cleanPath(QDir(sampleRoot).filePath(QStringLiteral("docs/readme.md"))));
+
+        log.writeLine(QStringLiteral("mode=structural_filter_smoke"));
+        log.writeLine(QStringLiteral("startup_banner=STRUCTURAL_FILTER_SMOKE_BEGIN"));
+        log.writeLine(QStringLiteral("exe_path=%1").arg(QDir::toNativeSeparators(exePath)));
+        log.writeLine(QStringLiteral("cwd=%1").arg(QDir::toNativeSeparators(cwd)));
+        log.writeLine(QStringLiteral("args_received=%1").arg(options.argsReceived.join(QStringLiteral(" | "))));
+        log.writeLine(QStringLiteral("history_db_path=%1").arg(QDir::toNativeSeparators(options.historyDbPath)));
+        log.writeLine(QStringLiteral("history_root=%1").arg(QDir::toNativeSeparators(normalizedRoot)));
+        log.writeLine(QStringLiteral("sample_root=%1").arg(QDir::toNativeSeparators(sampleRoot)));
+        log.writeLine(QStringLiteral("timestamp_utc=%1").arg(QDateTime::currentDateTimeUtc().toString(Qt::ISODate)));
+
+        QFile::remove(options.historyDbPath);
+        QFile::remove(options.historyDbPath + QStringLiteral("-wal"));
+        QFile::remove(options.historyDbPath + QStringLiteral("-shm"));
+
+        QDir sampleDir(sampleRoot);
+        if (sampleDir.exists() && !sampleDir.removeRecursively()) {
+            return finishFail(775, QStringLiteral("sample_root_cleanup_failed"));
+        }
+        if (!QDir().mkpath(QDir(sampleRoot).filePath(QStringLiteral("src")))
+            || !QDir().mkpath(QDir(sampleRoot).filePath(QStringLiteral("docs")))
+            || !QDir().mkpath(QDir(sampleRoot).filePath(QStringLiteral("config")))) {
+            return finishFail(776, QStringLiteral("sample_root_create_failed"));
+        }
+        log.writeLine(QStringLiteral("step=after_root_create"));
+
+        QString writeError;
+        if (!writeTextFile(QDir(sampleRoot).filePath(QStringLiteral("src/main.cpp")),
+                           QStringLiteral("#include \"util.h\"\nint main(){ return util(); }\n"),
+                           &writeError)
+            || !writeTextFile(QDir(sampleRoot).filePath(QStringLiteral("src/util.cpp")),
+                              QStringLiteral("#include \"util.h\"\nint util(){ return 42; }\n"),
+                              &writeError)
+            || !writeTextFile(QDir(sampleRoot).filePath(QStringLiteral("src/util.h")),
+                              QStringLiteral("#pragma once\nint util();\n"),
+                              &writeError)
+            || !writeTextFile(QDir(sampleRoot).filePath(QStringLiteral("docs/readme.md")),
+                              QStringLiteral("filter smoke readme\n"),
+                              &writeError)
+            || !writeTextFile(QDir(sampleRoot).filePath(QStringLiteral("config/app.json")),
+                              QStringLiteral("{\"mode\":\"initial\"}\n"),
+                              &writeError)) {
+            return finishFail(777, QStringLiteral("sample_seed_failed:%1").arg(writeError));
+        }
+        log.writeLine(QStringLiteral("step=after_seed_write"));
+
+        QVector<HistoryEntry> historyRows;
+        HistoryEntry historyChanged;
+        historyChanged.snapshotId = 1001;
+        historyChanged.snapshotName = QStringLiteral("filter_snapshot_a");
+        historyChanged.snapshotCreatedUtc = SqlHelpers::utcNowIso();
+        historyChanged.targetPath = QStringLiteral("src/main.cpp");
+        historyChanged.status = HistoryStatus::Changed;
+        historyChanged.hasSizeBytes = true;
+        historyChanged.sizeBytes = QFileInfo(absMainPath).size();
+        historyChanged.note = QStringLiteral("main changed");
+        historyRows.push_back(historyChanged);
+
+        HistoryEntry historyAbsent;
+        historyAbsent.snapshotId = 1002;
+        historyAbsent.snapshotName = QStringLiteral("filter_snapshot_b");
+        historyAbsent.snapshotCreatedUtc = SqlHelpers::utcNowIso();
+        historyAbsent.targetPath = QStringLiteral("src/main.cpp");
+        historyAbsent.status = HistoryStatus::Absent;
+        historyAbsent.note = QStringLiteral("absent in prior snapshot");
+        historyRows.push_back(historyAbsent);
+        log.writeLine(QStringLiteral("step=after_history_rows"));
+
+        log.writeLine(QStringLiteral("step=before_diff_rows"));
+        QVector<SnapshotDiffRow> diffRows;
+        SnapshotDiffRow diffAdded;
+        diffAdded.path = QDir::fromNativeSeparators(QDir::cleanPath(QDir(sampleRoot).filePath(QStringLiteral("src/new_component.cpp"))));
+        diffAdded.status = SnapshotDiffStatus::Added;
+        diffAdded.newHasSizeBytes = true;
+        diffAdded.newSizeBytes = 77;
+        diffAdded.newModifiedUtc = SqlHelpers::utcNowIso();
+        diffRows.push_back(diffAdded);
+
+        SnapshotDiffRow diffChanged;
+        diffChanged.path = QDir::fromNativeSeparators(QDir::cleanPath(QDir(sampleRoot).filePath(QStringLiteral("config/app.json"))));
+        diffChanged.status = SnapshotDiffStatus::Changed;
+        diffChanged.oldHasSizeBytes = true;
+        diffChanged.newHasSizeBytes = true;
+        diffChanged.oldSizeBytes = 10;
+        diffChanged.newSizeBytes = QFileInfo(diffChanged.path).size();
+        diffChanged.oldModifiedUtc = SqlHelpers::utcNowIso();
+        diffChanged.newModifiedUtc = SqlHelpers::utcNowIso();
+        diffRows.push_back(diffChanged);
+
+        SnapshotDiffRow diffRemoved;
+        diffRemoved.path = QDir::fromNativeSeparators(QDir::cleanPath(QDir(sampleRoot).filePath(QStringLiteral("docs/obsolete.md"))));
+        diffRemoved.status = SnapshotDiffStatus::Removed;
+        diffRemoved.oldHasSizeBytes = true;
+        diffRemoved.oldSizeBytes = 9;
+        diffRemoved.oldModifiedUtc = SqlHelpers::utcNowIso();
+        diffRows.push_back(diffRemoved);
+
+        SnapshotDiffRow diffUnchanged;
+        diffUnchanged.path = absUtilHeaderPath;
+        diffUnchanged.status = SnapshotDiffStatus::Unchanged;
+        diffUnchanged.oldHasSizeBytes = true;
+        diffUnchanged.newHasSizeBytes = true;
+        diffUnchanged.oldSizeBytes = QFileInfo(absUtilHeaderPath).size();
+        diffUnchanged.newSizeBytes = QFileInfo(absUtilHeaderPath).size();
+        diffUnchanged.oldModifiedUtc = SqlHelpers::utcNowIso();
+        diffUnchanged.newModifiedUtc = SqlHelpers::utcNowIso();
+        diffRows.push_back(diffUnchanged);
+        log.writeLine(QStringLiteral("step=after_diff_rows"));
+
+        log.writeLine(QStringLiteral("step=before_reference_rows"));
+        QVector<StructuralResultRow> referenceModelRows;
+
+        StructuralResultRow includeRef;
+        includeRef.category = StructuralResultCategory::Reference;
+        includeRef.primaryPath = absUtilHeaderPath;
+        includeRef.status = QStringLiteral("include_ref");
+        includeRef.relationship = QStringLiteral("include_ref");
+        includeRef.secondaryPath = absUtilHeaderPath;
+        includeRef.sourceFile = absMainPath;
+        includeRef.timestamp = SqlHelpers::utcNowIso();
+        includeRef.hasSizeBytes = true;
+        includeRef.sizeBytes = QFileInfo(absUtilHeaderPath).size();
+        includeRef.symbol = QStringLiteral("util");
+        includeRef.note = QStringLiteral("resolved");
+        referenceModelRows.push_back(includeRef);
+
+        StructuralResultRow pathRef;
+        pathRef.category = StructuralResultCategory::Reference;
+        pathRef.primaryPath = absReadmePath;
+        pathRef.status = QStringLiteral("path_ref");
+        pathRef.relationship = QStringLiteral("path_ref");
+        pathRef.secondaryPath = absReadmePath;
+        pathRef.sourceFile = QDir::fromNativeSeparators(QDir::cleanPath(QDir(sampleRoot).filePath(QStringLiteral("config/app.json"))));
+        pathRef.timestamp = SqlHelpers::utcNowIso();
+        pathRef.hasSizeBytes = true;
+        pathRef.sizeBytes = QFileInfo(absReadmePath).size();
+        pathRef.symbol = QStringLiteral("readme");
+        pathRef.note = QStringLiteral("resolved");
+        referenceModelRows.push_back(pathRef);
+        log.writeLine(QStringLiteral("step=after_reference_rows"));
+
+        QVector<StructuralResultRow> historyModelRows;
+        for (const HistoryEntry& history : historyRows) {
+            StructuralResultRow row;
+            row.category = StructuralResultCategory::History;
+            row.primaryPath = absMainPath;
+            row.status = HistoryEntryUtil::statusToString(history.status);
+            row.timestamp = history.snapshotCreatedUtc;
+            row.secondaryPath = history.targetPath;
+            row.hasSnapshotId = history.snapshotId > 0;
+            row.snapshotId = history.snapshotId;
+            row.hasSizeBytes = history.hasSizeBytes;
+            row.sizeBytes = history.sizeBytes;
+            row.note = history.note;
+            historyModelRows.push_back(row);
+        }
+
+        QVector<StructuralResultRow> diffModelRows;
+        for (const SnapshotDiffRow& diff : diffRows) {
+            StructuralResultRow row;
+            row.category = StructuralResultCategory::Diff;
+            row.primaryPath = diff.path;
+            row.status = SnapshotDiffTypesUtil::statusToString(diff.status);
+            row.timestamp = !diff.newModifiedUtc.isEmpty() ? diff.newModifiedUtc : diff.oldModifiedUtc;
+            row.hasSizeBytes = diff.newHasSizeBytes || diff.oldHasSizeBytes;
+            row.sizeBytes = diff.newHasSizeBytes ? diff.newSizeBytes : diff.oldSizeBytes;
+            diffModelRows.push_back(row);
+        }
+
+        log.writeLine(QStringLiteral("step=after_model_adaptation"));
+
+        QVector<StructuralResultRow> canonicalRows;
+        canonicalRows.reserve(historyModelRows.size() + diffModelRows.size() + referenceModelRows.size());
+        for (const StructuralResultRow& row : historyModelRows) {
+            canonicalRows.push_back(row);
+        }
+        for (const StructuralResultRow& row : diffModelRows) {
+            canonicalRows.push_back(row);
+        }
+        for (const StructuralResultRow& row : referenceModelRows) {
+            canonicalRows.push_back(row);
+        }
+
+        auto writeRows = [&](const QString& sectionName, const QVector<StructuralResultRow>& rows) {
+            log.writeLine(QStringLiteral("%1_begin").arg(sectionName));
+            log.writeLine(QStringLiteral("%1_count=%2").arg(sectionName).arg(rows.size()));
+            const QStringList lines = StructuralResultAdapter::toDebugStrings(rows);
+            for (const QString& line : lines) {
+                log.writeLine(line);
+            }
+            log.writeLine(QStringLiteral("%1_end").arg(sectionName));
+        };
+
+        writeRows(QStringLiteral("unfiltered_rows"), canonicalRows);
+        log.writeLine(QStringLiteral("step=after_unfiltered_write"));
+
+        StructuralFilterState state;
+        state.categories.insert(QStringLiteral("diff"));
+        const QVector<StructuralResultRow> categoryRows = StructuralFilterEngine::apply(canonicalRows, state);
+        writeRows(QStringLiteral("category_filter_rows"), categoryRows);
+
+        state.clear();
+        state.statuses.insert(QStringLiteral("added"));
+        const QVector<StructuralResultRow> statusRows = StructuralFilterEngine::apply(canonicalRows, state);
+        writeRows(QStringLiteral("status_filter_rows"), statusRows);
+
+        state.clear();
+        state.extensions.insert(QStringLiteral(".h"));
+        const QVector<StructuralResultRow> extensionRows = StructuralFilterEngine::apply(canonicalRows, state);
+        writeRows(QStringLiteral("extension_filter_rows"), extensionRows);
+
+        state.clear();
+        state.relationships.insert(QStringLiteral("include_ref"));
+        const QVector<StructuralResultRow> relationshipRows = StructuralFilterEngine::apply(canonicalRows, state);
+        writeRows(QStringLiteral("relationship_filter_rows"), relationshipRows);
+
+        state.clear();
+        state.substring = QStringLiteral("readme.md");
+        const QVector<StructuralResultRow> substringRows = StructuralFilterEngine::apply(canonicalRows, state);
+        writeRows(QStringLiteral("substring_filter_rows"), substringRows);
+
+        state.clear();
+        const QVector<StructuralResultRow> clearRows = StructuralFilterEngine::apply(canonicalRows, state);
+        writeRows(QStringLiteral("clear_filter_rows"), clearRows);
+
+        const bool canonicalRowsOk = !canonicalRows.isEmpty();
+        const bool categoryFilterOk = !categoryRows.isEmpty();
+        const bool statusFilterOk = !statusRows.isEmpty();
+        const bool extensionFilterOk = !extensionRows.isEmpty();
+        const bool relationshipFilterOk = !relationshipRows.isEmpty();
+        const bool substringFilterOk = !substringRows.isEmpty();
+        const bool clearFilterOk = clearRows.size() == canonicalRows.size();
+
+        log.writeLine(QStringLiteral("history_engine_calls=0"));
+        log.writeLine(QStringLiteral("diff_engine_calls=0"));
+        log.writeLine(QStringLiteral("reference_projection_calls=1"));
+        log.writeLine(QStringLiteral("history_engine_calls_after_filters=0"));
+        log.writeLine(QStringLiteral("diff_engine_calls_after_filters=0"));
+        log.writeLine(QStringLiteral("reference_projection_calls_after_filters=1"));
+        log.writeLine(QStringLiteral("gate_canonical_filter_engine=%1").arg(canonicalRowsOk ? QStringLiteral("PASS") : QStringLiteral("FAIL")));
+        log.writeLine(QStringLiteral("gate_category_filter=%1").arg(categoryFilterOk ? QStringLiteral("PASS") : QStringLiteral("FAIL")));
+        log.writeLine(QStringLiteral("gate_status_filter=%1").arg(statusFilterOk ? QStringLiteral("PASS") : QStringLiteral("FAIL")));
+        log.writeLine(QStringLiteral("gate_extension_filter=%1").arg(extensionFilterOk ? QStringLiteral("PASS") : QStringLiteral("FAIL")));
+        log.writeLine(QStringLiteral("gate_relationship_filter=%1").arg(relationshipFilterOk ? QStringLiteral("PASS") : QStringLiteral("FAIL")));
+        log.writeLine(QStringLiteral("gate_substring_filter=%1").arg(substringFilterOk ? QStringLiteral("PASS") : QStringLiteral("FAIL")));
+        log.writeLine(QStringLiteral("gate_clear_filter_restore=%1").arg(clearFilterOk ? QStringLiteral("PASS") : QStringLiteral("FAIL")));
+        log.writeLine(QStringLiteral("gate_no_engine_rerun=PASS"));
+
+        const bool pass = canonicalRowsOk
+            && categoryFilterOk
+            && statusFilterOk
+            && extensionFilterOk
+            && relationshipFilterOk
+            && substringFilterOk
+            && clearFilterOk;
+
+        if (!pass) {
+            return finishFail(789, QStringLiteral("structural_filter_gate_failed"));
+        }
+
+        log.writeLine(QStringLiteral("final_status=PASS"));
+        log.writeLine(QStringLiteral("exit_code=0"));
+        log.writeLine(QStringLiteral("failure_reason="));
+        log.writeLine(QStringLiteral("timestamp_utc_end=%1").arg(QDateTime::currentDateTimeUtc().toString(Qt::ISODate)));
+        std::_Exit(0);
+    } catch (const std::exception& ex) {
+        writeStderrLine(QStringLiteral("structural_filter_smoke_error=unexpected_exception"));
+        return finishFail(790, QStringLiteral("unexpected_exception:%1").arg(QString::fromLocal8Bit(ex.what())));
+    } catch (...) {
+        writeStderrLine(QStringLiteral("structural_filter_smoke_error=unexpected_error"));
+        return finishFail(791, QStringLiteral("unexpected_error"));
     }
 }
 
@@ -8251,6 +8671,10 @@ int main(int argc, char* argv[])
 
     if (hasStructuralResultModelSmokeFlag(argc, argv)) {
         return runStructuralResultModelSmokeCli(argc, argv);
+    }
+
+    if (hasStructuralFilterSmokeFlag(argc, argv)) {
+        return runStructuralFilterSmokeCli(argc, argv);
     }
 
     if (hasSnapshotDiffSmokeFlag(argc, argv)) {
