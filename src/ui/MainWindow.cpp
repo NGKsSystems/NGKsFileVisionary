@@ -74,6 +74,8 @@
 #include "model/StructuralRankingEngine.h"
 #include "model/StructuralResultAdapter.h"
 #include "model/StructuralSortEngine.h"
+#include "export/StructuralExportEngine.h"
+#include "export/StructuralExportFormat.h"
 #include "query/QueryBarWidget.h"
 #include "query/QueryController.h"
 #include "core/services/RefreshTypes.h"
@@ -507,6 +509,20 @@ void MainWindow::setupStructuralPanel()
     filterLayout->addWidget(m_structuralClearFiltersButton);
     panelLayout->addLayout(filterLayout);
 
+    QHBoxLayout* exportLayout = new QHBoxLayout();
+    QLabel* exportLabel = new QLabel(QStringLiteral("Export:"), panelRoot);
+    m_structuralExportFormatCombo = new QComboBox(panelRoot);
+    m_structuralExportButton = new QPushButton(QStringLiteral("Export Visible Rows"), panelRoot);
+    m_structuralExportFormatCombo->addItem(QStringLiteral("JSON"), QStringLiteral("json"));
+    m_structuralExportFormatCombo->addItem(QStringLiteral("CSV"), QStringLiteral("csv"));
+    m_structuralExportFormatCombo->addItem(QStringLiteral("Markdown"), QStringLiteral("markdown"));
+    m_structuralExportFormatCombo->addItem(QStringLiteral("GraphViz (.dot)"), QStringLiteral("dot"));
+    exportLayout->addWidget(exportLabel);
+    exportLayout->addWidget(m_structuralExportFormatCombo);
+    exportLayout->addWidget(m_structuralExportButton);
+    exportLayout->addStretch(1);
+    panelLayout->addLayout(exportLayout);
+
     m_structuralTabWidget = new QTabWidget(panelRoot);
     m_structuralTabWidget->setObjectName(QStringLiteral("structuralTabWidget"));
 
@@ -649,6 +665,7 @@ void MainWindow::setupStructuralPanel()
     connect(m_structuralClearFiltersButton, &QPushButton::clicked, this, [this]() {
         clearStructuralFilters(true);
     });
+    connect(m_structuralExportButton, &QPushButton::clicked, this, &MainWindow::onStructuralExportCurrent);
 
     clearStructuralFilters(false);
     setStructuralViewMode(0);
@@ -3256,6 +3273,118 @@ void MainWindow::clearStructuralFilters(bool applyNow)
     if (applyNow) {
         applyStructuralFiltersToCurrentRows(m_structuralStatusPrefix);
     }
+}
+
+bool MainWindow::exportStructuralRowsToPath(const QString& outputPath,
+                                            QString* errorText,
+                                            QString* formatTokenOut,
+                                            bool* graphHasEdgesOut) const
+{
+    if (m_structuralFilteredRows.isEmpty()) {
+        if (errorText) {
+            *errorText = QStringLiteral("no_visible_structural_rows");
+        }
+        return false;
+    }
+
+    const QString token = (m_structuralExportFormatCombo && m_structuralExportFormatCombo->currentIndex() >= 0)
+        ? m_structuralExportFormatCombo->currentData().toString()
+        : QStringLiteral("json");
+
+    StructuralExportFormat format = StructuralExportFormat::Json;
+    if (!StructuralExportFormatUtil::fromToken(token, &format)) {
+        if (errorText) {
+            *errorText = QStringLiteral("invalid_export_format:%1").arg(token);
+        }
+        return false;
+    }
+
+    bool hasGraphEdges = false;
+    QString writeError;
+    if (!StructuralExportEngine::writeRowsToFile(m_structuralFilteredRows,
+                                                 format,
+                                                 outputPath,
+                                                 &writeError,
+                                                 &hasGraphEdges)) {
+        if (errorText) {
+            *errorText = writeError;
+        }
+        return false;
+    }
+
+    if (formatTokenOut) {
+        *formatTokenOut = StructuralExportFormatUtil::toToken(format);
+    }
+    if (graphHasEdgesOut) {
+        *graphHasEdgesOut = hasGraphEdges;
+    }
+    return true;
+}
+
+void MainWindow::onStructuralExportCurrent()
+{
+    if (m_structuralFilteredRows.isEmpty()) {
+        if (m_statusLabel) {
+            m_statusLabel->setText(QStringLiteral("Structural export skipped: no visible rows"));
+        }
+        return;
+    }
+
+    const QString token = (m_structuralExportFormatCombo && m_structuralExportFormatCombo->currentIndex() >= 0)
+        ? m_structuralExportFormatCombo->currentData().toString()
+        : QStringLiteral("json");
+
+    StructuralExportFormat format = StructuralExportFormat::Json;
+    if (!StructuralExportFormatUtil::fromToken(token, &format)) {
+        if (m_statusLabel) {
+            m_statusLabel->setText(QStringLiteral("Structural export failed: invalid format"));
+        }
+        return;
+    }
+
+    const QString rootForExport = m_structuralRootPath.trimmed().isEmpty() ? currentRootPath() : m_structuralRootPath;
+    const QString baseDir = rootForExport.trimmed().isEmpty() ? QDir::currentPath() : rootForExport;
+    const QString defaultName = QStringLiteral("structural_export_%1%2")
+        .arg(QDateTime::currentDateTime().toString(QStringLiteral("yyyyMMdd_HHmmss")))
+        .arg(StructuralExportFormatUtil::defaultExtension(format));
+    const QString suggestedPath = QDir(baseDir).filePath(defaultName);
+
+    const QString outputPath = QFileDialog::getSaveFileName(this,
+                                                            QStringLiteral("Export Structural Rows"),
+                                                            suggestedPath,
+                                                            StructuralExportFormatUtil::defaultFilter(format));
+    if (outputPath.trimmed().isEmpty()) {
+        if (m_statusLabel) {
+            m_statusLabel->setText(QStringLiteral("Structural export canceled"));
+        }
+        return;
+    }
+
+    QString errorText;
+    QString formatToken;
+    bool graphHasEdges = false;
+    if (!exportStructuralRowsToPath(outputPath, &errorText, &formatToken, &graphHasEdges)) {
+        if (m_statusLabel) {
+            m_statusLabel->setText(QStringLiteral("Structural export failed: %1").arg(errorText));
+        }
+        return;
+    }
+
+    const QString graphNote = (formatToken == QStringLiteral("dot"))
+        ? QStringLiteral(" graph_edges=%1").arg(graphHasEdges ? QStringLiteral("yes") : QStringLiteral("no"))
+        : QString();
+    if (m_statusLabel) {
+        m_statusLabel->setText(QStringLiteral("Structural export wrote %1 rows to %2 (%3)%4")
+                                   .arg(m_structuralFilteredRows.size())
+                                   .arg(QDir::toNativeSeparators(outputPath))
+                                   .arg(formatToken)
+                                   .arg(graphNote));
+    }
+    appendRuntimeLog(QStringLiteral("structural_export path=%1 rows=%2 format=%3 graph_edges=%4")
+                         .arg(outputPath)
+                         .arg(m_structuralFilteredRows.size())
+                         .arg(formatToken)
+                         .arg(graphHasEdges ? QStringLiteral("true") : QStringLiteral("false")));
 }
 
 void MainWindow::setStructuralCanonicalRows(const QVector<StructuralResultRow>& rows,

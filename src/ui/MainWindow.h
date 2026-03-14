@@ -175,6 +175,7 @@ private slots:
     void onStructuralCompareSnapshots();
     void onStructuralShowReferences();
     void onStructuralShowUsedBy();
+    void onStructuralExportCurrent();
     void onActionCopyPath();
     void onActionRename();
     void onActionPinFavorite();
@@ -293,6 +294,10 @@ private:
     void updateStructuralFilterControlChoices(const QVector<StructuralResultRow>& canonicalRows);
     void applyStructuralFiltersToCurrentRows(const QString& statusPrefix = QString());
     void clearStructuralFilters(bool applyNow = true);
+    bool exportStructuralRowsToPath(const QString& outputPath,
+                                    QString* errorText = nullptr,
+                                    QString* formatTokenOut = nullptr,
+                                    bool* graphHasEdgesOut = nullptr) const;
     void setStructuralCanonicalRows(const QVector<StructuralResultRow>& rows,
                                     const QString& viewRoot,
                                     const QString& statusPrefix);
@@ -431,6 +436,8 @@ private:
     QPushButton* m_structuralClearFiltersButton = nullptr;
     QComboBox* m_structuralSortFieldCombo = nullptr;
     QPushButton* m_structuralSortDirectionButton = nullptr;
+    QComboBox* m_structuralExportFormatCombo = nullptr;
+    QPushButton* m_structuralExportButton = nullptr;
     QPushButton* m_structuralTableViewButton = nullptr;
     QPushButton* m_structuralGraphViewButton = nullptr;
     QPushButton* m_structuralTimelineViewButton = nullptr;

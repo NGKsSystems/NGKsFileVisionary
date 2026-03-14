@@ -58,6 +58,8 @@
 #include "ui/graph/StructuralGraphWidget.h"
 #include "ui/timeline/StructuralTimelineBuilder.h"
 #include "ui/timeline/StructuralTimelineWidget.h"
+#include "ui/export/StructuralExportEngine.h"
+#include "ui/export/StructuralExportFormat.h"
 #include "ui/model/DirectoryModel.h"
 #include "ui/model/QueryResultAdapter.h"
 #include "ui/query/StructuralQueryAutocomplete.h"
@@ -224,6 +226,15 @@ struct QueryAutocompleteSmokeCliOptions {
     QString historyDbPath;
     QString historyRoot;
     QString autocompleteLogPath;
+    QStringList argsReceived;
+    QString parseError;
+};
+
+struct ExportSmokeCliOptions {
+    bool enabled = false;
+    QString historyDbPath;
+    QString historyRoot;
+    QString exportLogPath;
     QStringList argsReceived;
     QString parseError;
 };
@@ -519,6 +530,16 @@ bool hasQueryAutocompleteSmokeFlag(int argc, char* argv[])
 {
     for (int i = 1; i < argc; ++i) {
         if (QString::fromLocal8Bit(argv[i]) == QStringLiteral("--query-autocomplete-smoke")) {
+            return true;
+        }
+    }
+    return false;
+}
+
+bool hasExportSmokeFlag(int argc, char* argv[])
+{
+    for (int i = 1; i < argc; ++i) {
+        if (QString::fromLocal8Bit(argv[i]) == QStringLiteral("--export-smoke")) {
             return true;
         }
     }
@@ -1526,6 +1547,59 @@ QueryAutocompleteSmokeCliOptions parseQueryAutocompleteSmokeOptions(int argc, ch
                 break;
             }
             options.autocompleteLogPath = QDir::cleanPath(options.autocompleteLogPath);
+            continue;
+        }
+    }
+
+    return options;
+}
+
+ExportSmokeCliOptions parseExportSmokeOptions(int argc, char* argv[])
+{
+    ExportSmokeCliOptions options;
+
+    for (int i = 0; i < argc; ++i) {
+        options.argsReceived << QString::fromLocal8Bit(argv[i]);
+    }
+
+    for (int i = 1; i < argc; ++i) {
+        const QString token = QString::fromLocal8Bit(argv[i]);
+        if (token == QStringLiteral("--export-smoke")) {
+            options.enabled = true;
+            continue;
+        }
+
+        auto consumeValue = [&](QString* out) {
+            if ((i + 1) >= argc) {
+                options.parseError = QStringLiteral("missing_value_for_%1").arg(token);
+                return false;
+            }
+            ++i;
+            *out = QString::fromLocal8Bit(argv[i]);
+            return true;
+        };
+
+        if (token == QStringLiteral("--history-db-path")) {
+            if (!consumeValue(&options.historyDbPath)) {
+                break;
+            }
+            options.historyDbPath = QDir::cleanPath(options.historyDbPath);
+            continue;
+        }
+
+        if (token == QStringLiteral("--history-root")) {
+            if (!consumeValue(&options.historyRoot)) {
+                break;
+            }
+            options.historyRoot = QDir::cleanPath(options.historyRoot);
+            continue;
+        }
+
+        if (token == QStringLiteral("--export-log")) {
+            if (!consumeValue(&options.exportLogPath)) {
+                break;
+            }
+            options.exportLogPath = QDir::cleanPath(options.exportLogPath);
             continue;
         }
     }
@@ -6315,6 +6389,416 @@ int runQueryAutocompleteSmokeCli(int argc, char* argv[])
     }
 }
 
+int runExportSmokeCli(int argc, char* argv[])
+{
+    QCoreApplication cliApp(argc, argv);
+
+    const ExportSmokeCliOptions options = parseExportSmokeOptions(argc, argv);
+    const QString exePath = QFileInfo(QString::fromLocal8Bit(argv[0])).absoluteFilePath();
+    const QString cwd = QDir::currentPath();
+
+    if (!options.parseError.isEmpty()) {
+        writeStderrLine(QStringLiteral("export_smoke_parse_error=%1").arg(options.parseError));
+        return 833;
+    }
+    if (options.exportLogPath.trimmed().isEmpty()) {
+        writeStderrLine(QStringLiteral("export_smoke_error=missing_required_arg_--export-log"));
+        return 834;
+    }
+
+    IndexSmokeLogWriter log;
+    QString logOpenError;
+    if (!log.open(options.exportLogPath, &logOpenError)) {
+        writeStderrLine(QStringLiteral("export_smoke_error=log_open_failed"));
+        writeStderrLine(QStringLiteral("export_smoke_log_path=%1").arg(QDir::toNativeSeparators(options.exportLogPath)));
+        writeStderrLine(QStringLiteral("export_smoke_log_error=%1").arg(logOpenError));
+        return 835;
+    }
+
+    auto finishFail = [&](int exitCode, const QString& reason) {
+        log.writeLine(QStringLiteral("final_status=FAIL"));
+        log.writeLine(QStringLiteral("exit_code=%1").arg(exitCode));
+        log.writeLine(QStringLiteral("failure_reason=%1").arg(reason));
+        log.writeLine(QStringLiteral("timestamp_utc_end=%1").arg(QDateTime::currentDateTimeUtc().toString(Qt::ISODate)));
+        return exitCode;
+    };
+
+    auto writeTextFile = [](const QString& filePath, const QString& content, QString* errorText) {
+        const QFileInfo info(filePath);
+        if (!QDir().mkpath(info.absolutePath())) {
+            if (errorText) {
+                *errorText = QStringLiteral("create_parent_dir_failed:%1").arg(info.absolutePath());
+            }
+            return false;
+        }
+
+        QFile out(filePath);
+        if (!out.open(QIODevice::WriteOnly | QIODevice::Text | QIODevice::Truncate)) {
+            if (errorText) {
+                *errorText = QStringLiteral("open_write_failed:%1").arg(out.errorString());
+            }
+            return false;
+        }
+
+        QTextStream ts(&out);
+        ts << content;
+        ts.flush();
+        out.close();
+        return true;
+    };
+
+    auto parseCsvLine = [](const QString& line) {
+        QStringList fields;
+        QString current;
+        bool inQuotes = false;
+        for (int i = 0; i < line.size(); ++i) {
+            const QChar ch = line.at(i);
+            if (inQuotes) {
+                if (ch == QChar('"')) {
+                    if ((i + 1) < line.size() && line.at(i + 1) == QChar('"')) {
+                        current += QChar('"');
+                        ++i;
+                    } else {
+                        inQuotes = false;
+                    }
+                } else {
+                    current += ch;
+                }
+            } else {
+                if (ch == QChar('"')) {
+                    inQuotes = true;
+                } else if (ch == QChar(',')) {
+                    fields.push_back(current);
+                    current.clear();
+                } else {
+                    current += ch;
+                }
+            }
+        }
+        fields.push_back(current);
+        return fields;
+    };
+
+    try {
+        if (options.historyDbPath.trimmed().isEmpty()) {
+            return finishFail(836, QStringLiteral("missing_required_arg_--history-db-path"));
+        }
+        if (options.historyRoot.trimmed().isEmpty()) {
+            return finishFail(837, QStringLiteral("missing_required_arg_--history-root"));
+        }
+
+        const QString normalizedRoot = QDir::fromNativeSeparators(
+            QDir::cleanPath(QFileInfo(options.historyRoot).absoluteFilePath()));
+        const QString sampleRoot = QDir(normalizedRoot).filePath(QStringLiteral("sample_export_root"));
+        const QString exportRoot = QDir(normalizedRoot).filePath(QStringLiteral("export_smoke_outputs"));
+
+        log.writeLine(QStringLiteral("mode=export_smoke"));
+        log.writeLine(QStringLiteral("startup_banner=EXPORT_SMOKE_BEGIN"));
+        log.writeLine(QStringLiteral("exe_path=%1").arg(QDir::toNativeSeparators(exePath)));
+        log.writeLine(QStringLiteral("cwd=%1").arg(QDir::toNativeSeparators(cwd)));
+        log.writeLine(QStringLiteral("args_received=%1").arg(options.argsReceived.join(QStringLiteral(" | "))));
+        log.writeLine(QStringLiteral("history_db_path=%1").arg(QDir::toNativeSeparators(options.historyDbPath)));
+        log.writeLine(QStringLiteral("history_root=%1").arg(QDir::toNativeSeparators(normalizedRoot)));
+        log.writeLine(QStringLiteral("sample_root=%1").arg(QDir::toNativeSeparators(sampleRoot)));
+        log.writeLine(QStringLiteral("export_root=%1").arg(QDir::toNativeSeparators(exportRoot)));
+        log.writeLine(QStringLiteral("timestamp_utc=%1").arg(QDateTime::currentDateTimeUtc().toString(Qt::ISODate)));
+
+        QDir sampleDir(sampleRoot);
+        if (sampleDir.exists() && !sampleDir.removeRecursively()) {
+            return finishFail(838, QStringLiteral("sample_root_cleanup_failed"));
+        }
+        if (!QDir().mkpath(QDir(sampleRoot).filePath(QStringLiteral("src")))
+            || !QDir().mkpath(QDir(sampleRoot).filePath(QStringLiteral("docs")))
+            || !QDir().mkpath(QDir(sampleRoot).filePath(QStringLiteral("config")))) {
+            return finishFail(839, QStringLiteral("sample_root_create_failed"));
+        }
+
+        QString writeError;
+        if (!writeTextFile(QDir(sampleRoot).filePath(QStringLiteral("src/main.cpp")),
+                           QStringLiteral("#include \"util.h\"\nint main(){ return util(); }\n"),
+                           &writeError)
+            || !writeTextFile(QDir(sampleRoot).filePath(QStringLiteral("src/util.cpp")),
+                              QStringLiteral("#include \"util.h\"\nint util(){ return 1; }\n"),
+                              &writeError)
+            || !writeTextFile(QDir(sampleRoot).filePath(QStringLiteral("src/util.h")),
+                              QStringLiteral("#pragma once\nint util();\n"),
+                              &writeError)
+            || !writeTextFile(QDir(sampleRoot).filePath(QStringLiteral("docs/readme.md")),
+                              QStringLiteral("export smoke sample\n"),
+                              &writeError)
+            || !writeTextFile(QDir(sampleRoot).filePath(QStringLiteral("config/app.json")),
+                              QStringLiteral("{\n  \"name\": \"sample\"\n}\n"),
+                              &writeError)) {
+            return finishFail(840, QStringLiteral("sample_seed_failed:%1").arg(writeError));
+        }
+
+        const QString mainPath = QDir::fromNativeSeparators(QDir::cleanPath(QDir(sampleRoot).filePath(QStringLiteral("src/main.cpp"))));
+        const QString utilCppPath = QDir::fromNativeSeparators(QDir::cleanPath(QDir(sampleRoot).filePath(QStringLiteral("src/util.cpp"))));
+        const QString utilHeaderPath = QDir::fromNativeSeparators(QDir::cleanPath(QDir(sampleRoot).filePath(QStringLiteral("src/util.h"))));
+        const QString docsPath = QDir::fromNativeSeparators(QDir::cleanPath(QDir(sampleRoot).filePath(QStringLiteral("docs/readme.md"))));
+        const QString configPath = QDir::fromNativeSeparators(QDir::cleanPath(QDir(sampleRoot).filePath(QStringLiteral("config/app.json"))));
+
+        QVector<StructuralResultRow> canonicalRows;
+
+        StructuralResultRow historyRow;
+        historyRow.category = StructuralResultCategory::History;
+        historyRow.primaryPath = mainPath;
+        historyRow.secondaryPath = mainPath;
+        historyRow.status = QStringLiteral("changed");
+        historyRow.hasSnapshotId = true;
+        historyRow.snapshotId = 1001;
+        historyRow.timestamp = QStringLiteral("2026-03-10T10:01:00Z");
+        historyRow.hasSizeBytes = true;
+        historyRow.sizeBytes = 120;
+        historyRow.note = QStringLiteral("history_event");
+        canonicalRows.push_back(historyRow);
+
+        StructuralResultRow snapshotRow;
+        snapshotRow.category = StructuralResultCategory::Snapshot;
+        snapshotRow.primaryPath = sampleRoot;
+        snapshotRow.secondaryPath = QStringLiteral("snap_a");
+        snapshotRow.status = QStringLiteral("structural_full");
+        snapshotRow.hasSnapshotId = true;
+        snapshotRow.snapshotId = 1002;
+        snapshotRow.timestamp = QStringLiteral("2026-03-10T10:02:00Z");
+        snapshotRow.note = QStringLiteral("snapshot_row");
+        canonicalRows.push_back(snapshotRow);
+
+        StructuralResultRow diffRow;
+        diffRow.category = StructuralResultCategory::Diff;
+        diffRow.primaryPath = utilCppPath;
+        diffRow.status = QStringLiteral("changed");
+        diffRow.timestamp = QStringLiteral("2026-03-10T10:03:00Z");
+        diffRow.hasSizeBytes = true;
+        diffRow.sizeBytes = 82;
+        diffRow.note = QStringLiteral("diff_row");
+        canonicalRows.push_back(diffRow);
+
+        StructuralResultRow referenceRow;
+        referenceRow.category = StructuralResultCategory::Reference;
+        referenceRow.primaryPath = mainPath;
+        referenceRow.secondaryPath = utilHeaderPath;
+        referenceRow.relationship = QStringLiteral("include_ref");
+        referenceRow.status = QStringLiteral("include_ref");
+        referenceRow.hasSnapshotId = true;
+        referenceRow.snapshotId = 1003;
+        referenceRow.timestamp = QStringLiteral("2026-03-10T10:04:00Z");
+        referenceRow.hasSizeBytes = true;
+        referenceRow.sizeBytes = 90;
+        referenceRow.sourceFile = mainPath;
+        referenceRow.symbol = QStringLiteral("util");
+        referenceRow.note = QStringLiteral("resolved");
+        canonicalRows.push_back(referenceRow);
+
+        StructuralResultRow referenceRow2 = referenceRow;
+        referenceRow2.primaryPath = docsPath;
+        referenceRow2.secondaryPath = configPath;
+        referenceRow2.sourceFile = docsPath;
+        referenceRow2.symbol = QStringLiteral("docs_config_link");
+        referenceRow2.timestamp = QStringLiteral("2026-03-10T10:05:00Z");
+        referenceRow2.status = QStringLiteral("path_ref");
+        referenceRow2.relationship = QStringLiteral("path_ref");
+        canonicalRows.push_back(referenceRow2);
+
+        StructuralFilterState filterState;
+        filterState.extensions.insert(QStringLiteral(".cpp"));
+        filterState.statuses.insert(QStringLiteral("changed"));
+
+        QVector<StructuralResultRow> rankedRows = canonicalRows;
+        StructuralRankingEngine::computeRanking(&rankedRows);
+
+        QVector<StructuralResultRow> visibleRows = StructuralFilterEngine::apply(rankedRows, filterState);
+        StructuralSortEngine::sortRows(&visibleRows,
+                                       StructuralSortField::Timestamp,
+                                       StructuralSortDirection::Descending);
+
+        log.writeLine(QStringLiteral("canonical_row_count=%1").arg(canonicalRows.size()));
+        log.writeLine(QStringLiteral("visible_row_count=%1").arg(visibleRows.size()));
+        log.writeLine(QStringLiteral("visible_rows_begin"));
+        const QStringList debugRows = StructuralResultAdapter::toDebugStrings(visibleRows);
+        for (const QString& rowLine : debugRows) {
+            log.writeLine(rowLine);
+        }
+        log.writeLine(QStringLiteral("visible_rows_end"));
+
+        if (!QDir().mkpath(exportRoot)) {
+            return finishFail(841, QStringLiteral("export_root_create_failed"));
+        }
+
+        const QString jsonPath = QDir(exportRoot).filePath(QStringLiteral("structural_export.json"));
+        const QString csvPath = QDir(exportRoot).filePath(QStringLiteral("structural_export.csv"));
+        const QString markdownPath = QDir(exportRoot).filePath(QStringLiteral("structural_export.md"));
+        const QString dotPath = QDir(exportRoot).filePath(QStringLiteral("structural_export.dot"));
+
+        QString exportError;
+        bool dotHasEdges = false;
+        const bool jsonWriteOk = StructuralExportEngine::writeRowsToFile(visibleRows,
+                                                                          StructuralExportFormat::Json,
+                                                                          jsonPath,
+                                                                          &exportError,
+                                                                          nullptr);
+        if (!jsonWriteOk) {
+            return finishFail(842, QStringLiteral("json_export_failed:%1").arg(exportError));
+        }
+        const bool csvWriteOk = StructuralExportEngine::writeRowsToFile(visibleRows,
+                                                                         StructuralExportFormat::Csv,
+                                                                         csvPath,
+                                                                         &exportError,
+                                                                         nullptr);
+        if (!csvWriteOk) {
+            return finishFail(843, QStringLiteral("csv_export_failed:%1").arg(exportError));
+        }
+        const bool markdownWriteOk = StructuralExportEngine::writeRowsToFile(visibleRows,
+                                                                              StructuralExportFormat::Markdown,
+                                                                              markdownPath,
+                                                                              &exportError,
+                                                                              nullptr);
+        if (!markdownWriteOk) {
+            return finishFail(844, QStringLiteral("markdown_export_failed:%1").arg(exportError));
+        }
+        const bool dotWriteOk = StructuralExportEngine::writeRowsToFile(visibleRows,
+                                                                         StructuralExportFormat::GraphViz,
+                                                                         dotPath,
+                                                                         &exportError,
+                                                                         &dotHasEdges);
+        if (!dotWriteOk) {
+            return finishFail(845, QStringLiteral("dot_export_failed:%1").arg(exportError));
+        }
+
+        const bool jsonExists = QFileInfo::exists(jsonPath);
+        const bool csvExists = QFileInfo::exists(csvPath);
+        const bool markdownExists = QFileInfo::exists(markdownPath);
+        const bool dotExists = QFileInfo::exists(dotPath);
+
+        QByteArray jsonBytes;
+        {
+            QFile jsonFile(jsonPath);
+            if (!jsonFile.open(QIODevice::ReadOnly | QIODevice::Text)) {
+                return finishFail(846, QStringLiteral("json_read_failed:%1").arg(jsonFile.errorString()));
+            }
+            jsonBytes = jsonFile.readAll();
+        }
+
+        QJsonParseError jsonParseError;
+        const QJsonDocument jsonDoc = QJsonDocument::fromJson(jsonBytes, &jsonParseError);
+        if (jsonParseError.error != QJsonParseError::NoError || !jsonDoc.isArray()) {
+            return finishFail(847, QStringLiteral("json_parse_failed:%1").arg(jsonParseError.errorString()));
+        }
+        const QJsonArray jsonRows = jsonDoc.array();
+        QStringList jsonOrder;
+        for (const QJsonValue& value : jsonRows) {
+            const QJsonObject obj = value.toObject();
+            jsonOrder.push_back(obj.value(QStringLiteral("primaryPath")).toString());
+        }
+
+        QStringList csvLines;
+        {
+            QFile csvFile(csvPath);
+            if (!csvFile.open(QIODevice::ReadOnly | QIODevice::Text)) {
+                return finishFail(848, QStringLiteral("csv_read_failed:%1").arg(csvFile.errorString()));
+            }
+            QTextStream ts(&csvFile);
+            while (!ts.atEnd()) {
+                const QString line = ts.readLine();
+                if (!line.trimmed().isEmpty()) {
+                    csvLines.push_back(line);
+                }
+            }
+        }
+        QStringList csvOrder;
+        for (int i = 1; i < csvLines.size(); ++i) {
+            const QStringList fields = parseCsvLine(csvLines.at(i));
+            if (fields.size() >= 2) {
+                csvOrder.push_back(fields.at(1));
+            }
+        }
+
+        QStringList markdownLines;
+        {
+            QFile mdFile(markdownPath);
+            if (!mdFile.open(QIODevice::ReadOnly | QIODevice::Text)) {
+                return finishFail(849, QStringLiteral("markdown_read_failed:%1").arg(mdFile.errorString()));
+            }
+            QTextStream ts(&mdFile);
+            while (!ts.atEnd()) {
+                const QString line = ts.readLine();
+                if (!line.trimmed().isEmpty()) {
+                    markdownLines.push_back(line);
+                }
+            }
+        }
+        QStringList markdownOrder;
+        for (int i = 2; i < markdownLines.size(); ++i) {
+            const QString line = markdownLines.at(i);
+            if (!line.startsWith(QStringLiteral("|"))) {
+                continue;
+            }
+            QStringList cols = line.split('|');
+            if (cols.size() >= 4) {
+                markdownOrder.push_back(cols.at(2).trimmed());
+            }
+        }
+
+        QStringList visibleOrder;
+        visibleOrder.reserve(visibleRows.size());
+        for (const StructuralResultRow& row : visibleRows) {
+            visibleOrder.push_back(row.primaryPath);
+        }
+
+        const bool rowCountPreserved = static_cast<int>(jsonRows.size()) == visibleRows.size()
+            && csvOrder.size() == visibleRows.size()
+            && markdownOrder.size() == visibleRows.size();
+        const bool orderingPreserved = (jsonOrder == visibleOrder)
+            && (csvOrder == visibleOrder)
+            && (markdownOrder == visibleOrder);
+        const bool filterSortPreserved = !visibleRows.isEmpty() && rowCountPreserved && orderingPreserved;
+
+        log.writeLine(QStringLiteral("export_json_path=%1").arg(QDir::toNativeSeparators(jsonPath)));
+        log.writeLine(QStringLiteral("export_csv_path=%1").arg(QDir::toNativeSeparators(csvPath)));
+        log.writeLine(QStringLiteral("export_markdown_path=%1").arg(QDir::toNativeSeparators(markdownPath)));
+        log.writeLine(QStringLiteral("export_dot_path=%1").arg(QDir::toNativeSeparators(dotPath)));
+        log.writeLine(QStringLiteral("json_row_count=%1").arg(jsonRows.size()));
+        log.writeLine(QStringLiteral("csv_row_count=%1").arg(csvOrder.size()));
+        log.writeLine(QStringLiteral("markdown_row_count=%1").arg(markdownOrder.size()));
+        log.writeLine(QStringLiteral("dot_has_edges=%1").arg(dotHasEdges ? QStringLiteral("true") : QStringLiteral("false")));
+
+        log.writeLine(QStringLiteral("gate_export_engine_exists=PASS"));
+        log.writeLine(QStringLiteral("gate_json_export=%1").arg((jsonWriteOk && jsonExists) ? QStringLiteral("PASS") : QStringLiteral("FAIL")));
+        log.writeLine(QStringLiteral("gate_csv_export=%1").arg((csvWriteOk && csvExists) ? QStringLiteral("PASS") : QStringLiteral("FAIL")));
+        log.writeLine(QStringLiteral("gate_markdown_export=%1").arg((markdownWriteOk && markdownExists) ? QStringLiteral("PASS") : QStringLiteral("FAIL")));
+        log.writeLine(QStringLiteral("gate_graphviz_export=%1").arg((dotWriteOk && dotExists) ? QStringLiteral("PASS") : QStringLiteral("FAIL")));
+        log.writeLine(QStringLiteral("gate_export_row_count_preserved=%1").arg(rowCountPreserved ? QStringLiteral("PASS") : QStringLiteral("FAIL")));
+        log.writeLine(QStringLiteral("gate_export_order_preserved=%1").arg(orderingPreserved ? QStringLiteral("PASS") : QStringLiteral("FAIL")));
+        log.writeLine(QStringLiteral("gate_filter_sort_state_preserved=%1").arg(filterSortPreserved ? QStringLiteral("PASS") : QStringLiteral("FAIL")));
+
+        const bool pass = jsonWriteOk
+            && csvWriteOk
+            && markdownWriteOk
+            && jsonExists
+            && csvExists
+            && markdownExists
+            && rowCountPreserved
+            && orderingPreserved
+            && filterSortPreserved;
+
+        if (!pass) {
+            return finishFail(850, QStringLiteral("export_smoke_gate_failed"));
+        }
+
+        log.writeLine(QStringLiteral("final_status=PASS"));
+        log.writeLine(QStringLiteral("exit_code=0"));
+        log.writeLine(QStringLiteral("failure_reason="));
+        log.writeLine(QStringLiteral("timestamp_utc_end=%1").arg(QDateTime::currentDateTimeUtc().toString(Qt::ISODate)));
+        std::_Exit(0);
+    } catch (const std::exception& ex) {
+        writeStderrLine(QStringLiteral("export_smoke_error=unexpected_exception"));
+        return finishFail(851, QStringLiteral("unexpected_exception:%1").arg(QString::fromLocal8Bit(ex.what())));
+    } catch (...) {
+        writeStderrLine(QStringLiteral("export_smoke_error=unexpected_error"));
+        return finishFail(852, QStringLiteral("unexpected_error"));
+    }
+}
+
 int runArchiveSmokeCli(int argc, char* argv[])
 {
     QCoreApplication cliApp(argc, argv);
@@ -10021,6 +10505,10 @@ int main(int argc, char* argv[])
 
     if (hasQueryAutocompleteSmokeFlag(argc, argv)) {
         return runQueryAutocompleteSmokeCli(argc, argv);
+    }
+
+    if (hasExportSmokeFlag(argc, argv)) {
+        return runExportSmokeCli(argc, argv);
     }
 
     if (hasSnapshotDiffSmokeFlag(argc, argv)) {
