@@ -35,6 +35,7 @@ class QCloseEvent;
 class QComboBox;
 class QDockWidget;
 class QLabel;
+class QFrame;
 class QProcess;
 class QProgressDialog;
 class QTabWidget;
@@ -146,6 +147,12 @@ public:
                                                    StructuralSortDirection sortDirection,
                                                    QString* errorText = nullptr);
     QString structuralSessionSummaryForTesting() const;
+    bool isLeftNavigationReadyForTesting() const;
+    bool isQueryCommandBarReadyForTesting() const;
+    bool isResultListReadyForTesting() const;
+    bool isStructuralPanelReadyForTesting() const;
+    int structuralTabCountForTesting() const;
+    bool switchStructuralTabForTesting(int index, QString* activeTabLabel = nullptr);
 
 protected:
     void closeEvent(QCloseEvent* event) override;
@@ -161,6 +168,7 @@ private slots:
     void onQuerySubmitted(const QString& text);
     void onQueryCleared();
     void onFocusQueryBar();
+    void onTreeCurrentChanged(const QModelIndex& current, const QModelIndex& previous);
     void onTreeContextMenu(const QPoint& pos);
     void onTreeActivated(const QModelIndex& index);
     void onSidebarItemActivated(QTreeWidgetItem* item, int column);
@@ -205,7 +213,13 @@ private:
     QString resolveUiDbPath() const;
     QuerySortField currentQuerySortField() const;
     QString selectedPath(const QModelIndex& index) const;
+    QModelIndex findSourceIndexByPath(const QString& absolutePath, const QModelIndex& parent = QModelIndex()) const;
     void appendRuntimeLog(const QString& message) const;
+    void updateStatusDisplay(const QString& status,
+                             int indexPercent,
+                             quint64 results,
+                             const QString& detail = QString());
+    QString mapStatusErrorText(const QString& errorText, const QString& rootPath = QString()) const;
     void startScanNow();
     bool isInternalNavigableDirectory(const QFileInfo& fileInfo) const;
     bool isNavigablePath(const QString& path) const;
@@ -364,6 +378,9 @@ private:
     QLineEdit* m_searchEdit = nullptr;
     QueryBarWidget* m_queryBarWidget = nullptr;
     QLabel* m_statusLabel = nullptr;
+    QFrame* m_queryCommandBarContainer = nullptr;
+    QFrame* m_navigationRailContainer = nullptr;
+    QFrame* m_workspaceContainer = nullptr;
     QToolBar* m_viewToolbar = nullptr;
     QComboBox* m_viewModeCombo = nullptr;
     QPushButton* m_backButton = nullptr;
@@ -415,6 +432,11 @@ private:
     QStringList m_actionContextPaths;
     QString m_actionContextType;
     QDateTime m_lastRefreshRequeryAt;
+    QString m_lastActivatedTreePath;
+    QDateTime m_lastActivatedTreeAt;
+    bool m_treeActivationInFlight = false;
+    QString m_pendingActivatedPath;
+    QString m_pendingRestoreSelectionPath;
 
     QAction* m_actionTreeSnapshot = nullptr;
     QAction* m_actionCompressZip = nullptr;
@@ -435,6 +457,8 @@ private:
     QDockWidget* m_structuralPanelDock = nullptr;
     QTabWidget* m_structuralTabWidget = nullptr;
     QLabel* m_structuralContextLabel = nullptr;
+    QLabel* m_structuralWorkspaceHeaderLabel = nullptr;
+    QLabel* m_structuralEmptyStateLabel = nullptr;
     QLabel* m_structuralHistoryStatusLabel = nullptr;
     QLabel* m_structuralSnapshotStatusLabel = nullptr;
     QLabel* m_structuralDiffStatusLabel = nullptr;

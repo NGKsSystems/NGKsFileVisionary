@@ -8,24 +8,32 @@
 #include <QLineEdit>
 #include <QPushButton>
 #include <QShortcut>
+#include <QVBoxLayout>
 
 #include "StructuralSuggestionModel.h"
 
 QueryBarWidget::QueryBarWidget(QWidget* parent)
     : QWidget(parent)
 {
-    auto* layout = new QHBoxLayout(this);
+    auto* layout = new QVBoxLayout(this);
     layout->setContentsMargins(0, 0, 0, 0);
+    layout->setSpacing(8);
 
-    auto* label = new QLabel(QStringLiteral("Query:"), this);
     m_queryInput = new QLineEdit(this);
     m_queryInput->setObjectName(QStringLiteral("queryInput"));
-    m_queryInput->setPlaceholderText(QStringLiteral("ext:.cpp under:src/ name:main references:src/main.cpp usedby:parser.h"));
+    m_queryInput->setPlaceholderText(QStringLiteral("Example: ext:.cpp under:src name:main references:parser"));
+    m_queryInput->setMinimumHeight(40);
+    m_queryInput->setStyleSheet(QStringLiteral("QLineEdit#queryInput { font-size: 14px; padding: 8px 10px; }"));
 
-    m_clearButton = new QPushButton(QStringLiteral("Clear"), this);
-    m_clearButton->setObjectName(QStringLiteral("queryClearButton"));
     m_executeButton = new QPushButton(QStringLiteral("Execute"), this);
     m_executeButton->setObjectName(QStringLiteral("queryExecuteButton"));
+    m_executeButton->setStyleSheet(QStringLiteral("QPushButton#queryExecuteButton { background: #1d4ed8; color: #ffffff; border: 1px solid #1e40af; border-radius: 5px; padding: 5px 14px; font-weight: 700; } QPushButton#queryExecuteButton:hover { background: #1e40af; }"));
+    m_clearButton = new QPushButton(QStringLiteral("Clear"), this);
+    m_clearButton->setObjectName(QStringLiteral("queryClearButton"));
+    m_clearButton->setStyleSheet(QStringLiteral("QPushButton#queryClearButton { background: #f3f4f6; color: #1f2937; border: 1px solid #cbd5e1; border-radius: 5px; padding: 5px 14px; font-weight: 600; } QPushButton#queryClearButton:hover { background: #e5e7eb; }"));
+    m_hintLabel = new QLabel(QStringLiteral("Query tokens: ext:  under:  name:  references:  usedby:"), this);
+    m_hintLabel->setObjectName(QStringLiteral("queryTokensHint"));
+    m_hintLabel->setStyleSheet(QStringLiteral("QLabel#queryTokensHint { color: #6b7280; font-size: 11px; font-weight: 500; }"));
 
     m_suggestionModel = new StructuralSuggestionModel(this);
     m_completer = new QCompleter(m_suggestionModel, this);
@@ -35,10 +43,15 @@ QueryBarWidget::QueryBarWidget(QWidget* parent)
     m_completer->setWrapAround(false);
     m_queryInput->setCompleter(m_completer);
 
-    layout->addWidget(label);
     layout->addWidget(m_queryInput, 1);
-    layout->addWidget(m_clearButton);
-    layout->addWidget(m_executeButton);
+    auto* buttonRow = new QHBoxLayout();
+    buttonRow->setContentsMargins(0, 0, 0, 0);
+    buttonRow->setSpacing(8);
+    buttonRow->addWidget(m_executeButton);
+    buttonRow->addWidget(m_clearButton);
+    buttonRow->addStretch(1);
+    layout->addLayout(buttonRow);
+    layout->addWidget(m_hintLabel);
 
     connect(m_queryInput, &QLineEdit::returnPressed, this, &QueryBarWidget::onReturnPressed);
     connect(m_queryInput, &QLineEdit::textChanged, this, &QueryBarWidget::onQueryTextChanged);
@@ -119,11 +132,12 @@ void QueryBarWidget::onCompleterActivated(const QString& text)
         return;
     }
 
+    const QString replaced = replaceCurrentToken(text);
     m_ignoreTextChanges = true;
-    m_queryInput->setText(text);
-    m_queryInput->setCursorPosition(text.size());
+    m_queryInput->setText(replaced);
+    m_queryInput->setCursorPosition(replaced.size());
     m_ignoreTextChanges = false;
-    updateSuggestions(text, false);
+    updateSuggestions(replaced, false);
 }
 
 void QueryBarWidget::onReturnPressed()
@@ -143,6 +157,43 @@ void QueryBarWidget::onReturnPressed()
 QStringList QueryBarWidget::computeSuggestions(const QString& text) const
 {
     return StructuralQueryAutocomplete::buildSuggestions(text, m_autocompleteContext);
+}
+
+QString QueryBarWidget::replaceCurrentToken(const QString& selectedSuggestion) const
+{
+    if (!m_queryInput) {
+        return selectedSuggestion;
+    }
+
+    const QString current = m_queryInput->text();
+    const int cursorPos = m_queryInput->cursorPosition();
+    const QString beforeCursor = current.left(cursorPos);
+    const QString afterCursor = current.mid(cursorPos);
+
+    int tokenStart = beforeCursor.size() - 1;
+    while (tokenStart >= 0 && !beforeCursor.at(tokenStart).isSpace()) {
+        --tokenStart;
+    }
+    tokenStart += 1;
+
+    int tokenEnd = 0;
+    while (tokenEnd < afterCursor.size() && !afterCursor.at(tokenEnd).isSpace()) {
+        ++tokenEnd;
+    }
+
+    const QString left = beforeCursor.left(tokenStart);
+    const QString right = afterCursor.mid(tokenEnd);
+
+    QString rebuilt = left;
+    if (!rebuilt.isEmpty() && !rebuilt.endsWith(QLatin1Char(' '))) {
+        rebuilt += QLatin1Char(' ');
+    }
+    rebuilt += selectedSuggestion;
+    if (!right.isEmpty() && !right.startsWith(QLatin1Char(' '))) {
+        rebuilt += QLatin1Char(' ');
+    }
+    rebuilt += right;
+    return rebuilt.trimmed();
 }
 
 void QueryBarWidget::updateSuggestions(const QString& text, bool showPopup)

@@ -16,12 +16,14 @@
 #include <QSqlError>
 #include <QSqlQuery>
 #include <QTextStream>
+#include <QDockWidget>
 #include <QTreeView>
 
 #include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <cstdlib>
+#include <functional>
 #include <thread>
 
 #include "core/db/MetaStore.h"
@@ -253,6 +255,15 @@ struct SystemCertificationSmokeCliOptions {
     QString historyDbPath;
     QString historyRoot;
     QString certLogPath;
+    QStringList argsReceived;
+    QString parseError;
+};
+
+struct UiShellSmokeCliOptions {
+    bool enabled = false;
+    QString uiRoot;
+    QString uiDbPath;
+    QString uiShellLogPath;
     QStringList argsReceived;
     QString parseError;
 };
@@ -578,6 +589,16 @@ bool hasSystemCertificationSmokeFlag(int argc, char* argv[])
 {
     for (int i = 1; i < argc; ++i) {
         if (QString::fromLocal8Bit(argv[i]) == QStringLiteral("--system-certification-smoke")) {
+            return true;
+        }
+    }
+    return false;
+}
+
+bool hasUiShellSmokeFlag(int argc, char* argv[])
+{
+    for (int i = 1; i < argc; ++i) {
+        if (QString::fromLocal8Bit(argv[i]) == QStringLiteral("--ui-shell-smoke")) {
             return true;
         }
     }
@@ -1744,6 +1765,59 @@ SystemCertificationSmokeCliOptions parseSystemCertificationSmokeOptions(int argc
                 break;
             }
             options.certLogPath = QDir::cleanPath(options.certLogPath);
+            continue;
+        }
+    }
+
+    return options;
+}
+
+UiShellSmokeCliOptions parseUiShellSmokeOptions(int argc, char* argv[])
+{
+    UiShellSmokeCliOptions options;
+
+    for (int i = 0; i < argc; ++i) {
+        options.argsReceived << QString::fromLocal8Bit(argv[i]);
+    }
+
+    for (int i = 1; i < argc; ++i) {
+        const QString token = QString::fromLocal8Bit(argv[i]);
+        if (token == QStringLiteral("--ui-shell-smoke")) {
+            options.enabled = true;
+            continue;
+        }
+
+        auto consumeValue = [&](QString* out) {
+            if ((i + 1) >= argc) {
+                options.parseError = QStringLiteral("missing_value_for_%1").arg(token);
+                return false;
+            }
+            ++i;
+            *out = QString::fromLocal8Bit(argv[i]);
+            return true;
+        };
+
+        if (token == QStringLiteral("--ui-root")) {
+            if (!consumeValue(&options.uiRoot)) {
+                break;
+            }
+            options.uiRoot = QDir::cleanPath(options.uiRoot);
+            continue;
+        }
+
+        if (token == QStringLiteral("--ui-db-path")) {
+            if (!consumeValue(&options.uiDbPath)) {
+                break;
+            }
+            options.uiDbPath = QDir::cleanPath(options.uiDbPath);
+            continue;
+        }
+
+        if (token == QStringLiteral("--ui-shell-log")) {
+            if (!consumeValue(&options.uiShellLogPath)) {
+                break;
+            }
+            options.uiShellLogPath = QDir::cleanPath(options.uiShellLogPath);
             continue;
         }
     }
@@ -7653,6 +7727,145 @@ int runSystemCertificationSmokeCli(int argc, char* argv[])
     }
 }
 
+int runUiShellSmokeCli(int argc, char* argv[])
+{
+    QApplication cliApp(argc, argv);
+
+    const UiShellSmokeCliOptions options = parseUiShellSmokeOptions(argc, argv);
+    const QString exePath = QFileInfo(QString::fromLocal8Bit(argv[0])).absoluteFilePath();
+    const QString cwd = QDir::currentPath();
+
+    if (!options.parseError.isEmpty()) {
+        writeStderrLine(QStringLiteral("ui_shell_smoke_parse_error=%1").arg(options.parseError));
+        return 1301;
+    }
+    if (options.uiShellLogPath.trimmed().isEmpty()) {
+        writeStderrLine(QStringLiteral("ui_shell_smoke_error=missing_required_arg_--ui-shell-log"));
+        return 1302;
+    }
+    if (options.uiRoot.trimmed().isEmpty()) {
+        writeStderrLine(QStringLiteral("ui_shell_smoke_error=missing_required_arg_--ui-root"));
+        return 1303;
+    }
+    if (options.uiDbPath.trimmed().isEmpty()) {
+        writeStderrLine(QStringLiteral("ui_shell_smoke_error=missing_required_arg_--ui-db-path"));
+        return 1304;
+    }
+
+    IndexSmokeLogWriter log;
+    QString logOpenError;
+    if (!log.open(options.uiShellLogPath, &logOpenError)) {
+        writeStderrLine(QStringLiteral("ui_shell_smoke_error=log_open_failed"));
+        writeStderrLine(QStringLiteral("ui_shell_smoke_log_path=%1").arg(QDir::toNativeSeparators(options.uiShellLogPath)));
+        writeStderrLine(QStringLiteral("ui_shell_smoke_log_error=%1").arg(logOpenError));
+        return 1305;
+    }
+
+    auto finishFail = [&](int exitCode, const QString& reason) {
+        log.writeLine(QStringLiteral("final_status=FAIL"));
+        log.writeLine(QStringLiteral("exit_code=%1").arg(exitCode));
+        log.writeLine(QStringLiteral("failure_reason=%1").arg(reason));
+        log.writeLine(QStringLiteral("timestamp_utc_end=%1").arg(QDateTime::currentDateTimeUtc().toString(Qt::ISODate)));
+        return exitCode;
+    };
+
+    const QString normalizedRoot = QDir::fromNativeSeparators(
+        QDir::cleanPath(QFileInfo(options.uiRoot).absoluteFilePath()));
+    if (!QDir(normalizedRoot).exists()) {
+        return finishFail(1306, QStringLiteral("ui_root_missing"));
+    }
+
+    log.writeLine(QStringLiteral("mode=ui_shell_smoke"));
+    log.writeLine(QStringLiteral("startup_banner=UI_SHELL_SMOKE_BEGIN"));
+    log.writeLine(QStringLiteral("exe_path=%1").arg(QDir::toNativeSeparators(exePath)));
+    log.writeLine(QStringLiteral("cwd=%1").arg(QDir::toNativeSeparators(cwd)));
+    log.writeLine(QStringLiteral("args_received=%1").arg(options.argsReceived.join(QStringLiteral(" | "))));
+    log.writeLine(QStringLiteral("ui_root=%1").arg(QDir::toNativeSeparators(normalizedRoot)));
+    log.writeLine(QStringLiteral("ui_db_path=%1").arg(QDir::toNativeSeparators(options.uiDbPath)));
+    log.writeLine(QStringLiteral("timestamp_utc=%1").arg(QDateTime::currentDateTimeUtc().toString(Qt::ISODate)));
+
+    MainWindow window(true,
+                      normalizedRoot,
+                      QString(),
+                      QString(),
+                      options.uiDbPath,
+                      nullptr);
+    window.show();
+    if (QDockWidget* structuralDock = window.findChild<QDockWidget*>(QStringLiteral("structuralPanelDock"))) {
+        structuralDock->show();
+    }
+    cliApp.processEvents();
+
+    const bool windowInit = window.isVisible();
+    const bool leftNavReady = window.isLeftNavigationReadyForTesting();
+    const bool queryBarReady = window.isQueryCommandBarReadyForTesting();
+    const bool resultListReady = window.isResultListReadyForTesting();
+    const bool structuralReady = window.isStructuralPanelReadyForTesting();
+
+    log.writeLine(QStringLiteral("window_initialized=%1").arg(windowInit ? QStringLiteral("true") : QStringLiteral("false")));
+    log.writeLine(QStringLiteral("left_navigation_loaded=%1").arg(leftNavReady ? QStringLiteral("true") : QStringLiteral("false")));
+    log.writeLine(QStringLiteral("query_bar_loaded=%1").arg(queryBarReady ? QStringLiteral("true") : QStringLiteral("false")));
+    log.writeLine(QStringLiteral("result_table_loaded=%1").arg(resultListReady ? QStringLiteral("true") : QStringLiteral("false")));
+    log.writeLine(QStringLiteral("structural_panel_loaded=%1").arg(structuralReady ? QStringLiteral("true") : QStringLiteral("false")));
+
+    std::function<void(const QObject*, int)> writeWidgetTree;
+    writeWidgetTree = [&](const QObject* node, int depth) {
+        if (!node) {
+            return;
+        }
+        const QString indent(depth * 2, QChar(' '));
+        const QString objectName = node->objectName().trimmed().isEmpty()
+            ? QStringLiteral("(anon)")
+            : node->objectName();
+        log.writeLine(QStringLiteral("widget_tree_entry=%1%2 [%3]")
+                          .arg(indent, objectName, QString::fromLatin1(node->metaObject()->className())));
+        const QObjectList children = node->children();
+        for (const QObject* child : children) {
+            if (qobject_cast<const QWidget*>(child) != nullptr) {
+                writeWidgetTree(child, depth + 1);
+            }
+        }
+    };
+    log.writeLine(QStringLiteral("widget_tree_begin"));
+    writeWidgetTree(&window, 0);
+    log.writeLine(QStringLiteral("widget_tree_end"));
+
+    const int tabCount = window.structuralTabCountForTesting();
+    bool tabSwitchPass = tabCount >= 4;
+    log.writeLine(QStringLiteral("structural_tab_count=%1").arg(tabCount));
+    for (int i = 0; i < tabCount; ++i) {
+        QString activeLabel;
+        const bool switched = window.switchStructuralTabForTesting(i, &activeLabel);
+        tabSwitchPass = tabSwitchPass && switched && !activeLabel.trimmed().isEmpty();
+        log.writeLine(QStringLiteral("tab_switch_%1_ok=%2 label=%3")
+                          .arg(i)
+                          .arg(switched ? QStringLiteral("true") : QStringLiteral("false"), activeLabel));
+    }
+
+    log.writeLine(QStringLiteral("gate_window_initializes=%1").arg(windowInit ? QStringLiteral("PASS") : QStringLiteral("FAIL")));
+    log.writeLine(QStringLiteral("gate_left_navigation_loads=%1").arg(leftNavReady ? QStringLiteral("PASS") : QStringLiteral("FAIL")));
+    log.writeLine(QStringLiteral("gate_query_bar_loads=%1").arg(queryBarReady ? QStringLiteral("PASS") : QStringLiteral("FAIL")));
+    log.writeLine(QStringLiteral("gate_result_table_loads=%1").arg(resultListReady ? QStringLiteral("PASS") : QStringLiteral("FAIL")));
+    log.writeLine(QStringLiteral("gate_structural_panel_loads=%1").arg(structuralReady ? QStringLiteral("PASS") : QStringLiteral("FAIL")));
+    log.writeLine(QStringLiteral("gate_structural_tabs_switch=%1").arg(tabSwitchPass ? QStringLiteral("PASS") : QStringLiteral("FAIL")));
+
+    const bool pass = windowInit
+        && leftNavReady
+        && queryBarReady
+        && resultListReady
+        && structuralReady
+        && tabSwitchPass;
+    if (!pass) {
+        return finishFail(1307, QStringLiteral("ui_shell_gate_failed"));
+    }
+
+    log.writeLine(QStringLiteral("final_status=PASS"));
+    log.writeLine(QStringLiteral("exit_code=0"));
+    log.writeLine(QStringLiteral("failure_reason="));
+    log.writeLine(QStringLiteral("timestamp_utc_end=%1").arg(QDateTime::currentDateTimeUtc().toString(Qt::ISODate)));
+    return 0;
+}
+
 int runArchiveSmokeCli(int argc, char* argv[])
 {
     QCoreApplication cliApp(argc, argv);
@@ -11371,6 +11584,10 @@ int main(int argc, char* argv[])
 
     if (hasSystemCertificationSmokeFlag(argc, argv)) {
         return runSystemCertificationSmokeCli(argc, argv);
+    }
+
+    if (hasUiShellSmokeFlag(argc, argv)) {
+        return runUiShellSmokeCli(argc, argv);
     }
 
     if (hasSnapshotDiffSmokeFlag(argc, argv)) {

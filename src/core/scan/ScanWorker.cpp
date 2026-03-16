@@ -67,6 +67,7 @@ ScanWorker::Result ScanWorker::run(const ScanTask& task, const Callbacks& callba
     };
 
     auto emitProgress = [&]() {
+        result.progress.pendingDirectories = static_cast<qint64>(pendingDirs.size());
         if (callbacks.onProgress) {
             callbacks.onProgress(result.progress);
         }

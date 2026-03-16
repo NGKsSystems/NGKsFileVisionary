@@ -81,6 +81,7 @@ bool ScanCoordinator::runScan(const ScanTask& task,
     workerCallbacks.onProgress = [&](const ScanWorkerProgress& progress) {
         state.totalSeen = progress.totalSeen;
         state.errorCount = progress.errorCount;
+        state.pendingDirectories = progress.pendingDirectories;
         QString progressError;
         if (!m_store.updateScanSessionProgress(state.sessionId,
                                                state.totalSeen,
@@ -99,6 +100,7 @@ bool ScanCoordinator::runScan(const ScanTask& task,
     const ScanWorker::Result workerResult = worker.run(workerTask, workerCallbacks);
     state.totalSeen = workerResult.progress.totalSeen;
     state.errorCount = workerResult.progress.errorCount;
+    state.pendingDirectories = workerResult.progress.pendingDirectories;
 
     if (!workerResult.errorText.isEmpty() && state.errorText.isEmpty()) {
         state.errorText = workerResult.errorText;

@@ -1,7 +1,86 @@
 #include "DirectoryModel.h"
 
+#include <QDateTime>
+#include <QDir>
+#include <QDirIterator>
+#include <QFileInfo>
+#include <QFileInfoList>
+
 #include "core/archive/ArchiveQueryAdapter.h"
 #include "core/services/VisionIndexService.h"
+
+namespace {
+QueryResult queryFilesystemFallback(const QString& rootPath,
+                                    const QueryOptions& options,
+                                    ViewModeController::UiViewMode mode)
+{
+    QueryResult result;
+    const QDir root(rootPath);
+    if (!root.exists()) {
+        result.ok = false;
+        result.errorText = QStringLiteral("not_found");
+        return result;
+    }
+
+    QVector<QueryRow> rows;
+
+    auto appendRow = [&](const QFileInfo& info, int depth) {
+        QueryRow row;
+        row.path = QDir::fromNativeSeparators(info.absoluteFilePath());
+        row.name = info.fileName();
+        row.normalizedName = row.name;
+        row.extension = info.isDir() ? QString() : QStringLiteral(".") + info.suffix().toLower();
+        row.isDir = info.isDir();
+        row.hasSizeBytes = !row.isDir;
+        row.sizeBytes = row.hasSizeBytes ? info.size() : 0;
+        row.modifiedUtc = info.lastModified().toUTC().toString(Qt::ISODate);
+        row.hiddenFlag = info.isHidden();
+        row.systemFlag = false;
+        row.archiveFlag = false;
+        row.existsFlag = true;
+        row.depth = depth;
+        rows.push_back(row);
+    };
+
+    if (mode == ViewModeController::UiViewMode::Standard) {
+        const QFileInfoList children = root.entryInfoList(QDir::NoDotAndDotDot | QDir::AllEntries,
+                                                          QDir::DirsFirst | QDir::Name | QDir::IgnoreCase);
+        rows.reserve(children.size());
+        for (const QFileInfo& info : children) {
+            appendRow(info, 1);
+        }
+    } else {
+        QDirIterator it(rootPath,
+                        QDir::NoDotAndDotDot | QDir::AllEntries,
+                        QDirIterator::Subdirectories);
+        while (it.hasNext()) {
+            const QFileInfo info(it.nextFileInfo());
+            if (!info.exists()) {
+                continue;
+            }
+            if (info.isSymLink() && info.isDir()) {
+                continue;
+            }
+
+            const QString relative = root.relativeFilePath(info.absoluteFilePath());
+            const int depth = qMax(1, relative.count(QLatin1Char('/')) + 1);
+            appendRow(info, depth);
+        }
+    }
+
+    QString filterError;
+    if (!QueryTypesUtil::applyFiltersAndSort(options, &rows, &filterError)) {
+        result.ok = false;
+        result.errorText = filterError;
+        return result;
+    }
+
+    result.ok = true;
+    result.rows = rows;
+    result.totalCount = rows.size();
+    return result;
+}
+}
 
 DirectoryModel::DirectoryModel()
     : m_visionService(new VisionIndexService())
@@ -68,12 +147,41 @@ QueryResult DirectoryModel::query(const Request& request)
     }
 
     switch (request.mode) {
-    case ViewModeController::UiViewMode::Standard:
-        return m_visionService->queryChildren(request.rootPath, options);
-    case ViewModeController::UiViewMode::Hierarchy:
-        return m_visionService->queryHierarchy(request.rootPath, options);
-    case ViewModeController::UiViewMode::Flat:
-        return m_visionService->queryFlat(request.rootPath, options);
+    case ViewModeController::UiViewMode::Standard: {
+        QueryResult indexed = m_visionService->queryChildren(request.rootPath, options);
+        if (indexed.ok) {
+            return indexed;
+        }
+
+        if (QString::compare(indexed.errorText.trimmed(), QStringLiteral("not_found"), Qt::CaseInsensitive) != 0) {
+            return indexed;
+        }
+
+        QueryResult fallback = queryFilesystemFallback(request.rootPath, options, request.mode);
+        if (!fallback.ok) {
+            return indexed;
+        }
+
+        return fallback;
+    }
+    case ViewModeController::UiViewMode::Hierarchy: {
+        QueryResult indexed = m_visionService->queryHierarchy(request.rootPath, options);
+        if (indexed.ok || QString::compare(indexed.errorText.trimmed(), QStringLiteral("not_found"), Qt::CaseInsensitive) != 0) {
+            return indexed;
+        }
+
+        QueryResult fallback = queryFilesystemFallback(request.rootPath, options, request.mode);
+        return fallback.ok ? fallback : indexed;
+    }
+    case ViewModeController::UiViewMode::Flat: {
+        QueryResult indexed = m_visionService->queryFlat(request.rootPath, options);
+        if (indexed.ok || QString::compare(indexed.errorText.trimmed(), QStringLiteral("not_found"), Qt::CaseInsensitive) != 0) {
+            return indexed;
+        }
+
+        QueryResult fallback = queryFilesystemFallback(request.rootPath, options, request.mode);
+        return fallback.ok ? fallback : indexed;
+    }
     }
 
     result.ok = false;

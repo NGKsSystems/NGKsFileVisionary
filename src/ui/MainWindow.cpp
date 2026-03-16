@@ -19,9 +19,11 @@
 #include <QFile>
 #include <QFileInfo>
 #include <QFileInfoList>
+#include <QFrame>
 #include <QFormLayout>
 #include <QHash>
 #include <QInputDialog>
+#include <QItemSelectionModel>
 #include <QHeaderView>
 #include <QHBoxLayout>
 #include <QDialog>
@@ -57,9 +59,12 @@
 #include <QtConcurrent/QtConcurrentRun>
 
 #include <algorithm>
+#include <functional>
 
 #include "TreeSnapshotDialog.h"
 #include "TreeSnapshotPreviewDialog.h"
+#include "layout/ApplicationShell.h"
+#include "layout/WorkspaceLayout.h"
 #include "graph/StructuralGraphWidget.h"
 #include "timeline/StructuralTimelineWidget.h"
 #include "core/history/HistoryEntry.h"
@@ -319,6 +324,14 @@ void MainWindow::setupUi()
 
     m_viewToolbar = addToolBar(QStringLiteral("View"));
     m_viewToolbar->setMovable(false);
+    ApplicationShell::styleTopToolbar(m_viewToolbar);
+    QLabel* appTitleLabel = new QLabel(QStringLiteral("NGKsFileVisionary"), this);
+    appTitleLabel->setObjectName(QStringLiteral("appTitleLabel"));
+    QFont titleFont = appTitleLabel->font();
+    titleFont.setBold(true);
+    appTitleLabel->setFont(titleFont);
+    m_viewToolbar->addWidget(appTitleLabel);
+    m_viewToolbar->addSeparator();
     m_backButton = new QPushButton(QStringLiteral("Back"), this);
     m_forwardButton = new QPushButton(QStringLiteral("Forward"), this);
     m_upButton = new QPushButton(QStringLiteral("Up"), this);
@@ -326,17 +339,78 @@ void MainWindow::setupUi()
     m_viewModeCombo->addItem(QStringLiteral("Standard"));
     m_viewModeCombo->addItem(QStringLiteral("Full Hierarchy"));
     m_viewModeCombo->addItem(QStringLiteral("Flat Files"));
+    QLabel* navGroupLabel = new QLabel(QStringLiteral("Navigation"), this);
+    navGroupLabel->setStyleSheet(QStringLiteral("color: #475569; font-weight: 600;"));
+    QLabel* viewGroupLabel = new QLabel(QStringLiteral("View"), this);
+    viewGroupLabel->setStyleSheet(QStringLiteral("color: #475569; font-weight: 600;"));
+    m_viewToolbar->addWidget(navGroupLabel);
     m_viewToolbar->addWidget(m_backButton);
     m_viewToolbar->addWidget(m_forwardButton);
     m_viewToolbar->addWidget(m_upButton);
     m_viewToolbar->addSeparator();
-    m_viewToolbar->addWidget(new QLabel(QStringLiteral("View Mode:"), this));
+    m_viewToolbar->addWidget(viewGroupLabel);
+    m_viewToolbar->addWidget(new QLabel(QStringLiteral("Mode:"), this));
     m_viewToolbar->addWidget(m_viewModeCombo);
 
     QWidget* central = new QWidget(this);
     QVBoxLayout* rootLayout = new QVBoxLayout(central);
+    rootLayout->setContentsMargins(12, 12, 12, 12);
+    rootLayout->setSpacing(12);
+
+    m_queryCommandBarContainer = new QFrame(central);
+    m_queryCommandBarContainer->setObjectName(QStringLiteral("queryCommandBarZone"));
+    ApplicationShell::styleQueryCommandBar(m_queryCommandBarContainer);
+    QVBoxLayout* queryCommandLayout = new QVBoxLayout(m_queryCommandBarContainer);
+    queryCommandLayout->setContentsMargins(14, 14, 14, 14);
+    queryCommandLayout->setSpacing(16);
+
+    QLabel* commandLabel = new QLabel(QStringLiteral("Command"), m_queryCommandBarContainer);
+    commandLabel->setObjectName(QStringLiteral("commandTitleLabel"));
+    QFont commandFont = commandLabel->font();
+    commandFont.setBold(true);
+    commandFont.setPointSize(commandFont.pointSize() + 1);
+    commandLabel->setFont(commandFont);
+    commandLabel->setStyleSheet(QStringLiteral("color: #1f2937;"));
+    queryCommandLayout->addWidget(commandLabel);
+
+    QFrame* structuralQuerySection = new QFrame(m_queryCommandBarContainer);
+    structuralQuerySection->setObjectName(QStringLiteral("structuralQuerySection"));
+    structuralQuerySection->setStyleSheet(QStringLiteral("QFrame#structuralQuerySection { border: none; border-radius: 0px; background: #eaf2ff; }"));
+    QVBoxLayout* structuralQueryLayout = new QVBoxLayout(structuralQuerySection);
+    structuralQueryLayout->setContentsMargins(12, 12, 12, 12);
+    structuralQueryLayout->setSpacing(8);
+    QLabel* structuralQueryLabel = new QLabel(QStringLiteral("STRUCTURAL QUERY"), structuralQuerySection);
+    structuralQueryLabel->setObjectName(QStringLiteral("structuralQueryTitleLabel"));
+    QFont structuralQueryFont = structuralQueryLabel->font();
+    structuralQueryFont.setBold(true);
+    structuralQueryFont.setPointSize(structuralQueryFont.pointSize() + 2);
+    structuralQueryLabel->setFont(structuralQueryFont);
+    structuralQueryLabel->setStyleSheet(QStringLiteral("color: #0f3d91; letter-spacing: 0.3px;"));
+    structuralQueryLayout->addWidget(structuralQueryLabel);
+    m_queryBarWidget = new QueryBarWidget(structuralQuerySection);
+    m_queryBarWidget->setObjectName(QStringLiteral("queryBarWidget"));
+    m_queryBarWidget->setMinimumWidth(640);
+    m_queryBarWidget->setStyleSheet(QStringLiteral("QLineEdit#queryInput { min-height: 42px; }"));
+    structuralQueryLayout->addWidget(m_queryBarWidget);
+    queryCommandLayout->addWidget(structuralQuerySection);
+
+    QFrame* filterSection = new QFrame(m_queryCommandBarContainer);
+    filterSection->setObjectName(QStringLiteral("fileFilterSection"));
+    filterSection->setStyleSheet(QStringLiteral("QFrame#fileFilterSection { border: none; border-radius: 0px; background: #f5f9ff; }"));
+    QVBoxLayout* filterLayout = new QVBoxLayout(filterSection);
+    filterLayout->setContentsMargins(12, 12, 12, 12);
+    filterLayout->setSpacing(8);
+    QLabel* filterTitleLabel = new QLabel(QStringLiteral("FILE SEARCH / FILTER"), filterSection);
+    filterTitleLabel->setObjectName(QStringLiteral("fileFilterTitleLabel"));
+    QFont filterTitleFont = filterTitleLabel->font();
+    filterTitleFont.setBold(true);
+    filterTitleFont.setPointSize(filterTitleFont.pointSize() + 1);
+    filterTitleLabel->setFont(filterTitleFont);
+    filterTitleLabel->setStyleSheet(QStringLiteral("color: #1f2937;"));
+    filterLayout->addWidget(filterTitleLabel);
 
     QHBoxLayout* row1 = new QHBoxLayout();
+    row1->setSpacing(8);
     m_rootEdit = new QLineEdit(central);
     m_rootEdit->setPlaceholderText(QStringLiteral("Select root folder..."));
     m_rootEdit->setText(QDir::homePath());
@@ -344,36 +418,90 @@ void MainWindow::setupUi()
     m_rescanButton = new QPushButton(QStringLiteral("Rescan"), central);
     m_cancelButton = new QPushButton(QStringLiteral("Cancel"), central);
     m_pinCurrentButton = new QPushButton(QStringLiteral("Pin Current"), central);
+    m_browseButton->setStyleSheet(QStringLiteral("padding: 4px 10px;"));
+    m_rescanButton->setStyleSheet(QStringLiteral("padding: 4px 10px;"));
+    m_cancelButton->setStyleSheet(QStringLiteral("padding: 4px 10px;"));
+    m_pinCurrentButton->setStyleSheet(QStringLiteral("padding: 4px 10px;"));
     row1->addWidget(new QLabel(QStringLiteral("Root:"), central));
     row1->addWidget(m_rootEdit, 1);
     row1->addWidget(m_browseButton);
     row1->addWidget(m_rescanButton);
     row1->addWidget(m_cancelButton);
     row1->addWidget(m_pinCurrentButton);
+    filterLayout->addLayout(row1);
 
     QHBoxLayout* row2 = new QHBoxLayout();
+    row2->setSpacing(8);
     m_showHiddenCheck = new QCheckBox(QStringLiteral("Show Hidden"), central);
     m_showSystemCheck = new QCheckBox(QStringLiteral("Show System"), central);
     m_extensionFilterEdit = new QLineEdit(central);
     m_extensionFilterEdit->setPlaceholderText(QStringLiteral(".png;.mp3;"));
     m_searchEdit = new QLineEdit(central);
     m_searchEdit->setPlaceholderText(QStringLiteral("Search substring..."));
-    m_queryBarWidget = new QueryBarWidget(central);
-    m_queryBarWidget->setObjectName(QStringLiteral("queryBarWidget"));
     row2->addWidget(m_showHiddenCheck);
     row2->addWidget(m_showSystemCheck);
     row2->addWidget(new QLabel(QStringLiteral("Ext Filter:"), central));
     row2->addWidget(m_extensionFilterEdit, 1);
+    row2->addStretch(1);
     row2->addWidget(new QLabel(QStringLiteral("Search:"), central));
     row2->addWidget(m_searchEdit, 1);
+    filterLayout->addLayout(row2);
+    queryCommandLayout->addWidget(filterSection);
 
-    QSplitter* splitter = new QSplitter(Qt::Horizontal, central);
-    m_sidebarTree = new QTreeWidget(splitter);
+    QSplitter* mainShellSplitter = new QSplitter(Qt::Horizontal, central);
+    mainShellSplitter->setObjectName(QStringLiteral("mainShellSplitter"));
+
+    m_navigationRailContainer = new QFrame(mainShellSplitter);
+    m_navigationRailContainer->setObjectName(QStringLiteral("leftNavigationZone"));
+    ApplicationShell::styleNavigationRail(m_navigationRailContainer);
+    QVBoxLayout* navLayout = new QVBoxLayout(m_navigationRailContainer);
+    navLayout->setContentsMargins(12, 12, 12, 12);
+    navLayout->setSpacing(10);
+    QLabel* navLabel = new QLabel(QStringLiteral("Navigation"), m_navigationRailContainer);
+    QFont navHeaderFont = navLabel->font();
+    navHeaderFont.setBold(true);
+    navHeaderFont.setPointSize(navHeaderFont.pointSize() + 1);
+    navLabel->setFont(navHeaderFont);
+    navLabel->setStyleSheet(QStringLiteral("color: #111827;"));
+    navLayout->addWidget(navLabel);
+    QLabel* favoritesLabel = new QLabel(QStringLiteral("Favorites"), m_navigationRailContainer);
+    favoritesLabel->setStyleSheet(QStringLiteral("color: #374151; font-weight: 600;"));
+    navLayout->addWidget(favoritesLabel);
+    QFrame* favoritesSeparator = new QFrame(m_navigationRailContainer);
+    favoritesSeparator->setFrameShape(QFrame::HLine);
+    favoritesSeparator->setStyleSheet(QStringLiteral("color: #cbd5e1;"));
+    navLayout->addWidget(favoritesSeparator);
+    QLabel* standardLocationsLabel = new QLabel(QStringLiteral("Standard Locations"), m_navigationRailContainer);
+    standardLocationsLabel->setStyleSheet(QStringLiteral("color: #374151; font-weight: 600;"));
+    navLayout->addWidget(standardLocationsLabel);
+    QFrame* standardSeparator = new QFrame(m_navigationRailContainer);
+    standardSeparator->setFrameShape(QFrame::HLine);
+    standardSeparator->setStyleSheet(QStringLiteral("color: #cbd5e1;"));
+    navLayout->addWidget(standardSeparator);
+    m_sidebarTree = new QTreeWidget(m_navigationRailContainer);
     m_sidebarTree->setHeaderHidden(true);
     m_sidebarTree->setContextMenuPolicy(Qt::CustomContextMenu);
     m_sidebarTree->setSelectionMode(QAbstractItemView::SingleSelection);
+    m_sidebarTree->setStyleSheet(QStringLiteral("QTreeView::item { min-height: 24px; padding: 2px 0; } QTreeView::item:selected { background: #dbeafe; color: #111827; }"));
+    navLayout->addWidget(m_sidebarTree, 1);
+    m_navigationRailContainer->setMinimumWidth(220);
+    m_navigationRailContainer->setMaximumWidth(320);
 
-    m_treeView = new QTreeView(splitter);
+    m_workspaceContainer = new QFrame(mainShellSplitter);
+    m_workspaceContainer->setObjectName(QStringLiteral("mainWorkspaceZone"));
+    ApplicationShell::styleMainWorkspace(m_workspaceContainer);
+    QVBoxLayout* workspaceLayout = new QVBoxLayout(m_workspaceContainer);
+    workspaceLayout->setContentsMargins(12, 12, 12, 12);
+    workspaceLayout->setSpacing(10);
+    QLabel* resultLabel = new QLabel(QStringLiteral("File / Result List"), m_workspaceContainer);
+    QFont resultLabelFont = resultLabel->font();
+    resultLabelFont.setBold(true);
+    resultLabelFont.setPointSize(resultLabelFont.pointSize() + 1);
+    resultLabel->setFont(resultLabelFont);
+    resultLabel->setStyleSheet(QStringLiteral("color: #111827;"));
+    workspaceLayout->addWidget(resultLabel);
+
+    m_treeView = new QTreeView(m_workspaceContainer);
     m_proxyModel.setSourceModel(&m_fileModel);
     m_proxyModel.setRecursiveFilteringEnabled(true);
     m_proxyModel.setFilterCaseSensitivity(Qt::CaseInsensitive);
@@ -381,18 +509,36 @@ void MainWindow::setupUi()
     m_treeView->setModel(&m_proxyModel);
     m_treeView->setContextMenuPolicy(Qt::CustomContextMenu);
     m_treeView->setSelectionMode(QAbstractItemView::ExtendedSelection);
+    m_treeView->setAllColumnsShowFocus(true);
     m_treeView->setSortingEnabled(true);
-    m_treeView->header()->setSectionResizeMode(QHeaderView::ResizeToContents);
+    m_treeView->setAlternatingRowColors(true);
+    m_treeView->setUniformRowHeights(true);
+    m_treeView->setTextElideMode(Qt::ElideRight);
+    m_treeView->setWordWrap(false);
+    m_treeView->setStyleSheet(QStringLiteral("QTreeView::item { min-height: 23px; } QTreeView::item:hover { background: #eef4ff; } QTreeView::item:selected { background: #bfdbfe; color: #0f172a; } QTreeView::item:selected:active { background: #93c5fd; color: #0b1f3a; } QTreeView:focus { border: 1px solid #3b82f6; border-radius: 4px; } QHeaderView::section { background: #dce4ef; color: #0f172a; font-weight: 700; border-right: 1px solid #cbd5e1; border-bottom: 1px solid #cbd5e1; padding: 3px 6px; }"));
+    m_treeView->header()->setMinimumSectionSize(56);
+    m_treeView->header()->setSectionResizeMode(0, QHeaderView::Interactive);
+    m_treeView->header()->setSectionResizeMode(1, QHeaderView::Fixed);
+    m_treeView->header()->setSectionResizeMode(2, QHeaderView::Fixed);
+    m_treeView->header()->setSectionResizeMode(3, QHeaderView::Fixed);
+    m_treeView->header()->setSectionResizeMode(4, QHeaderView::Stretch);
+    m_treeView->header()->setStretchLastSection(true);
+    m_treeView->setColumnWidth(0, 300);
+    m_treeView->setColumnWidth(1, 96);
+    m_treeView->setColumnWidth(2, 96);
+    m_treeView->setColumnWidth(3, 176);
+    workspaceLayout->addWidget(m_treeView, 1);
 
-    splitter->setStretchFactor(0, 1);
-    splitter->setStretchFactor(1, 4);
+    mainShellSplitter->addWidget(m_navigationRailContainer);
+    mainShellSplitter->addWidget(m_workspaceContainer);
+    WorkspaceLayout::configureNavigationSplitter(mainShellSplitter);
 
-    m_statusLabel = new QLabel(QStringLiteral("Idle"), central);
+    m_statusLabel = new QLabel(QString(), central);
+    m_statusLabel->setObjectName(QStringLiteral("statusSummaryLabel"));
+    m_statusLabel->setStyleSheet(QStringLiteral("QLabel#statusSummaryLabel { background: #eef2f7; border: 1px solid #cbd5e1; border-radius: 6px; color: #1f2937; font-weight: 600; padding: 6px 10px; }"));
 
-    rootLayout->addLayout(row1);
-    rootLayout->addLayout(row2);
-    rootLayout->addWidget(m_queryBarWidget);
-    rootLayout->addWidget(splitter, 1);
+    rootLayout->addWidget(m_queryCommandBarContainer);
+    rootLayout->addWidget(mainShellSplitter, 1);
     rootLayout->addWidget(m_statusLabel);
     setCentralWidget(central);
     setupStructuralPanel();
@@ -410,6 +556,8 @@ void MainWindow::setupUi()
     connect(m_upButton, &QPushButton::clicked, this, &MainWindow::onNavigateUp);
     connect(m_treeView, &QWidget::customContextMenuRequested, this, &MainWindow::onTreeContextMenu);
     connect(m_treeView, &QTreeView::activated, this, &MainWindow::onTreeActivated);
+    connect(m_treeView, &QTreeView::doubleClicked, this, &MainWindow::onTreeActivated);
+    connect(m_treeView->selectionModel(), &QItemSelectionModel::currentChanged, this, &MainWindow::onTreeCurrentChanged);
     connect(m_sidebarTree, &QTreeWidget::itemActivated, this, &MainWindow::onSidebarItemActivated);
     connect(m_sidebarTree, &QWidget::customContextMenuRequested, this, &MainWindow::onSidebarContextMenu);
 
@@ -419,9 +567,37 @@ void MainWindow::setupUi()
     auto* focusQueryShortcutF = new QShortcut(QKeySequence(QStringLiteral("Ctrl+F")), this);
     connect(focusQueryShortcutF, &QShortcut::activated, this, &MainWindow::onFocusQueryBar);
 
+    auto* activateTreeReturn = new QShortcut(QKeySequence(Qt::Key_Return), m_treeView);
+    activateTreeReturn->setContext(Qt::WidgetWithChildrenShortcut);
+    connect(activateTreeReturn, &QShortcut::activated, this, [this]() {
+        if (m_treeView && m_treeView->currentIndex().isValid()) {
+            onTreeActivated(m_treeView->currentIndex());
+        }
+    });
+
+    auto* activateTreeEnter = new QShortcut(QKeySequence(Qt::Key_Enter), m_treeView);
+    activateTreeEnter->setContext(Qt::WidgetWithChildrenShortcut);
+    connect(activateTreeEnter, &QShortcut::activated, this, [this]() {
+        if (m_treeView && m_treeView->currentIndex().isValid()) {
+            onTreeActivated(m_treeView->currentIndex());
+        }
+    });
+
+    auto* clearTreeSelectionShortcut = new QShortcut(QKeySequence(Qt::Key_Escape), m_treeView);
+    clearTreeSelectionShortcut->setContext(Qt::WidgetWithChildrenShortcut);
+    connect(clearTreeSelectionShortcut, &QShortcut::activated, this, [this]() {
+        if (!m_treeView || !m_treeView->selectionModel()) {
+            return;
+        }
+        m_treeView->selectionModel()->clearSelection();
+        m_treeView->setCurrentIndex(QModelIndex());
+        updateStatusDisplay(QStringLiteral("Ready"), m_scanInProgress ? 0 : 100, m_fileModel.itemCount(), QStringLiteral("Selection cleared"));
+    });
+
     loadFavorites();
     rebuildSidebar();
     updateNavigationButtons();
+    updateStatusDisplay(QStringLiteral("Ready"), 0, 0);
 
     appendRuntimeLog(QStringLiteral("MainWindow setup complete. sidebar_created=true favorites_config=%1 root=%2 startup_autorescan=false")
                          .arg(favoritesConfigPath(), m_rootEdit->text()));
@@ -429,16 +605,43 @@ void MainWindow::setupUi()
 
 void MainWindow::setupStructuralPanel()
 {
-    m_structuralPanelDock = new QDockWidget(QStringLiteral("Structural Panel"), this);
+    m_structuralPanelDock = new QDockWidget(QStringLiteral("Structural Workspace"), this);
     m_structuralPanelDock->setObjectName(QStringLiteral("structuralPanelDock"));
     m_structuralPanelDock->setAllowedAreas(Qt::BottomDockWidgetArea | Qt::RightDockWidgetArea);
+    m_structuralPanelDock->setFeatures(QDockWidget::DockWidgetMovable | QDockWidget::DockWidgetFloatable);
+    m_structuralPanelDock->setMinimumHeight(240);
 
     QWidget* panelRoot = new QWidget(m_structuralPanelDock);
     QVBoxLayout* panelLayout = new QVBoxLayout(panelRoot);
     panelLayout->setContentsMargins(8, 8, 8, 8);
+    panelLayout->setSpacing(8);
+
+    m_structuralWorkspaceHeaderLabel = new QLabel(QStringLiteral("Structural Workspace"), panelRoot);
+    QFont workspaceHeaderFont = m_structuralWorkspaceHeaderLabel->font();
+    workspaceHeaderFont.setBold(true);
+    workspaceHeaderFont.setPointSize(workspaceHeaderFont.pointSize() + 1);
+    m_structuralWorkspaceHeaderLabel->setFont(workspaceHeaderFont);
+    m_structuralWorkspaceHeaderLabel->setStyleSheet(QStringLiteral("color: #0f172a;"));
+    panelLayout->addWidget(m_structuralWorkspaceHeaderLabel);
+
+    QLabel* workspaceCapabilityLabel = new QLabel(
+        QStringLiteral("Structural query, references/usedby, graph, timeline, snapshots/history/diff"),
+        panelRoot);
+    workspaceCapabilityLabel->setStyleSheet(QStringLiteral("color: #475569; font-size: 11px;"));
+    panelLayout->addWidget(workspaceCapabilityLabel);
+
+    m_structuralEmptyStateLabel = new QLabel(
+        QStringLiteral("Run a structural query to view references, graph, timeline, and history."),
+        panelRoot);
+    m_structuralEmptyStateLabel->setWordWrap(true);
+    m_structuralEmptyStateLabel->setStyleSheet(
+        QStringLiteral("background: #f8fafc; border: 1px solid #cbd5e1; border-radius: 6px; color: #334155; padding: 8px;"));
+    m_structuralEmptyStateLabel->setVisible(true);
+    panelLayout->addWidget(m_structuralEmptyStateLabel);
 
     m_structuralContextLabel = new QLabel(QStringLiteral("Root: (none) | Target: (none)"), panelRoot);
     m_structuralContextLabel->setObjectName(QStringLiteral("structuralContextLabel"));
+    m_structuralContextLabel->setStyleSheet(QStringLiteral("color: #334155;"));
     panelLayout->addWidget(m_structuralContextLabel);
 
     QHBoxLayout* structuralNavigationLayout = new QHBoxLayout();
@@ -599,7 +802,12 @@ void MainWindow::setupStructuralPanel()
 
     m_structuralPanelDock->setWidget(panelRoot);
     addDockWidget(Qt::BottomDockWidgetArea, m_structuralPanelDock);
-    m_structuralPanelDock->hide();
+    m_structuralPanelDock->show();
+    QList<QDockWidget*> docks;
+    docks.push_back(m_structuralPanelDock);
+    QList<int> sizes;
+    sizes.push_back(300);
+    resizeDocks(docks, sizes, Qt::Vertical);
 
     connect(m_structuralHistoryLoadButton, &QPushButton::clicked, this, &MainWindow::onActionShowHistory);
     connect(m_structuralSnapshotLoadButton, &QPushButton::clicked, this, &MainWindow::onActionSnapshots);
@@ -814,6 +1022,15 @@ void MainWindow::configureObjectNames()
     if (m_statusLabel) {
         m_statusLabel->setObjectName(QStringLiteral("statusLabel"));
     }
+    if (m_queryCommandBarContainer) {
+        m_queryCommandBarContainer->setObjectName(QStringLiteral("queryCommandBarZone"));
+    }
+    if (m_navigationRailContainer) {
+        m_navigationRailContainer->setObjectName(QStringLiteral("leftNavigationZone"));
+    }
+    if (m_workspaceContainer) {
+        m_workspaceContainer->setObjectName(QStringLiteral("mainWorkspaceZone"));
+    }
 }
 
 void MainWindow::ensureUiActionTracePath()
@@ -1014,7 +1231,7 @@ void MainWindow::onRescan()
     if (m_scanInProgress) {
         m_rescanPending = true;
         appendRuntimeLog(QStringLiteral("rescan_requested_while_busy queued=true"));
-        m_statusLabel->setText(QStringLiteral("Canceling previous scan..."));
+        updateStatusDisplay(QStringLiteral("Reindexing"), 0, m_fileModel.itemCount(), QStringLiteral("Canceling previous scan"));
         return;
     }
 
@@ -1047,6 +1264,20 @@ void MainWindow::onRefreshPollTick()
                              .arg(event.totalUpdated)
                              .arg(event.errorText));
 
+        const bool isVisibleScope = !visibleRoot.isEmpty()
+            && (QString::compare(QDir::cleanPath(event.path), QDir::cleanPath(visibleRoot), Qt::CaseInsensitive) == 0
+                || QDir::cleanPath(visibleRoot).startsWith(QDir::cleanPath(event.path), Qt::CaseInsensitive));
+
+        if (isVisibleScope && event.state == RefreshState::Running && event.progressPercent >= 0) {
+            updateStatusDisplay(QStringLiteral("Indexing"), event.progressPercent, m_fileModel.itemCount(),
+                                QStringLiteral("seen=%1 queued_dirs=%2").arg(event.totalSeen).arg(event.pendingDirectories));
+        }
+
+        if (isVisibleScope && event.state == RefreshState::Completed) {
+            updateStatusDisplay(QStringLiteral("Ready"), 100, m_fileModel.itemCount(),
+                                QStringLiteral("seen=%1").arg(event.totalSeen));
+        }
+
         if (event.state == RefreshState::Completed
             && !visibleRoot.isEmpty()
             && (QString::compare(QDir::cleanPath(event.path), QDir::cleanPath(visibleRoot), Qt::CaseInsensitive) == 0
@@ -1071,7 +1302,7 @@ void MainWindow::onCancelScan()
     m_publishQueue.clear();
     m_publishTimer.stop();
     m_scanInProgress = false;
-    m_statusLabel->setText(QStringLiteral("Canceled"));
+    updateStatusDisplay(QStringLiteral("Canceled"), 0, m_fileModel.itemCount());
     appendRuntimeLog(QStringLiteral("cancel_requested"));
 }
 
@@ -1104,11 +1335,11 @@ void MainWindow::onScanProgress(quint64 scanId, const QString& stage, quint64 en
     }
 
     m_scanEnumeratedCount = enumerated;
-    m_statusLabel->setText(QStringLiteral("%1... enumerated=%2 matched=%3 shown=%4")
-                               .arg(stage)
-                               .arg(enumerated)
-                               .arg(matched)
-                               .arg(m_fileModel.itemCount()));
+    updateStatusDisplay(QStringLiteral("Indexing"), 0, m_fileModel.itemCount(),
+                        QStringLiteral("%1 enumerated=%2 matched=%3")
+                            .arg(stage)
+                            .arg(enumerated)
+                            .arg(matched));
 
     if ((enumerated % 500ULL) == 0ULL || stage == QStringLiteral("Publishing")) {
         appendRuntimeLog(QStringLiteral("scan_progress stage=%1 enumerated=%2 matched=%3 shown=%4")
@@ -1140,18 +1371,15 @@ void MainWindow::onScanFinished(quint64 scanId,
     }
 
     if (!error.isEmpty()) {
-        m_statusLabel->setText(QStringLiteral("Error: %1").arg(error));
+        updateStatusDisplay(QStringLiteral("Error"), 0, m_fileModel.itemCount(),
+                            mapStatusErrorText(error, m_rootEdit ? m_rootEdit->text() : QString()));
     } else if (canceled) {
-        m_statusLabel->setText(QStringLiteral("Canceled"));
+        updateStatusDisplay(QStringLiteral("Canceled"), 0, m_fileModel.itemCount());
     } else {
-        m_statusLabel->setText(QStringLiteral("Complete: %1 items (enumerated=%2, matched=%3)")
-                                   .arg(m_fileModel.itemCount())
-                                   .arg(enumerated)
-                                   .arg(matched));
+        updateStatusDisplay(QStringLiteral("Ready"), 100, m_fileModel.itemCount(),
+                            QStringLiteral("enumerated=%1 matched=%2").arg(enumerated).arg(matched));
         if (m_viewMode == FileViewMode::FullHierarchy) {
             m_treeView->expandAll();
-        } else if (m_viewMode == FileViewMode::Standard) {
-            m_treeView->collapseAll();
         }
     }
 
@@ -1163,6 +1391,26 @@ void MainWindow::onScanFinished(quint64 scanId,
                          .arg(m_fileModel.itemCount())
                          .arg(m_scanBatchCount)
                          .arg(m_scanEntryCount));
+
+    if (!m_pendingActivatedPath.trimmed().isEmpty()) {
+        if (!error.isEmpty() || canceled) {
+            appendRuntimeLog(QStringLiteral("tree_activated_deferred_cleared reason=scan_not_successful path=%1")
+                                 .arg(m_pendingActivatedPath));
+            m_pendingActivatedPath.clear();
+        } else {
+            const QString pendingPath = m_pendingActivatedPath;
+            m_pendingActivatedPath.clear();
+            appendRuntimeLog(QStringLiteral("tree_activated_deferred_replay path=%1").arg(pendingPath));
+            QTimer::singleShot(0, this, [this, pendingPath]() {
+                if (isNavigablePath(pendingPath)) {
+                    navigateToDirectory(pendingPath);
+                } else {
+                    appendRuntimeLog(QStringLiteral("tree_activated_deferred_replay_skipped reason=not_navigable path=%1")
+                                         .arg(pendingPath));
+                }
+            });
+        }
+    }
 
     if (m_rescanPending) {
         m_rescanPending = false;
@@ -1201,7 +1449,8 @@ void MainWindow::onQuerySubmitted(const QString& text)
     if (!structuralError.isEmpty()) {
         m_queryModeActive = false;
         m_activeQueryString.clear();
-        m_statusLabel->setText(QStringLiteral("Structural query error: %1").arg(structuralError));
+        updateStatusDisplay(QStringLiteral("Error"), 0, m_fileModel.itemCount(),
+                            QStringLiteral("Structural query: %1").arg(structuralError));
         appendRuntimeLog(QStringLiteral("querybar_structural_dispatch_failed query=%1 error=%2")
                              .arg(query)
                              .arg(structuralError));
@@ -1212,7 +1461,7 @@ void MainWindow::onQuerySubmitted(const QString& text)
     m_queryModeActive = true;
 
     appendRuntimeLog(QStringLiteral("querybar_submit query=%1").arg(query));
-    m_statusLabel->setText(QStringLiteral("Query: parsing and executing..."));
+    updateStatusDisplay(QStringLiteral("Running Query"), 0, m_fileModel.itemCount(), QStringLiteral("Parsing and executing"));
     onRescan();
 }
 
@@ -1224,7 +1473,7 @@ void MainWindow::onQueryCleared()
 
     appendRuntimeLog(QStringLiteral("querybar_cleared restore_normal_view=true"));
     if (wasActive) {
-        m_statusLabel->setText(QStringLiteral("Query cleared. Restoring directory view..."));
+        updateStatusDisplay(QStringLiteral("Ready"), 0, m_fileModel.itemCount(), QStringLiteral("Query cleared"));
         onRescan();
     }
 }
@@ -1234,6 +1483,25 @@ void MainWindow::onFocusQueryBar()
     if (m_queryBarWidget) {
         m_queryBarWidget->focusInput();
     }
+}
+
+void MainWindow::onTreeCurrentChanged(const QModelIndex& current, const QModelIndex& previous)
+{
+    Q_UNUSED(previous);
+    if (m_scanInProgress || !current.isValid()) {
+        return;
+    }
+
+    const QModelIndex sourceIndex = m_proxyModel.mapToSource(current);
+    const QString path = selectedPath(sourceIndex);
+    if (path.trimmed().isEmpty()) {
+        return;
+    }
+
+    const QFileInfo info(path);
+    const QString target = info.fileName().trimmed().isEmpty() ? path : info.fileName();
+    updateStatusDisplay(QStringLiteral("Ready"), 100, m_fileModel.itemCount(),
+                        QStringLiteral("Selected: %1").arg(QDir::toNativeSeparators(target)));
 }
 
 void MainWindow::onTreeContextMenu(const QPoint& pos)
@@ -1590,11 +1858,55 @@ void MainWindow::onTreeContextMenu(const QPoint& pos)
 
 void MainWindow::onTreeActivated(const QModelIndex& index)
 {
+    if (!index.isValid()) {
+        appendRuntimeLog(QStringLiteral("tree_activated_ignored reason=invalid_proxy_index"));
+        return;
+    }
+
     const QModelIndex sourceIndex = m_proxyModel.mapToSource(index);
+    if (!sourceIndex.isValid()) {
+        appendRuntimeLog(QStringLiteral("tree_activated_ignored reason=invalid_source_index"));
+        return;
+    }
+
+    if (sourceIndex.row() < 0) {
+        appendRuntimeLog(QStringLiteral("tree_activated_ignored reason=negative_source_row"));
+        return;
+    }
+
     const QString path = selectedPath(sourceIndex);
-    const QString type = m_fileModel.data(m_fileModel.index(sourceIndex.row(), 1, sourceIndex.parent()), Qt::DisplayRole).toString();
+    if (path.trimmed().isEmpty()) {
+        appendRuntimeLog(QStringLiteral("tree_activated_ignored reason=empty_path"));
+        return;
+    }
+
+    const QDateTime now = QDateTime::currentDateTimeUtc();
+    if (QString::compare(m_lastActivatedTreePath, path, Qt::CaseInsensitive) == 0
+        && m_lastActivatedTreeAt.isValid()
+        && m_lastActivatedTreeAt.msecsTo(now) <= 500) {
+        appendRuntimeLog(QStringLiteral("tree_activated_ignored reason=duplicate_fast_activation path=%1").arg(path));
+        return;
+    }
+    m_lastActivatedTreePath = path;
+    m_lastActivatedTreeAt = now;
+
+    if (m_scanInProgress) {
+        m_pendingActivatedPath = path;
+        appendRuntimeLog(QStringLiteral("tree_activated_deferred reason=scan_in_progress path=%1").arg(path));
+        return;
+    }
+
+    const QModelIndex typeIndex = m_fileModel.index(sourceIndex.row(), 1, sourceIndex.parent());
+    const QString type = typeIndex.isValid()
+        ? m_fileModel.data(typeIndex, Qt::DisplayRole).toString()
+        : QString();
     const bool modelSaysFolder = QString::compare(type, QStringLiteral("Folder"), Qt::CaseInsensitive) == 0;
-    const QFileInfo fileInfo(path);
+
+    if (m_treeActivationInFlight) {
+        appendRuntimeLog(QStringLiteral("tree_activated_ignored reason=activation_in_flight path=%1").arg(path));
+        return;
+    }
+    m_treeActivationInFlight = true;
 
     auto rememberPathForAutocomplete = [this](const QString& rawPath) {
         const QString normalized = QDir::fromNativeSeparators(QDir::cleanPath(rawPath));
@@ -1609,37 +1921,46 @@ void MainWindow::onTreeActivated(const QModelIndex& index)
         refreshQueryAutocompleteContext();
     };
 
-    if (PathUtils::isArchiveVirtualPath(path)) {
-        if (modelSaysFolder) {
-            appendRuntimeLog(QStringLiteral("tree_activated_archive_virtual_dir path=%1").arg(path));
-            navigateToDirectory(path);
+    QTimer::singleShot(0, this, [this, path, modelSaysFolder, rememberPathForAutocomplete]() {
+        const QFileInfo fileInfo(path);
+
+        if (PathUtils::isArchiveVirtualPath(path)) {
+            if (modelSaysFolder) {
+                appendRuntimeLog(QStringLiteral("tree_activated_archive_virtual_dir path=%1").arg(path));
+                navigateToDirectory(path);
+            }
+            rememberPathForAutocomplete(path);
+            m_treeActivationInFlight = false;
+            return;
         }
-        rememberPathForAutocomplete(path);
-        return;
-    }
 
-    if (PathUtils::isArchivePath(path)) {
-        appendRuntimeLog(QStringLiteral("tree_activated_archive_file path=%1").arg(path));
-        navigateToDirectory(path);
-        rememberPathForAutocomplete(path);
-        return;
-    }
+        if (PathUtils::isArchivePath(path)) {
+            appendRuntimeLog(QStringLiteral("tree_activated_archive_file path=%1").arg(path));
+            navigateToDirectory(path);
+            rememberPathForAutocomplete(path);
+            m_treeActivationInFlight = false;
+            return;
+        }
 
-    if (isInternalNavigableDirectory(fileInfo)) {
-        appendRuntimeLog(QStringLiteral("tree_activated_internal_dir path=%1").arg(path));
-        navigateToDirectory(path);
-        rememberPathForAutocomplete(path);
-        return;
-    }
+        if (isInternalNavigableDirectory(fileInfo)) {
+            appendRuntimeLog(QStringLiteral("tree_activated_internal_dir path=%1").arg(path));
+            navigateToDirectory(path);
+            rememberPathForAutocomplete(path);
+            m_treeActivationInFlight = false;
+            return;
+        }
 
-    if (fileInfo.exists() && fileInfo.isFile()) {
-        appendRuntimeLog(QStringLiteral("tree_activated_external_file path=%1 suffix=%2 is_link=%3")
-                             .arg(path)
-                             .arg(fileInfo.suffix())
-                             .arg(fileInfo.isSymLink() ? QStringLiteral("true") : QStringLiteral("false")));
-        rememberPathForAutocomplete(path);
-        QDesktopServices::openUrl(QUrl::fromLocalFile(path));
-    }
+        if (fileInfo.exists() && fileInfo.isFile()) {
+            appendRuntimeLog(QStringLiteral("tree_activated_external_file path=%1 suffix=%2 is_link=%3")
+                                 .arg(path)
+                                 .arg(fileInfo.suffix())
+                                 .arg(fileInfo.isSymLink() ? QStringLiteral("true") : QStringLiteral("false")));
+            rememberPathForAutocomplete(path);
+            QDesktopServices::openUrl(QUrl::fromLocalFile(path));
+        }
+
+        m_treeActivationInFlight = false;
+    });
 }
 
 void MainWindow::onSidebarItemActivated(QTreeWidgetItem* item, int column)
@@ -1655,8 +1976,27 @@ void MainWindow::onSidebarItemActivated(QTreeWidgetItem* item, int column)
         return;
     }
 
+    const QDateTime now = QDateTime::currentDateTimeUtc();
+    if (QString::compare(m_lastActivatedTreePath, path, Qt::CaseInsensitive) == 0
+        && m_lastActivatedTreeAt.isValid()
+        && m_lastActivatedTreeAt.msecsTo(now) <= 500) {
+        appendRuntimeLog(QStringLiteral("sidebar_activated_ignored reason=duplicate_fast_activation path=%1").arg(path));
+        return;
+    }
+    m_lastActivatedTreePath = path;
+    m_lastActivatedTreeAt = now;
+
+    if (m_scanInProgress) {
+        m_pendingActivatedPath = path;
+        appendRuntimeLog(QStringLiteral("sidebar_activated_deferred reason=scan_in_progress path=%1").arg(path));
+        return;
+    }
+
     appendRuntimeLog(QStringLiteral("sidebar_activated path=%1").arg(path));
-    navigateToDirectory(path);
+    // Defer navigation so the activation signal stack can unwind before model work begins.
+    QTimer::singleShot(0, this, [this, path]() {
+        navigateToDirectory(path);
+    });
 }
 
 void MainWindow::onSidebarContextMenu(const QPoint& pos)
@@ -3110,21 +3450,76 @@ void MainWindow::refreshQueryAutocompleteContext()
 
     StructuralAutocompleteContext context;
     context.currentTargetPath = m_structuralTargetPath;
+    context.currentRootPath = currentRootPath();
 
     QStringList knownPaths = m_recentStructuralPaths;
+    QStringList knownDirectories;
+    QStringList knownFiles;
     if (!m_structuralTargetPath.trimmed().isEmpty()) {
         knownPaths.push_back(QDir::fromNativeSeparators(QDir::cleanPath(m_structuralTargetPath)));
     }
 
+    const QString root = currentRootPath();
+    if (!root.trimmed().isEmpty() && QFileInfo::exists(root) && QFileInfo(root).isDir()) {
+        QDir rootDir(root);
+        const QFileInfoList rootChildren = rootDir.entryInfoList(QDir::Dirs | QDir::NoDotAndDotDot,
+                                                                 QDir::Name | QDir::IgnoreCase);
+        for (const QFileInfo& child : rootChildren) {
+            const QString normalized = QDir::fromNativeSeparators(QDir::cleanPath(child.absoluteFilePath()));
+            if (!normalized.isEmpty()) {
+                knownDirectories.push_back(normalized);
+                knownPaths.push_back(normalized);
+            }
+        }
+    }
+
+    std::function<void(const QModelIndex&)> collectVisiblePaths;
+    collectVisiblePaths = [&](const QModelIndex& parent) {
+        const int rows = m_fileModel.rowCount(parent);
+        for (int row = 0; row < rows; ++row) {
+            const QModelIndex base = m_fileModel.index(row, 0, parent);
+            const QModelIndex pathIndex = m_fileModel.index(row, 4, parent);
+            const QModelIndex typeIndex = m_fileModel.index(row, 1, parent);
+            const QString path = QDir::fromNativeSeparators(QDir::cleanPath(m_fileModel.data(pathIndex, Qt::DisplayRole).toString()));
+            const QString type = m_fileModel.data(typeIndex, Qt::DisplayRole).toString();
+            if (!path.trimmed().isEmpty()) {
+                knownPaths.push_back(path);
+                if (QString::compare(type, QStringLiteral("Folder"), Qt::CaseInsensitive) == 0) {
+                    knownDirectories.push_back(path);
+                } else {
+                    knownFiles.push_back(path);
+                }
+            }
+            if (base.isValid()) {
+                collectVisiblePaths(base);
+            }
+        }
+    };
+    collectVisiblePaths(QModelIndex());
+
     for (const StructuralResultRow& row : m_structuralCanonicalRows) {
         if (!row.primaryPath.trimmed().isEmpty()) {
-            knownPaths.push_back(QDir::fromNativeSeparators(QDir::cleanPath(row.primaryPath)));
+            const QString path = QDir::fromNativeSeparators(QDir::cleanPath(row.primaryPath));
+            knownPaths.push_back(path);
+            if (QFileInfo(path).isDir()) {
+                knownDirectories.push_back(path);
+            } else {
+                knownFiles.push_back(path);
+            }
         }
         if (!row.secondaryPath.trimmed().isEmpty()) {
-            knownPaths.push_back(QDir::fromNativeSeparators(QDir::cleanPath(row.secondaryPath)));
+            const QString path = QDir::fromNativeSeparators(QDir::cleanPath(row.secondaryPath));
+            knownPaths.push_back(path);
+            if (QFileInfo(path).isDir()) {
+                knownDirectories.push_back(path);
+            } else {
+                knownFiles.push_back(path);
+            }
         }
         if (!row.sourceFile.trimmed().isEmpty()) {
-            knownPaths.push_back(QDir::fromNativeSeparators(QDir::cleanPath(row.sourceFile)));
+            const QString path = QDir::fromNativeSeparators(QDir::cleanPath(row.sourceFile));
+            knownPaths.push_back(path);
+            knownFiles.push_back(path);
         }
         if (row.hasSnapshotId && row.snapshotId > 0) {
             m_recentSnapshotTokens.push_back(QString::number(row.snapshotId));
@@ -3142,8 +3537,16 @@ void MainWindow::refreshQueryAutocompleteContext()
     }
 
     knownPaths.removeDuplicates();
+    knownDirectories.removeDuplicates();
+    knownFiles.removeDuplicates();
     while (knownPaths.size() > 300) {
         knownPaths.removeFirst();
+    }
+    while (knownDirectories.size() > 300) {
+        knownDirectories.removeFirst();
+    }
+    while (knownFiles.size() > 300) {
+        knownFiles.removeFirst();
     }
 
     m_recentSnapshotTokens.removeDuplicates();
@@ -3152,6 +3555,8 @@ void MainWindow::refreshQueryAutocompleteContext()
     }
 
     context.knownPaths = knownPaths;
+    context.knownDirectories = knownDirectories;
+    context.knownFiles = knownFiles;
     context.snapshotTokens = m_recentSnapshotTokens;
     m_queryBarWidget->setAutocompleteContext(context);
 }
@@ -3259,6 +3664,15 @@ void MainWindow::applyStructuralFiltersToCurrentRows(const QString& statusPrefix
 
     updateStructuralGraphFromCanonicalRows();
     updateStructuralTimelineFromCanonicalRows();
+
+    if (m_structuralEmptyStateLabel) {
+        const bool hasRows = !m_structuralCanonicalRows.isEmpty();
+        m_structuralEmptyStateLabel->setVisible(!hasRows);
+        if (!hasRows) {
+            m_structuralEmptyStateLabel->setText(
+                QStringLiteral("Run a structural query to view references, graph, timeline, and history."));
+        }
+    }
 }
 
 void MainWindow::clearStructuralFilters(bool applyNow)
@@ -3454,6 +3868,16 @@ void MainWindow::setStructuralCanonicalRows(const QVector<StructuralResultRow>& 
     updateStructuralGraphFromCanonicalRows();
     updateStructuralTimelineFromCanonicalRows();
     refreshQueryAutocompleteContext();
+
+    if (m_structuralEmptyStateLabel) {
+        if (rows.isEmpty()) {
+            m_structuralEmptyStateLabel->setText(QStringLiteral("No structural rows match the current structural query."));
+            m_structuralEmptyStateLabel->setVisible(true);
+        } else {
+            m_structuralEmptyStateLabel->setVisible(false);
+        }
+    }
+
     applyStructuralFiltersToCurrentRows(statusPrefix);
 }
 
@@ -4498,6 +4922,54 @@ QString MainWindow::structuralSessionSummaryForTesting() const
     return QString::fromUtf8(QJsonDocument(state.toJson()).toJson(QJsonDocument::Compact));
 }
 
+bool MainWindow::isLeftNavigationReadyForTesting() const
+{
+    return m_sidebarTree
+    && m_sidebarTree->topLevelItemCount() >= 1
+        && m_navigationRailContainer;
+}
+
+bool MainWindow::isQueryCommandBarReadyForTesting() const
+{
+    return m_queryCommandBarContainer
+        && m_rootEdit
+        && m_searchEdit
+        && m_queryBarWidget;
+}
+
+bool MainWindow::isResultListReadyForTesting() const
+{
+    return m_workspaceContainer
+        && m_treeView
+        && m_treeView->model() != nullptr;
+}
+
+bool MainWindow::isStructuralPanelReadyForTesting() const
+{
+    return m_structuralPanelDock
+        && m_structuralPanelDock->isVisible()
+        && m_structuralTabWidget
+        && m_structuralTabWidget->count() >= 4;
+}
+
+int MainWindow::structuralTabCountForTesting() const
+{
+    return m_structuralTabWidget ? m_structuralTabWidget->count() : 0;
+}
+
+bool MainWindow::switchStructuralTabForTesting(int index, QString* activeTabLabel)
+{
+    if (!m_structuralTabWidget || index < 0 || index >= m_structuralTabWidget->count()) {
+        return false;
+    }
+
+    m_structuralTabWidget->setCurrentIndex(index);
+    if (activeTabLabel) {
+        *activeTabLabel = m_structuralTabWidget->tabText(m_structuralTabWidget->currentIndex());
+    }
+    return true;
+}
+
 void MainWindow::onActionCopyPath()
 {
     const QStringList paths = actionPathsForCurrentContext();
@@ -4618,6 +5090,9 @@ void MainWindow::rebuildSidebar()
 
     m_favoritesRootItem = new QTreeWidgetItem(QStringList() << QStringLiteral("Favorites"));
     m_favoritesRootItem->setData(0, Qt::UserRole, QString());
+    QFont sectionFont = m_sidebarTree->font();
+    sectionFont.setBold(true);
+    m_favoritesRootItem->setFont(0, sectionFont);
     m_sidebarTree->addTopLevelItem(m_favoritesRootItem);
 
     for (const QString& favoritePath : m_favorites) {
@@ -4629,6 +5104,7 @@ void MainWindow::rebuildSidebar()
 
     m_standardRootItem = new QTreeWidgetItem(QStringList() << QStringLiteral("Standard Locations"));
     m_standardRootItem->setData(0, Qt::UserRole, QString());
+    m_standardRootItem->setFont(0, sectionFont);
     m_sidebarTree->addTopLevelItem(m_standardRootItem);
 
     const QString desktop = normalizedDirectoryPath(QStandardPaths::writableLocation(QStandardPaths::DesktopLocation));
@@ -5393,6 +5869,25 @@ QString MainWindow::selectedPath(const QModelIndex& index) const
     return m_fileModel.data(pathIndex, Qt::DisplayRole).toString();
 }
 
+QModelIndex MainWindow::findSourceIndexByPath(const QString& absolutePath, const QModelIndex& parent) const
+{
+    const QString needle = QDir::cleanPath(absolutePath);
+    const int rows = m_fileModel.rowCount(parent);
+    for (int row = 0; row < rows; ++row) {
+        const QModelIndex base = m_fileModel.index(row, 0, parent);
+        const QModelIndex pathIndex = m_fileModel.index(row, 4, parent);
+        const QString candidate = QDir::cleanPath(m_fileModel.data(pathIndex, Qt::DisplayRole).toString());
+        if (QString::compare(candidate, needle, Qt::CaseInsensitive) == 0) {
+            return base;
+        }
+        const QModelIndex nested = findSourceIndexByPath(needle, base);
+        if (nested.isValid()) {
+            return nested;
+        }
+    }
+    return QModelIndex();
+}
+
 void MainWindow::appendRuntimeLog(const QString& message) const
 {
     auto locateProofRoot = []() -> QDir {
@@ -5445,8 +5940,57 @@ void MainWindow::appendRuntimeLog(const QString& message) const
     stream << QDateTime::currentDateTime().toString(Qt::ISODate) << " | " << message << "\n";
 }
 
+void MainWindow::updateStatusDisplay(const QString& status,
+                                     int indexPercent,
+                                     quint64 results,
+                                     const QString& detail)
+{
+    if (!m_statusLabel) {
+        return;
+    }
+
+    Q_UNUSED(status);
+
+    const int clamped = qBound(0, indexPercent, 100);
+    const quint64 showing = m_fileModel.itemCount();
+    const quint64 queued = static_cast<quint64>(m_publishQueue.size());
+    QString text = QStringLiteral("Index: %1% | Results: %2 | Showing: %3 | Queue: %4")
+                       .arg(clamped)
+                       .arg(results)
+                       .arg(showing)
+                       .arg(queued);
+    if (!detail.trimmed().isEmpty()) {
+        text += QStringLiteral(" | Note: %1").arg(detail.trimmed());
+    }
+    m_statusLabel->setText(text);
+}
+
+QString MainWindow::mapStatusErrorText(const QString& errorText, const QString& rootPath) const
+{
+    const QString token = errorText.trimmed();
+    if (token.compare(QStringLiteral("not_found"), Qt::CaseInsensitive) == 0) {
+        const QString root = rootPath.trimmed();
+        if (!root.isEmpty()) {
+            return QStringLiteral("Root path not found: %1").arg(QDir::toNativeSeparators(root));
+        }
+        return QStringLiteral("Requested path was not found");
+    }
+
+    if (token.compare(QStringLiteral("db_not_ready"), Qt::CaseInsensitive) == 0) {
+        return QStringLiteral("Database is not ready. Try Rescan.");
+    }
+
+    return token;
+}
+
 void MainWindow::startScanNow()
 {
+    m_pendingRestoreSelectionPath.clear();
+    if (m_treeView && m_treeView->currentIndex().isValid()) {
+        const QModelIndex sourceIndex = m_proxyModel.mapToSource(m_treeView->currentIndex());
+        m_pendingRestoreSelectionPath = selectedPath(sourceIndex);
+    }
+
     m_fileModel.clear();
     m_publishQueue.clear();
     m_publishTimer.stop();
@@ -5456,7 +6000,7 @@ void MainWindow::startScanNow()
     const QString search = m_searchEdit->text().trimmed();
 
     if (!archiveRoot && !ensureDirectoryModelReady()) {
-        m_statusLabel->setText(QStringLiteral("Error: db_not_ready"));
+        updateStatusDisplay(QStringLiteral("Error"), 0, 0, QStringLiteral("Database not ready"));
         appendRuntimeLog(QStringLiteral("ui_query_error db_not_ready path=%1").arg(m_uiDbPath));
         return;
     }
@@ -5466,7 +6010,7 @@ void MainWindow::startScanNow()
     m_scanEntryCount = 0;
     m_scanBatchCount = 0;
     m_scanEnumeratedCount = 0;
-    m_statusLabel->setText(QStringLiteral("Enumerating..."));
+    updateStatusDisplay(QStringLiteral("Indexing"), 0, 0, QStringLiteral("Enumerating"));
     m_treeView->setSortingEnabled(false);
 
     QueryResult result;
@@ -5482,7 +6026,7 @@ void MainWindow::startScanNow()
 
         if (!m_queryController) {
             m_scanInProgress = false;
-            m_statusLabel->setText(QStringLiteral("Error: query_controller_not_ready"));
+            updateStatusDisplay(QStringLiteral("Error"), 0, 0, QStringLiteral("Query controller not ready"));
             appendRuntimeLog(QStringLiteral("ui_querybar_failed error=query_controller_not_ready"));
             return;
         }
@@ -5504,7 +6048,8 @@ void MainWindow::startScanNow()
         if (!queryExec.parseOk) {
             m_scanInProgress = false;
             m_treeView->setSortingEnabled(true);
-            m_statusLabel->setText(QStringLiteral("Query parse error: %1").arg(queryExec.parseError));
+            updateStatusDisplay(QStringLiteral("Error"), 0, 0,
+                                QStringLiteral("Query parse error: %1").arg(queryExec.parseError));
             appendRuntimeLog(QStringLiteral("ui_querybar_failed phase=parse error=%1").arg(queryExec.parseError));
             return;
         }
@@ -5545,7 +6090,7 @@ void MainWindow::startScanNow()
     if (!result.ok) {
         m_scanInProgress = false;
         m_treeView->setSortingEnabled(true);
-        m_statusLabel->setText(QStringLiteral("Error: %1").arg(result.errorText));
+        updateStatusDisplay(QStringLiteral("Error"), 0, 0, mapStatusErrorText(result.errorText, root));
         appendRuntimeLog(QStringLiteral("ui_query_failed error=%1 query_mode=%2")
                              .arg(result.errorText)
                              .arg(queryActive ? QStringLiteral("true") : QStringLiteral("false")));
@@ -5566,17 +6111,14 @@ void MainWindow::startScanNow()
         m_treeView->setSortingEnabled(true);
     }
 
-    m_statusLabel->setText(queryActive
-                               ? QStringLiteral("Query complete: %1 items").arg(rows.size())
-                               : QStringLiteral("Complete: %1 items").arg(rows.size()));
+    updateStatusDisplay(QStringLiteral("Ready"), 100, static_cast<quint64>(rows.size()),
+                        queryActive ? QStringLiteral("Query complete") : QStringLiteral("Scan complete"));
     appendRuntimeLog(QStringLiteral("ui_query_complete rows=%1 query_mode=%2")
                          .arg(rows.size())
                          .arg(queryActive ? QStringLiteral("true") : QStringLiteral("false")));
 
     if (m_viewModeController.mode() == ViewModeController::UiViewMode::Hierarchy) {
         m_treeView->expandAll();
-    } else if (m_viewModeController.mode() == ViewModeController::UiViewMode::Standard) {
-        m_treeView->collapseAll();
     }
 }
 
@@ -5648,9 +6190,26 @@ void MainWindow::onPublishTick()
     m_publishQueue.erase(m_publishQueue.begin(), m_publishQueue.begin() + chunkSize);
 
     m_fileModel.appendBatch(chunk);
-    m_statusLabel->setText(QStringLiteral("Publishing... shown=%1 queued=%2")
-                               .arg(m_fileModel.itemCount())
-                               .arg(m_publishQueue.size()));
+
+    if (!m_pendingRestoreSelectionPath.trimmed().isEmpty()) {
+        const QModelIndex sourceMatch = findSourceIndexByPath(m_pendingRestoreSelectionPath);
+        if (sourceMatch.isValid()) {
+            const QModelIndex proxyMatch = m_proxyModel.mapFromSource(sourceMatch);
+            if (proxyMatch.isValid() && m_treeView && m_treeView->selectionModel()) {
+                m_treeView->selectionModel()->setCurrentIndex(
+                    proxyMatch,
+                    QItemSelectionModel::ClearAndSelect | QItemSelectionModel::Rows);
+                m_treeView->scrollTo(proxyMatch, QAbstractItemView::PositionAtCenter);
+                m_pendingRestoreSelectionPath.clear();
+            }
+        }
+    }
+
+    const quint64 shown = m_fileModel.itemCount();
+    const quint64 queued = static_cast<quint64>(m_publishQueue.size());
+    const quint64 total = shown + queued;
+    const int percent = total > 0 ? qBound(0, static_cast<int>((shown * 100ULL) / total), 100) : 100;
+    updateStatusDisplay(QStringLiteral("Indexing"), percent, shown);
     if (m_viewMode == FileViewMode::FullHierarchy && (m_scanBatchCount % 10ULL) == 0ULL) {
         m_treeView->expandAll();
     }
@@ -5712,6 +6271,13 @@ void MainWindow::navigateToDirectory(const QString& path, bool pushHistory)
         normalizedPath = fileInfo.absoluteFilePath();
     }
     m_rootEdit->setText(normalizedPath);
+
+    // Navigation should default to plain directory listing; explicit query execution can be re-triggered by the user.
+    m_queryModeActive = false;
+    m_activeQueryString.clear();
+    if (m_queryBarWidget) {
+        m_queryBarWidget->setQueryText(QString());
+    }
 
     if (pushHistory) {
         while (m_navigationHistory.size() > (m_navigationIndex + 1)) {

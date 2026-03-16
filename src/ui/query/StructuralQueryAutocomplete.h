@@ -5,8 +5,11 @@
 struct StructuralAutocompleteContext
 {
     QStringList knownPaths;
+    QStringList knownDirectories;
+    QStringList knownFiles;
     QStringList snapshotTokens;
     QString currentTargetPath;
+    QString currentRootPath;
 };
 
 namespace StructuralQueryAutocomplete

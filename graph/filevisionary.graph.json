@@ -13,6 +13,8 @@
         "src/ui/TreeSnapshotDialog.cpp",
         "src/ui/TreeSnapshotPreviewDialog.cpp",
         "src/ui/ArchiveExplorer.cpp",
+        "src/ui/layout/ApplicationShell.cpp",
+        "src/ui/layout/WorkspaceLayout.cpp",
         "src/core/FileScanner.cpp",
         "src/core/FileModel.cpp",
         "src/core/TreeSnapshotService.cpp",

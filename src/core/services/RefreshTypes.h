@@ -33,6 +33,8 @@ struct RefreshEvent
     qint64 totalInserted = 0;
     qint64 totalUpdated = 0;
     qint64 totalRemoved = 0;
+    qint64 pendingDirectories = 0;
+    int progressPercent = -1;
 
     bool success = false;
 };

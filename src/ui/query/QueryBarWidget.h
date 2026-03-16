@@ -7,6 +7,7 @@
 class QLineEdit;
 class QPushButton;
 class QCompleter;
+class QLabel;
 class StructuralSuggestionModel;
 
 class QueryBarWidget : public QWidget
@@ -38,10 +39,12 @@ private slots:
     void onReturnPressed();
 
 private:
+    QString replaceCurrentToken(const QString& selectedSuggestion) const;
     QStringList computeSuggestions(const QString& text) const;
     void updateSuggestions(const QString& text, bool showPopup);
 
     QLineEdit* m_queryInput = nullptr;
+    QLabel* m_hintLabel = nullptr;
     QPushButton* m_clearButton = nullptr;
     QPushButton* m_executeButton = nullptr;
     QCompleter* m_completer = nullptr;

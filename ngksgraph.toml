@@ -14,7 +14,7 @@ lib_dirs = ["C:/Qt/6.10.2/msvc2022_64/lib"]
 warnings = "default"
 
 [profiles.debug]
-cflags = ["/Od", "/Zi"]
+cflags = ["/Od", "/Zi", "/FS"]
 defines = ["DEBUG"]
 ldflags = ["/SUBSYSTEM:WINDOWS", "/ENTRY:mainCRTStartup"]
 

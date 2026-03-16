@@ -1,8 +1,77 @@
 #include "FileModel.h"
 
+#include <QApplication>
+#include <QBrush>
+#include <QColor>
 #include <QDir>
 #include <QFileInfo>
-#include <QMimeDatabase>
+#include <QFont>
+#include <QStyle>
+
+namespace {
+
+QString normalizedTypeToken(const QString& rawType)
+{
+    return rawType.trimmed().toLower();
+}
+
+QString displayTypeLabel(const QString& rawType, bool isDir)
+{
+    if (isDir) {
+        return QStringLiteral("Folder");
+    }
+
+    const QString token = normalizedTypeToken(rawType);
+    if (token == QStringLiteral("py")) {
+        return QStringLiteral("Python");
+    }
+    if (token == QStringLiteral("json")) {
+        return QStringLiteral("JSON");
+    }
+    if (token == QStringLiteral("txt")) {
+        return QStringLiteral("Text");
+    }
+    if (token == QStringLiteral("csv")) {
+        return QStringLiteral("CSV");
+    }
+    if (token == QStringLiteral("pdf")) {
+        return QStringLiteral("PDF");
+    }
+    if (token == QStringLiteral("zip")) {
+        return QStringLiteral("ZIP");
+    }
+    if (token == QStringLiteral("pptx") || token == QStringLiteral("pptm")) {
+        return QStringLiteral("PowerPoint");
+    }
+    if (token == QStringLiteral("file") || token.isEmpty()) {
+        return QStringLiteral("File");
+    }
+    return token.toUpper();
+}
+
+QColor typeTintColor(const QString& rawType, bool isDir)
+{
+    if (isDir) {
+        return QColor(QStringLiteral("#1f4b7a"));
+    }
+
+    const QString token = normalizedTypeToken(rawType);
+    if (token == QStringLiteral("py")) {
+        return QColor(QStringLiteral("#2f5e3e"));
+    }
+    if (token == QStringLiteral("json") || token == QStringLiteral("csv") || token == QStringLiteral("txt")) {
+        return QColor(QStringLiteral("#475569"));
+    }
+    if (token == QStringLiteral("pdf") || token == QStringLiteral("zip")) {
+        return QColor(QStringLiteral("#6b3f3f"));
+    }
+    if (token == QStringLiteral("pptx") || token == QStringLiteral("pptm")) {
+        return QColor(QStringLiteral("#5b4a3f"));
+    }
+    return QColor(QStringLiteral("#334155"));
+}
+
+}
 
 FileModel::FileModel(QObject* parent)
     : QAbstractItemModel(parent)
@@ -43,7 +112,14 @@ QModelIndex FileModel::parent(const QModelIndex& child) const
     }
 
     Node* grandParent = parentNode->parent;
-    const int row = grandParent ? grandParent->children.indexOf(parentNode) : 0;
+    if (!grandParent) {
+        return QModelIndex();
+    }
+
+    const int row = grandParent->children.indexOf(parentNode);
+    if (row < 0) {
+        return QModelIndex();
+    }
     return createIndex(row, 0, parentNode);
 }
 
@@ -71,13 +147,31 @@ QVariant FileModel::data(const QModelIndex& idx, int role) const
     if (role == Qt::DisplayRole) {
         switch (idx.column()) {
         case 0: return node->name;
-        case 1: return node->type;
+        case 1: return displayTypeLabel(node->type, node->isDir);
         case 2: return node->isDir ? QString() : QString::number(node->size);
         case 3: return node->modified.toString(Qt::ISODate);
         case 4: return node->fullPath;
         default: return QVariant();
         }
     }
+
+    if (role == Qt::DecorationRole && idx.column() == 0) {
+        if (node->isDir) {
+            return QApplication::style()->standardIcon(QStyle::SP_DirIcon);
+        }
+        return QApplication::style()->standardIcon(QStyle::SP_FileIcon);
+    }
+
+    if (role == Qt::FontRole && (idx.column() == 0 || idx.column() == 1) && node->isDir) {
+        QFont font;
+        font.setWeight(QFont::DemiBold);
+        return font;
+    }
+
+    if (role == Qt::ForegroundRole && (idx.column() == 0 || idx.column() == 1)) {
+        return QBrush(typeTintColor(node->type, node->isDir));
+    }
+
     return QVariant();
 }
 
@@ -157,7 +251,12 @@ FileModel::Node* FileModel::makeNode(const FileEntry& entry)
     node->size = entry.size;
     node->modified = entry.modified;
     node->fullPath = QDir::cleanPath(entry.absolutePath);
-    node->type = entry.isDir ? QStringLiteral("Folder") : QMimeDatabase().mimeTypeForFile(info).comment();
+    if (entry.isDir) {
+        node->type = QStringLiteral("Folder");
+    } else {
+        const QString suffix = info.suffix().trimmed();
+        node->type = suffix.isEmpty() ? QStringLiteral("File") : suffix.toLower();
+    }
     node->parent = m_root;
     return node;
 }

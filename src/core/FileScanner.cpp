@@ -6,6 +6,12 @@
 
 #ifdef Q_OS_WIN
 #include <windows.h>
+
+static DWORD fileAttributesForPath(const QString& path)
+{
+    const QString nativePath = QDir::toNativeSeparators(path);
+    return GetFileAttributesW(reinterpret_cast<LPCWSTR>(nativePath.utf16()));
+}
 #endif
 
 FileScanner::FileScanner(QObject* parent)
@@ -48,8 +54,7 @@ void FileScanner::startScan(quint64 scanId,
         }
 #ifdef Q_OS_WIN
         if (!showSystem) {
-            const std::wstring widePath = fileInfo.absoluteFilePath().toStdWString();
-            const DWORD attrs = GetFileAttributesW(widePath.c_str());
+            const DWORD attrs = fileAttributesForPath(fileInfo.absoluteFilePath());
             if (attrs != INVALID_FILE_ATTRIBUTES && (attrs & FILE_ATTRIBUTE_SYSTEM)) {
                 return false;
             }
@@ -163,8 +168,7 @@ bool FileScanner::matchesFilters(const QFileInfo& fileInfo,
     }
 #ifdef Q_OS_WIN
     if (!showSystem) {
-        const std::wstring widePath = fileInfo.absoluteFilePath().toStdWString();
-        const DWORD attrs = GetFileAttributesW(widePath.c_str());
+        const DWORD attrs = fileAttributesForPath(fileInfo.absoluteFilePath());
         if (attrs != INVALID_FILE_ATTRIBUTES && (attrs & FILE_ATTRIBUTE_SYSTEM)) {
             return false;
         }

@@ -8,6 +8,9 @@ namespace {
 QStringList structuralPrefixes()
 {
     return {
+        QStringLiteral("ext:"),
+        QStringLiteral("under:"),
+        QStringLiteral("name:"),
         QStringLiteral("history:"),
         QStringLiteral("snapshots:"),
         QStringLiteral("diff:"),
@@ -41,6 +44,63 @@ QStringList filterByPrefix(const QStringList& candidates, const QString& prefix)
         }
     }
     return dedupeSorted(out);
+}
+
+QString normalizedPathToken(const QString& raw)
+{
+    return raw.trimmed().replace('\\', '/');
+}
+
+QStringList extensionSuggestions(const QString& tokenText)
+{
+    const QStringList defaults = {
+        QStringLiteral("ext:.cpp"),
+        QStringLiteral("ext:.h"),
+        QStringLiteral("ext:.hpp"),
+        QStringLiteral("ext:.c"),
+        QStringLiteral("ext:.cc"),
+        QStringLiteral("ext:.js"),
+        QStringLiteral("ext:.ts"),
+        QStringLiteral("ext:.py"),
+    };
+    return filterByPrefix(defaults, tokenText);
+}
+
+QStringList nameSuggestions(const QString& tokenText, const StructuralAutocompleteContext& context)
+{
+    QStringList candidates;
+    for (const QString& path : context.knownPaths) {
+        const QString clean = normalizedPathToken(path);
+        if (clean.isEmpty()) {
+            continue;
+        }
+        const int slash = clean.lastIndexOf('/');
+        const QString name = slash >= 0 ? clean.mid(slash + 1) : clean;
+        if (!name.trimmed().isEmpty()) {
+            candidates.push_back(QStringLiteral("name:%1").arg(name));
+        }
+    }
+    if (candidates.isEmpty()) {
+        candidates.push_back(QStringLiteral("name:main"));
+    }
+    return filterByPrefix(dedupeSorted(candidates), tokenText);
+}
+
+QStringList pathTokenSuggestions(const QString& prefix,
+                                 const QString& tokenText,
+                                 const QStringList& pathCandidates)
+{
+    QStringList candidates;
+    for (const QString& path : pathCandidates) {
+        const QString clean = normalizedPathToken(path);
+        if (!clean.isEmpty()) {
+            candidates.push_back(prefix + clean);
+        }
+    }
+    if (candidates.isEmpty()) {
+        candidates.push_back(prefix);
+    }
+    return filterByPrefix(dedupeSorted(candidates), tokenText);
 }
 
 QStringList buildPrefixSuggestions(const QString& input)
@@ -103,35 +163,53 @@ namespace StructuralQueryAutocomplete
 {
 QStringList buildSuggestions(const QString& input, const StructuralAutocompleteContext& context)
 {
-    const QString trimmed = input.trimmed();
-    const QString lower = trimmed.toLower();
+    const QString cleaned = input;
+    const int lastSpace = cleaned.lastIndexOf(QRegularExpression(QStringLiteral("\\s")));
+    const QString token = (lastSpace >= 0) ? cleaned.mid(lastSpace + 1).trimmed() : cleaned.trimmed();
+    const QString lower = token.toLower();
 
-    if (trimmed.isEmpty()) {
+    if (token.isEmpty()) {
         return structuralPrefixes();
     }
 
-    if (!trimmed.contains(':')) {
-        return buildPrefixSuggestions(trimmed);
+    if (!token.contains(':')) {
+        return buildPrefixSuggestions(token);
+    }
+
+    if (lower.startsWith(QStringLiteral("ext:"))) {
+        return extensionSuggestions(token);
+    }
+
+    if (lower.startsWith(QStringLiteral("under:"))) {
+        QStringList underCandidates = context.knownDirectories;
+        if (!context.currentRootPath.trimmed().isEmpty()) {
+            underCandidates.push_back(context.currentRootPath.trimmed());
+        }
+        return pathTokenSuggestions(QStringLiteral("under:"), token, underCandidates);
+    }
+
+    if (lower.startsWith(QStringLiteral("name:"))) {
+        return nameSuggestions(token, context);
     }
 
     if (lower.startsWith(QStringLiteral("history:"))) {
-        return buildPathSuggestions(QStringLiteral("history:"), trimmed.mid(QStringLiteral("history:").size()), context);
+        return buildPathSuggestions(QStringLiteral("history:"), token.mid(QStringLiteral("history:").size()), context);
     }
 
     if (lower.startsWith(QStringLiteral("snapshots:"))) {
-        return buildPathSuggestions(QStringLiteral("snapshots:"), trimmed.mid(QStringLiteral("snapshots:").size()), context);
+        return buildPathSuggestions(QStringLiteral("snapshots:"), token.mid(QStringLiteral("snapshots:").size()), context);
     }
 
     if (lower.startsWith(QStringLiteral("references:"))) {
-        return buildPathSuggestions(QStringLiteral("references:"), trimmed.mid(QStringLiteral("references:").size()), context);
+        return pathTokenSuggestions(QStringLiteral("references:"), token, context.knownFiles);
     }
 
     if (lower.startsWith(QStringLiteral("usedby:"))) {
-        return buildPathSuggestions(QStringLiteral("usedby:"), trimmed.mid(QStringLiteral("usedby:").size()), context);
+        return pathTokenSuggestions(QStringLiteral("usedby:"), token, context.knownFiles);
     }
 
     if (lower.startsWith(QStringLiteral("diff:"))) {
-        return buildDiffSuggestions(trimmed, context);
+        return buildDiffSuggestions(token, context);
     }
 
     return QStringList();

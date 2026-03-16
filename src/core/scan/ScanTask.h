@@ -31,6 +31,7 @@ struct ScanWorkerProgress
     qint64 totalSeen = 0;
     qint64 totalEmitted = 0;
     qint64 errorCount = 0;
+    qint64 pendingDirectories = 0;
 };
 
 struct ScanCoordinatorResult
@@ -46,4 +47,5 @@ struct ScanCoordinatorResult
     qint64 totalUpdated = 0;
     qint64 totalRemoved = 0;
     qint64 errorCount = 0;
+    qint64 pendingDirectories = 0;
 };

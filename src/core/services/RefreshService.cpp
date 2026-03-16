@@ -299,10 +299,44 @@ void RefreshService::workerLoop()
         task.mode = item.mode;
         task.batchSize = 500;
         ScanCoordinatorResult runResult;
+        auto lastProgressEmitAt = std::chrono::steady_clock::now();
+        qint64 lastProgressSeen = -1;
 
         ScanCoordinator::Callbacks callbacks;
         callbacks.onLog = nullptr;
-        callbacks.onProgress = nullptr;
+        callbacks.onProgress = [&](const ScanCoordinatorResult& progress) {
+            const auto now = std::chrono::steady_clock::now();
+            const auto elapsedMs = std::chrono::duration_cast<std::chrono::milliseconds>(now - lastProgressEmitAt).count();
+            const bool seenAdvanced = (progress.totalSeen - lastProgressSeen) >= 500;
+            if (!seenAdvanced && elapsedMs < 300) {
+                return;
+            }
+            lastProgressEmitAt = now;
+            lastProgressSeen = progress.totalSeen;
+
+            const qint64 denominator = progress.totalSeen + qMax<qint64>(0, progress.pendingDirectories);
+            int percent = 0;
+            if (denominator > 0) {
+                const double ratio = static_cast<double>(progress.totalSeen) / static_cast<double>(denominator);
+                percent = qBound(0, static_cast<int>(ratio * 100.0), 99);
+            }
+
+            RefreshEvent progressEvent;
+            progressEvent.requestId = item.requestId;
+            progressEvent.path = item.path;
+            progressEvent.mode = item.mode;
+            progressEvent.state = RefreshState::Running;
+            progressEvent.reason = item.reason;
+            progressEvent.timestampUtc = nowIso();
+            progressEvent.sessionId = progress.sessionId;
+            progressEvent.totalSeen = progress.totalSeen;
+            progressEvent.totalInserted = progress.totalInserted;
+            progressEvent.totalUpdated = progress.totalUpdated;
+            progressEvent.totalRemoved = progress.totalRemoved;
+            progressEvent.pendingDirectories = progress.pendingDirectories;
+            progressEvent.progressPercent = percent;
+            emitEvent(progressEvent);
+        };
 
         const bool runOk = coordinator.runScan(task, callbacks, &runResult);
         doneEvent.sessionId = runResult.sessionId;
@@ -310,6 +344,8 @@ void RefreshService::workerLoop()
         doneEvent.totalInserted = runResult.totalInserted;
         doneEvent.totalUpdated = runResult.totalUpdated;
         doneEvent.totalRemoved = runResult.totalRemoved;
+        doneEvent.pendingDirectories = 0;
+        doneEvent.progressPercent = 100;
 
         if (runResult.canceled) {
             doneEvent.state = RefreshState::Canceled;
