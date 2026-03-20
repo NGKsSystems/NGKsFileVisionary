@@ -371,6 +371,60 @@ bool EntryRepository::findSubtreeByRootPath(const QString& rootPath,
     return true;
 }
 
+bool EntryRepository::removeStaleDescendantsByRootPath(const QString& rootPath,
+                                                       qint64 scanSessionId,
+                                                       qint64* removedCount,
+                                                       QString* errorText)
+{
+    if (removedCount) {
+        *removedCount = 0;
+    }
+
+    EntryRecord root;
+    if (!getByPath(rootPath, &root, errorText)) {
+        return false;
+    }
+
+    QSqlQuery q(m_connection.database());
+    q.prepare(QStringLiteral(
+        "WITH RECURSIVE tree(id, depth, last_seen_scan_id) AS ("
+        "SELECT id, 0, last_seen_scan_id FROM entries WHERE id=? "
+        "UNION ALL "
+        "SELECT e.id, tree.depth + 1, e.last_seen_scan_id FROM entries e JOIN tree ON e.parent_id = tree.id"
+        ") "
+        "DELETE FROM entries WHERE id IN ("
+        "SELECT id FROM tree WHERE depth > 0 AND (last_seen_scan_id IS NULL OR last_seen_scan_id <> ?)"
+        ");"));
+    q.addBindValue(root.id);
+    q.addBindValue(scanSessionId);
+
+    if (!q.exec()) {
+        if (errorText) {
+            *errorText = q.lastError().text();
+        }
+        return false;
+    }
+
+    if (removedCount) {
+        QSqlQuery changesQ(m_connection.database());
+        if (!changesQ.exec(QStringLiteral("SELECT changes();"))) {
+            if (errorText) {
+                *errorText = QStringLiteral("remove_stale_affected_rows_unavailable: %1").arg(changesQ.lastError().text());
+            }
+            return false;
+        }
+        if (!changesQ.next()) {
+            if (errorText) {
+                *errorText = QStringLiteral("remove_stale_affected_rows_unavailable: no_changes_row");
+            }
+            return false;
+        }
+        *removedCount = changesQ.value(0).toLongLong();
+    }
+
+    return true;
+}
+
 qint64 EntryRepository::countEntriesUnderRoot(const QString& rootPath, int maxDepth, QString* errorText)
 {
     EntryRecord root;

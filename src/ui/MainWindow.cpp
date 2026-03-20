@@ -141,9 +141,13 @@ MainWindow::MainWindow(bool testMode,
 
     m_publishTimer.setInterval(16);
     connect(&m_publishTimer, &QTimer::timeout, this, &MainWindow::onPublishTick);
-    m_refreshPollTimer.setInterval(250);
+    m_refreshPollTimer.setInterval(120);
     connect(&m_refreshPollTimer, &QTimer::timeout, this, &MainWindow::onRefreshPollTick);
     m_refreshPollTimer.start();
+    m_watcherRefreshTimer.setInterval(180);
+    m_watcherRefreshTimer.setSingleShot(true);
+    connect(&m_watcherRefreshTimer, &QTimer::timeout, this, &MainWindow::onWatcherRefreshTick);
+    updateRootWatcherPath(currentRootPath());
 
     if (m_testMode && !m_testScriptPath.trimmed().isEmpty()) {
         QTimer::singleShot(250, this, &MainWindow::onRunTestScript);
@@ -598,6 +602,14 @@ void MainWindow::setupUi()
     rebuildSidebar();
     updateNavigationButtons();
     updateStatusDisplay(QStringLiteral("Ready"), 0, 0);
+
+    m_navigationState.currentRootPath = currentRootPath();
+    m_navigationState.visiblePath = m_rootEdit ? m_rootEdit->text().trimmed() : QString();
+    m_navigationState.navigationBusy = false;
+    m_navigationState.rebindComplete = true;
+    m_navigationState.navigationGeneration = 0;
+    syncNavigationStateFromView(false);
+    logNavigationState(QStringLiteral("Idle"), QStringLiteral("startup"), m_navigationState.currentRootPath, QStringLiteral("initialized"));
 
     appendRuntimeLog(QStringLiteral("MainWindow setup complete. sidebar_created=true favorites_config=%1 root=%2 startup_autorescan=false")
                          .arg(favoritesConfigPath(), m_rootEdit->text()));
@@ -1253,7 +1265,7 @@ void MainWindow::onRefreshPollTick()
     bool shouldRequery = false;
 
     for (const RefreshEvent& event : events) {
-        appendRuntimeLog(QStringLiteral("refresh_event request_id=%1 state=%2 path=%3 mode=%4 reason=%5 session=%6 inserted=%7 updated=%8 error=%9")
+        appendRuntimeLog(QStringLiteral("refresh_event request_id=%1 state=%2 path=%3 mode=%4 reason=%5 session=%6 inserted=%7 updated=%8 removed=%9 error=%10")
                              .arg(event.requestId)
                              .arg(RefreshTypes::stateToString(event.state))
                              .arg(event.path)
@@ -1262,11 +1274,24 @@ void MainWindow::onRefreshPollTick()
                              .arg(event.sessionId)
                              .arg(event.totalInserted)
                              .arg(event.totalUpdated)
+                     .arg(event.totalRemoved)
                              .arg(event.errorText));
 
-        const bool isVisibleScope = !visibleRoot.isEmpty()
-            && (QString::compare(QDir::cleanPath(event.path), QDir::cleanPath(visibleRoot), Qt::CaseInsensitive) == 0
-                || QDir::cleanPath(visibleRoot).startsWith(QDir::cleanPath(event.path), Qt::CaseInsensitive));
+        if (event.totalRemoved > 0) {
+            appendRuntimeLog(QStringLiteral("WATCHER_EVENT type=DELETE path=%1").arg(event.path));
+        }
+
+        const QString normalizedVisibleRoot = QDir::cleanPath(visibleRoot);
+        const QString normalizedEventPath = QDir::cleanPath(event.path);
+        const bool isVisibleScope = !normalizedVisibleRoot.isEmpty()
+            && (QString::compare(normalizedEventPath, normalizedVisibleRoot, Qt::CaseInsensitive) == 0
+                || normalizedVisibleRoot.startsWith(normalizedEventPath, Qt::CaseInsensitive)
+                || normalizedEventPath.startsWith(normalizedVisibleRoot, Qt::CaseInsensitive));
+        appendRuntimeLog(QStringLiteral("refresh_event_scope_eval event_path_raw=%1 event_path_norm=%2 visible_root_norm=%3 in_visible_scope=%4")
+                             .arg(event.path,
+                                  normalizedEventPath,
+                                  normalizedVisibleRoot,
+                                  isVisibleScope ? QStringLiteral("true") : QStringLiteral("false")));
 
         if (isVisibleScope && event.state == RefreshState::Running && event.progressPercent >= 0) {
             updateStatusDisplay(QStringLiteral("Indexing"), event.progressPercent, m_fileModel.itemCount(),
@@ -1278,10 +1303,11 @@ void MainWindow::onRefreshPollTick()
                                 QStringLiteral("seen=%1").arg(event.totalSeen));
         }
 
-        if (event.state == RefreshState::Completed
-            && !visibleRoot.isEmpty()
-            && (QString::compare(QDir::cleanPath(event.path), QDir::cleanPath(visibleRoot), Qt::CaseInsensitive) == 0
-                || QDir::cleanPath(visibleRoot).startsWith(QDir::cleanPath(event.path), Qt::CaseInsensitive))) {
+        if (event.state == RefreshState::Completed && isVisibleScope) {
+            if (event.reason.startsWith(QStringLiteral("watcher_"), Qt::CaseInsensitive)) {
+                m_forceAuthoritativeRebuildNextScan = true;
+                appendRuntimeLog(QStringLiteral("FULL_REBUILD_TRIGGER path=%1 reason=%2").arg(event.path, event.reason));
+            }
             shouldRequery = true;
         }
     }
@@ -1293,6 +1319,166 @@ void MainWindow::onRefreshPollTick()
             appendRuntimeLog(QStringLiteral("refresh_triggered_requery root=%1").arg(visibleRoot));
             QMetaObject::invokeMethod(this, "onRescan", Qt::QueuedConnection);
         }
+    }
+}
+
+void MainWindow::updateRootWatcherPath(const QString& rootPath)
+{
+    if (!m_rootWatcher) {
+        m_rootWatcher = new QFileSystemWatcher(this);
+        connect(m_rootWatcher, &QFileSystemWatcher::directoryChanged, this, &MainWindow::onRootWatcherDirectoryChanged);
+        connect(m_rootWatcher, &QFileSystemWatcher::fileChanged, this, &MainWindow::onRootWatcherFileChanged);
+    }
+
+    const QString normalizedRoot = QDir::cleanPath(rootPath.trimmed());
+    const bool watchableRoot = !normalizedRoot.isEmpty()
+        && !PathUtils::isArchivePath(normalizedRoot)
+        && !PathUtils::isArchiveVirtualPath(normalizedRoot)
+        && QFileInfo(normalizedRoot).exists()
+        && QFileInfo(normalizedRoot).isDir();
+
+    if (QString::compare(m_watchedRootPath, normalizedRoot, Qt::CaseInsensitive) == 0 && watchableRoot) {
+        return;
+    }
+
+    if (!m_watchedDirectoryPaths.isEmpty()) {
+        m_rootWatcher->removePaths(m_watchedDirectoryPaths);
+        appendRuntimeLog(QStringLiteral("fs_watcher_removed_old_paths count=%1 root=%2")
+                             .arg(m_watchedDirectoryPaths.size())
+                             .arg(m_watchedRootPath));
+        m_watchedDirectoryPaths.clear();
+        m_watchedRootPath.clear();
+    }
+
+    if (!watchableRoot) {
+        appendRuntimeLog(QStringLiteral("fs_watcher_detached reason=root_not_watchable root=%1").arg(normalizedRoot));
+        return;
+    }
+
+    QStringList watchPaths;
+    watchPaths << normalizedRoot;
+    const QDir rootDir(normalizedRoot);
+    const QFileInfoList directChildDirs = rootDir.entryInfoList(QDir::Dirs | QDir::NoDotAndDotDot,
+                                                                 QDir::Name | QDir::IgnoreCase);
+    for (const QFileInfo& childInfo : directChildDirs) {
+        watchPaths << QDir::cleanPath(childInfo.absoluteFilePath());
+    }
+    watchPaths.removeDuplicates();
+
+    const QStringList attached = m_rootWatcher->addPaths(watchPaths);
+    if (attached.contains(normalizedRoot)) {
+        m_watchedRootPath = normalizedRoot;
+        m_watchedDirectoryPaths = attached;
+        appendRuntimeLog(QStringLiteral("fs_watcher_attached_paths root=%1 attached=%2 requested=%3")
+                             .arg(m_watchedRootPath)
+                             .arg(attached.size())
+                             .arg(watchPaths.size()));
+    } else {
+        appendRuntimeLog(QStringLiteral("fs_watcher_attach_failed path=%1 requested=%2 attached=%3")
+                             .arg(normalizedRoot)
+                             .arg(watchPaths.size())
+                             .arg(attached.size()));
+    }
+}
+
+void MainWindow::queueWatcherRefresh(const QString& reason, const QString& changedPath)
+{
+    m_pendingWatcherReason = reason;
+    m_pendingWatcherChangedPath = changedPath;
+    m_watcherRefreshPending = true;
+    if (!m_watcherRefreshTimer.isActive()) {
+        m_watcherRefreshTimer.start();
+    }
+}
+
+void MainWindow::onRootWatcherDirectoryChanged(const QString& path)
+{
+    appendRuntimeLog(QStringLiteral("fs_watcher_directory_changed path=%1 current_root=%2")
+                         .arg(path, currentRootPath()));
+
+    const QString currentRoot = QDir::cleanPath(currentRootPath());
+    const QString changedPath = QDir::cleanPath(path);
+    if (QString::compare(changedPath, currentRoot, Qt::CaseInsensitive) == 0) {
+        const QFileInfo rootInfo(currentRoot);
+        if (!rootInfo.exists() || !rootInfo.isDir()) {
+            appendRuntimeLog(QStringLiteral("fs_watcher_current_root_missing path=%1 exists=%2 is_dir=%3")
+                                 .arg(currentRoot)
+                                 .arg(rootInfo.exists() ? QStringLiteral("true") : QStringLiteral("false"))
+                                 .arg(rootInfo.isDir() ? QStringLiteral("true") : QStringLiteral("false")));
+        }
+    }
+
+    queueWatcherRefresh(QStringLiteral("directory_changed"), changedPath);
+    updateRootWatcherPath(currentRootPath());
+}
+
+void MainWindow::onRootWatcherFileChanged(const QString& path)
+{
+    appendRuntimeLog(QStringLiteral("fs_watcher_file_changed path=%1 current_root=%2")
+                         .arg(path, currentRootPath()));
+    queueWatcherRefresh(QStringLiteral("file_changed"), QDir::cleanPath(path));
+}
+
+void MainWindow::onWatcherRefreshTick()
+{
+    if (!m_watcherRefreshPending) {
+        return;
+    }
+
+    if (m_navigationState.navigationBusy || !m_navigationState.rebindComplete || m_scanInProgress) {
+        appendRuntimeLog(QStringLiteral("fs_watcher_refresh_deferred_due_to_navigation_busy reason=%1 changed=%2 nav_busy=%3 rebind_complete=%4 scan_in_progress=%5")
+                             .arg(m_pendingWatcherReason,
+                                  m_pendingWatcherChangedPath,
+                                  m_navigationState.navigationBusy ? QStringLiteral("true") : QStringLiteral("false"),
+                                  m_navigationState.rebindComplete ? QStringLiteral("true") : QStringLiteral("false"),
+                                  m_scanInProgress ? QStringLiteral("true") : QStringLiteral("false")));
+        m_watcherRefreshTimer.start();
+        return;
+    }
+
+    const QString pendingReason = m_pendingWatcherReason;
+    const QString pendingChangedPath = m_pendingWatcherChangedPath;
+    const QFileInfo changedInfo(pendingChangedPath);
+    if (!pendingChangedPath.trimmed().isEmpty() && !changedInfo.exists()) {
+        appendRuntimeLog(QStringLiteral("WATCHER_EVENT type=DELETE path=%1").arg(pendingChangedPath));
+    }
+    const QString normalizedRefreshRoot = QDir::cleanPath(currentRootPath());
+    const QString normalizedChangedPath = QDir::cleanPath(pendingChangedPath);
+    const bool changedInsideRoot = !normalizedChangedPath.isEmpty()
+        && normalizedChangedPath.startsWith(normalizedRefreshRoot, Qt::CaseInsensitive);
+    appendRuntimeLog(QStringLiteral("fs_watcher_refresh_triggered reason=%1 changed_raw=%2 changed_norm=%3 root_norm=%4 changed_inside_root=%5")
+                         .arg(pendingReason,
+                              pendingChangedPath,
+                              normalizedChangedPath,
+                              normalizedRefreshRoot,
+                              changedInsideRoot ? QStringLiteral("true") : QStringLiteral("false")));
+    const QString refreshRoot = currentRootPath();
+    m_watcherRefreshPending = false;
+    m_pendingWatcherReason.clear();
+    m_pendingWatcherChangedPath.clear();
+
+    if (!ensureDirectoryModelReady()) {
+        appendRuntimeLog(QStringLiteral("fs_watcher_refresh_request_failed reason=directory_model_not_ready root=%1")
+                             .arg(refreshRoot));
+        QMetaObject::invokeMethod(this, "onRescan", Qt::QueuedConnection);
+        return;
+    }
+
+    const RefreshRequestResult rr = m_directoryModel->requestRefresh(
+        refreshRoot,
+        true,
+        QStringLiteral("full_rebuild"),
+        QStringLiteral("watcher_%1").arg(pendingReason.isEmpty() ? QStringLiteral("changed") : pendingReason));
+
+    appendRuntimeLog(QStringLiteral("fs_watcher_refresh_request accepted=%1 state=%2 path=%3 reason=%4 error=%5")
+                         .arg(rr.accepted ? QStringLiteral("true") : QStringLiteral("false"))
+                         .arg(RefreshTypes::stateToString(rr.state))
+                         .arg(rr.path)
+                         .arg(rr.reason)
+                         .arg(rr.errorText));
+
+    if (!rr.accepted || rr.state == RefreshState::Failed) {
+        QMetaObject::invokeMethod(this, "onRescan", Qt::QueuedConnection);
     }
 }
 
@@ -1368,6 +1554,7 @@ void MainWindow::onScanFinished(quint64 scanId,
         m_publishTimer.start();
     } else if (m_publishQueue.isEmpty()) {
         m_treeView->setSortingEnabled(true);
+        m_proxyModel.invalidate();
     }
 
     if (!error.isEmpty()) {
@@ -1392,24 +1579,19 @@ void MainWindow::onScanFinished(quint64 scanId,
                          .arg(m_scanBatchCount)
                          .arg(m_scanEntryCount));
 
-    if (!m_pendingActivatedPath.trimmed().isEmpty()) {
-        if (!error.isEmpty() || canceled) {
+    if (!error.isEmpty() || canceled) {
+        if (m_navigationState.navigationBusy) {
+            abortNavigationTransition(QStringLiteral("scan_failed"),
+                                      QStringLiteral("canceled=%1 error=%2").arg(canceled ? QStringLiteral("true") : QStringLiteral("false"), error));
+        }
+        if (!m_pendingActivatedPath.trimmed().isEmpty()) {
             appendRuntimeLog(QStringLiteral("tree_activated_deferred_cleared reason=scan_not_successful path=%1")
                                  .arg(m_pendingActivatedPath));
             m_pendingActivatedPath.clear();
-        } else {
-            const QString pendingPath = m_pendingActivatedPath;
-            m_pendingActivatedPath.clear();
-            appendRuntimeLog(QStringLiteral("tree_activated_deferred_replay path=%1").arg(pendingPath));
-            QTimer::singleShot(0, this, [this, pendingPath]() {
-                if (isNavigablePath(pendingPath)) {
-                    navigateToDirectory(pendingPath);
-                } else {
-                    appendRuntimeLog(QStringLiteral("tree_activated_deferred_replay_skipped reason=not_navigable path=%1")
-                                         .arg(pendingPath));
-                }
-            });
+            m_pendingNavigationRoute.clear();
         }
+    } else {
+        replayDeferredNavigationIfAny(QStringLiteral("scan_finished"));
     }
 
     if (m_rescanPending) {
@@ -1488,7 +1670,8 @@ void MainWindow::onFocusQueryBar()
 void MainWindow::onTreeCurrentChanged(const QModelIndex& current, const QModelIndex& previous)
 {
     Q_UNUSED(previous);
-    if (m_scanInProgress || !current.isValid()) {
+    if (m_scanInProgress || m_navigationState.navigationBusy || !m_navigationState.rebindComplete || !current.isValid()) {
+        syncNavigationStateFromView(true);
         return;
     }
 
@@ -1500,6 +1683,7 @@ void MainWindow::onTreeCurrentChanged(const QModelIndex& current, const QModelIn
 
     const QFileInfo info(path);
     const QString target = info.fileName().trimmed().isEmpty() ? path : info.fileName();
+    syncNavigationStateFromView(true);
     updateStatusDisplay(QStringLiteral("Ready"), 100, m_fileModel.itemCount(),
                         QStringLiteral("Selected: %1").arg(QDir::toNativeSeparators(target)));
 }
@@ -1583,6 +1767,75 @@ void MainWindow::onTreeContextMenu(const QPoint& pos)
     const bool multiple = (paths.size() > 1);
     const bool isFolder = isInternalNavigableDirectory(firstInfo);
     const bool isArchive = isArchivePath(firstPath);
+    const auto resolveContextDirectory = [this](const QString& path) -> QString {
+        const QFileInfo info(path);
+        if (isInternalNavigableDirectory(info)) {
+            return QDir::cleanPath(path);
+        }
+        return QDir::cleanPath(info.absolutePath());
+    };
+    const auto requestContextRefresh = [this](const QString& directoryPath, const QString& reasonTag) {
+        const QString targetRoot = QDir::cleanPath(directoryPath);
+        if (targetRoot.isEmpty()) {
+            appendRuntimeLog(QStringLiteral("ui_context_refresh_skipped reason=empty_target"));
+            return;
+        }
+        if (!ensureDirectoryModelReady()) {
+            appendRuntimeLog(QStringLiteral("ui_context_refresh_failed reason=directory_model_not_ready path=%1").arg(targetRoot));
+            onRescan();
+            return;
+        }
+
+        const RefreshRequestResult rr = m_directoryModel->requestRefresh(
+            targetRoot,
+            true,
+            QStringLiteral("visible_refresh"),
+            QStringLiteral("ui_context_%1").arg(reasonTag));
+
+        appendRuntimeLog(QStringLiteral("ui_context_refresh_request accepted=%1 state=%2 path=%3 reason=%4 error=%5")
+                             .arg(rr.accepted ? QStringLiteral("true") : QStringLiteral("false"))
+                             .arg(RefreshTypes::stateToString(rr.state))
+                             .arg(rr.path)
+                             .arg(rr.reason)
+                             .arg(rr.errorText));
+
+        if (!rr.accepted || rr.state == RefreshState::Failed) {
+            onRescan();
+        }
+    };
+    const auto createNewFolderInDirectory = [this, &requestContextRefresh](const QString& directoryPath, const QString& reasonTag) {
+        const QString targetRoot = QDir::cleanPath(directoryPath);
+        if (targetRoot.isEmpty()) {
+            appendRuntimeLog(QStringLiteral("ui_new_folder_skipped reason=empty_target"));
+            return;
+        }
+
+        const QFileInfo targetInfo(targetRoot);
+        if (!targetInfo.exists() || !targetInfo.isDir()) {
+            appendRuntimeLog(QStringLiteral("ui_new_folder_skipped reason=invalid_target path=%1").arg(targetRoot));
+            QMessageBox::warning(this, QStringLiteral("New Folder"), QStringLiteral("Target directory is not available."));
+            return;
+        }
+
+        const QString name = QInputDialog::getText(this,
+                                                   QStringLiteral("New Folder"),
+                                                   QStringLiteral("Folder name:"),
+                                                   QLineEdit::Normal,
+                                                   QStringLiteral("New Folder"));
+        if (name.trimmed().isEmpty()) {
+            return;
+        }
+
+        QDir dir(targetRoot);
+        if (!dir.mkdir(name)) {
+            appendRuntimeLog(QStringLiteral("ui_new_folder_failed path=%1 name=%2").arg(targetRoot, name));
+            QMessageBox::warning(this, QStringLiteral("New Folder"), QStringLiteral("Failed to create folder."));
+            return;
+        }
+
+        appendRuntimeLog(QStringLiteral("ui_new_folder_created path=%1 name=%2").arg(targetRoot, name));
+        requestContextRefresh(targetRoot, reasonTag + QStringLiteral("_new_folder"));
+    };
     const QString selectionType = multiple ? QStringLiteral("multi")
                                            : (isArchive ? QStringLiteral("archive") : (isFolder ? QStringLiteral("folder") : QStringLiteral("file")));
     setActionContext(paths, selectionType);
@@ -1590,6 +1843,8 @@ void MainWindow::onTreeContextMenu(const QPoint& pos)
     if (multiple) {
         QMenu multiMenu(this);
         QAction* openSelectedAction = multiMenu.addAction(QStringLiteral("Open Selected"));
+        QAction* newFolderAction = multiMenu.addAction(QStringLiteral("New Folder"));
+        QAction* refreshAction = multiMenu.addAction(QStringLiteral("Refresh"));
         QAction* revealAction = multiMenu.addAction(QStringLiteral("Reveal in Explorer"));
         multiMenu.addAction(m_actionCopyPath);
         QAction* copyPathsAction = m_actionCopyPath;
@@ -1616,7 +1871,7 @@ void MainWindow::onTreeContextMenu(const QPoint& pos)
             for (const QString& path : paths) {
                 const QFileInfo info(path);
                 if (isInternalNavigableDirectory(info)) {
-                    navigateToDirectory(path);
+                    navigateToDirectory(path, true, QStringLiteral("context_open_selected_multi"));
                     break;
                 }
                 if (isArchivePath(path)) {
@@ -1624,9 +1879,21 @@ void MainWindow::onTreeContextMenu(const QPoint& pos)
                     explorer->openArchive(path);
                     explorer->show();
                 } else {
-                    QDesktopServices::openUrl(QUrl::fromLocalFile(path));
+                    appendRuntimeLog(QStringLiteral("context_open_selected_file_internal_selection path=%1").arg(path));
+                    const QModelIndex sourceMatch = findSourceIndexByPath(path);
+                    const QModelIndex proxyMatch = m_proxyModel.mapFromSource(sourceMatch);
+                    if (proxyMatch.isValid() && m_treeView && m_treeView->selectionModel()) {
+                        m_treeView->selectionModel()->setCurrentIndex(
+                            proxyMatch,
+                            QItemSelectionModel::ClearAndSelect | QItemSelectionModel::Rows);
+                        m_treeView->scrollTo(proxyMatch, QAbstractItemView::PositionAtCenter);
+                    }
                 }
             }
+        } else if (chosen == newFolderAction) {
+            createNewFolderInDirectory(resolveContextDirectory(firstPath), QStringLiteral("multi_menu"));
+        } else if (chosen == refreshAction) {
+            requestContextRefresh(resolveContextDirectory(firstPath), QStringLiteral("multi_menu"));
         } else if (chosen == revealAction) {
             QProcess::startDetached(QStringLiteral("explorer.exe"), {QStringLiteral("/select,"), QDir::toNativeSeparators(firstPath)});
         } else if (chosen == copyPathsAction) {
@@ -1653,6 +1920,8 @@ void MainWindow::onTreeContextMenu(const QPoint& pos)
 
     QMenu menu(this);
     QAction* openAction = menu.addAction(QStringLiteral("Open"));
+    QAction* newFolderAction = menu.addAction(QStringLiteral("New Folder"));
+    QAction* refreshAction = menu.addAction(QStringLiteral("Refresh"));
     QAction* openInNewTabAction = nullptr;
     QAction* openInNewWindowAction = nullptr;
     QAction* openWithAction = nullptr;
@@ -1763,12 +2032,26 @@ void MainWindow::onTreeContextMenu(const QPoint& pos)
 
     if (chosen == openAction) {
         if (isArchive) {
-            navigateToDirectory(firstPath);
+            navigateToDirectory(firstPath, true, QStringLiteral("context_open_archive"));
         } else if (isFolder) {
-            navigateToDirectory(firstPath);
+            navigateToDirectory(firstPath, true, QStringLiteral("context_open_folder"));
         } else {
-            QDesktopServices::openUrl(QUrl::fromLocalFile(firstPath));
+            appendRuntimeLog(QStringLiteral("context_open_file_internal_selection path=%1").arg(firstPath));
+            const QModelIndex sourceMatch = findSourceIndexByPath(firstPath);
+            const QModelIndex proxyMatch = m_proxyModel.mapFromSource(sourceMatch);
+            if (proxyMatch.isValid() && m_treeView && m_treeView->selectionModel()) {
+                m_treeView->selectionModel()->setCurrentIndex(
+                    proxyMatch,
+                    QItemSelectionModel::ClearAndSelect | QItemSelectionModel::Rows);
+                m_treeView->scrollTo(proxyMatch, QAbstractItemView::PositionAtCenter);
+            }
+            updateStatusDisplay(QStringLiteral("Ready"), 100, m_fileModel.itemCount(),
+                                QStringLiteral("Selected: %1").arg(QDir::toNativeSeparators(QFileInfo(firstPath).fileName())));
         }
+    } else if (chosen == newFolderAction) {
+        createNewFolderInDirectory(resolveContextDirectory(firstPath), QStringLiteral("single_menu"));
+    } else if (chosen == refreshAction) {
+        requestContextRefresh(resolveContextDirectory(firstPath), QStringLiteral("single_menu"));
     } else if (openInNewTabAction && chosen == openInNewTabAction) {
         QMessageBox::information(this, QStringLiteral("Open in New Tab"), QStringLiteral("Tabbed filesystem view is not available yet."));
     } else if (openInNewWindowAction && chosen == openInNewWindowAction) {
@@ -1850,7 +2133,15 @@ void MainWindow::onTreeContextMenu(const QPoint& pos)
                                      QStringLiteral("SHA-256:\n%1").arg(QString::fromLatin1(sha256.result().toHex())));
         }
     } else if (previewAction && chosen == previewAction) {
-        QDesktopServices::openUrl(QUrl::fromLocalFile(firstPath));
+        appendRuntimeLog(QStringLiteral("context_preview_internal_selection path=%1").arg(firstPath));
+        const QModelIndex sourceMatch = findSourceIndexByPath(firstPath);
+        const QModelIndex proxyMatch = m_proxyModel.mapFromSource(sourceMatch);
+        if (proxyMatch.isValid() && m_treeView && m_treeView->selectionModel()) {
+            m_treeView->selectionModel()->setCurrentIndex(
+                proxyMatch,
+                QItemSelectionModel::ClearAndSelect | QItemSelectionModel::Rows);
+            m_treeView->scrollTo(proxyMatch, QAbstractItemView::PositionAtCenter);
+        }
     } else if (chosen == propertiesAction) {
         showPropertiesDialog(paths);
     }
@@ -1858,12 +2149,20 @@ void MainWindow::onTreeContextMenu(const QPoint& pos)
 
 void MainWindow::onTreeActivated(const QModelIndex& index)
 {
+    appendRuntimeLog(QStringLiteral("tree_activated_handler_entry proxy_valid=%1 proxy_row=%2")
+                         .arg(index.isValid() ? QStringLiteral("true") : QStringLiteral("false"))
+                         .arg(index.isValid() ? QString::number(index.row()) : QStringLiteral("-1")));
+
     if (!index.isValid()) {
         appendRuntimeLog(QStringLiteral("tree_activated_ignored reason=invalid_proxy_index"));
         return;
     }
 
     const QModelIndex sourceIndex = m_proxyModel.mapToSource(index);
+    appendRuntimeLog(QStringLiteral("tree_activated_index_map proxy_row=%1 source_valid=%2 source_row=%3")
+                         .arg(index.row())
+                         .arg(sourceIndex.isValid() ? QStringLiteral("true") : QStringLiteral("false"))
+                         .arg(sourceIndex.isValid() ? QString::number(sourceIndex.row()) : QStringLiteral("-1")));
     if (!sourceIndex.isValid()) {
         appendRuntimeLog(QStringLiteral("tree_activated_ignored reason=invalid_source_index"));
         return;
@@ -1880,6 +2179,16 @@ void MainWindow::onTreeActivated(const QModelIndex& index)
         return;
     }
 
+    const QFileInfo resolvedInfo(path);
+    appendRuntimeLog(QStringLiteral("tree_activated_target_resolved path=%1 exists=%2 is_dir=%3 is_file=%4 is_link=%5")
+                         .arg(path)
+                         .arg(resolvedInfo.exists() ? QStringLiteral("true") : QStringLiteral("false"))
+                         .arg(resolvedInfo.isDir() ? QStringLiteral("true") : QStringLiteral("false"))
+                         .arg(resolvedInfo.isFile() ? QStringLiteral("true") : QStringLiteral("false"))
+                         .arg(resolvedInfo.isSymLink() ? QStringLiteral("true") : QStringLiteral("false")));
+
+    logNavigationState(QStringLiteral("RouteEntry"), QStringLiteral("tree_activated"), path, QStringLiteral("proxy_row=%1").arg(index.row()));
+
     const QDateTime now = QDateTime::currentDateTimeUtc();
     if (QString::compare(m_lastActivatedTreePath, path, Qt::CaseInsensitive) == 0
         && m_lastActivatedTreeAt.isValid()
@@ -1890,9 +2199,14 @@ void MainWindow::onTreeActivated(const QModelIndex& index)
     m_lastActivatedTreePath = path;
     m_lastActivatedTreeAt = now;
 
-    if (m_scanInProgress) {
+    if (m_scanInProgress || m_navigationState.navigationBusy || !m_navigationState.rebindComplete) {
         m_pendingActivatedPath = path;
-        appendRuntimeLog(QStringLiteral("tree_activated_deferred reason=scan_in_progress path=%1").arg(path));
+        m_pendingNavigationRoute = QStringLiteral("tree_activated_deferred");
+        appendRuntimeLog(QStringLiteral("tree_activated_deferred reason=busy_or_rebind_pending path=%1 busy=%2 rebind_complete=%3 scan_in_progress=%4")
+                             .arg(path)
+                             .arg(m_navigationState.navigationBusy ? QStringLiteral("true") : QStringLiteral("false"))
+                             .arg(m_navigationState.rebindComplete ? QStringLiteral("true") : QStringLiteral("false"))
+                             .arg(m_scanInProgress ? QStringLiteral("true") : QStringLiteral("false")));
         return;
     }
 
@@ -1927,7 +2241,7 @@ void MainWindow::onTreeActivated(const QModelIndex& index)
         if (PathUtils::isArchiveVirtualPath(path)) {
             if (modelSaysFolder) {
                 appendRuntimeLog(QStringLiteral("tree_activated_archive_virtual_dir path=%1").arg(path));
-                navigateToDirectory(path);
+                navigateToDirectory(path, true, QStringLiteral("tree_activated_archive_virtual"));
             }
             rememberPathForAutocomplete(path);
             m_treeActivationInFlight = false;
@@ -1936,7 +2250,7 @@ void MainWindow::onTreeActivated(const QModelIndex& index)
 
         if (PathUtils::isArchivePath(path)) {
             appendRuntimeLog(QStringLiteral("tree_activated_archive_file path=%1").arg(path));
-            navigateToDirectory(path);
+            navigateToDirectory(path, true, QStringLiteral("tree_activated_archive"));
             rememberPathForAutocomplete(path);
             m_treeActivationInFlight = false;
             return;
@@ -1944,19 +2258,29 @@ void MainWindow::onTreeActivated(const QModelIndex& index)
 
         if (isInternalNavigableDirectory(fileInfo)) {
             appendRuntimeLog(QStringLiteral("tree_activated_internal_dir path=%1").arg(path));
-            navigateToDirectory(path);
+            navigateToDirectory(path, true, QStringLiteral("tree_activated_internal"));
             rememberPathForAutocomplete(path);
             m_treeActivationInFlight = false;
             return;
         }
 
         if (fileInfo.exists() && fileInfo.isFile()) {
-            appendRuntimeLog(QStringLiteral("tree_activated_external_file path=%1 suffix=%2 is_link=%3")
+            appendRuntimeLog(QStringLiteral("tree_activated_file_internal_selection path=%1 suffix=%2 is_link=%3")
                                  .arg(path)
                                  .arg(fileInfo.suffix())
                                  .arg(fileInfo.isSymLink() ? QStringLiteral("true") : QStringLiteral("false")));
             rememberPathForAutocomplete(path);
-            QDesktopServices::openUrl(QUrl::fromLocalFile(path));
+            updateStatusDisplay(QStringLiteral("Ready"), 100, m_fileModel.itemCount(),
+                                QStringLiteral("Selected: %1").arg(QDir::toNativeSeparators(fileInfo.fileName())));
+        } else if (!fileInfo.exists()) {
+            appendRuntimeLog(QStringLiteral("tree_activated_missing_target path=%1").arg(path));
+            logNavigationState(QStringLiteral("RecoverMissingTargetDetected"),
+                               QStringLiteral("tree_activated"),
+                               path,
+                               QStringLiteral("selected_item_disappeared_before_activation"));
+            clearStaleSelectionState(QStringLiteral("tree_activated"), path, QStringLiteral("selected_item_disappeared_before_activation"));
+            updateStatusDisplay(QStringLiteral("Ready"), 100, m_fileModel.itemCount(),
+                                QStringLiteral("Selection cleared: target no longer exists"));
         }
 
         m_treeActivationInFlight = false;
@@ -1986,16 +2310,21 @@ void MainWindow::onSidebarItemActivated(QTreeWidgetItem* item, int column)
     m_lastActivatedTreePath = path;
     m_lastActivatedTreeAt = now;
 
-    if (m_scanInProgress) {
+    if (m_scanInProgress || m_navigationState.navigationBusy || !m_navigationState.rebindComplete) {
         m_pendingActivatedPath = path;
-        appendRuntimeLog(QStringLiteral("sidebar_activated_deferred reason=scan_in_progress path=%1").arg(path));
+        m_pendingNavigationRoute = QStringLiteral("sidebar_activated_deferred");
+        appendRuntimeLog(QStringLiteral("sidebar_activated_deferred reason=busy_or_rebind_pending path=%1 busy=%2 rebind_complete=%3 scan_in_progress=%4")
+                             .arg(path)
+                             .arg(m_navigationState.navigationBusy ? QStringLiteral("true") : QStringLiteral("false"))
+                             .arg(m_navigationState.rebindComplete ? QStringLiteral("true") : QStringLiteral("false"))
+                             .arg(m_scanInProgress ? QStringLiteral("true") : QStringLiteral("false")));
         return;
     }
 
     appendRuntimeLog(QStringLiteral("sidebar_activated path=%1").arg(path));
     // Defer navigation so the activation signal stack can unwind before model work begins.
     QTimer::singleShot(0, this, [this, path]() {
-        navigateToDirectory(path);
+        navigateToDirectory(path, true, QStringLiteral("sidebar_activated"));
     });
 }
 
@@ -2040,7 +2369,7 @@ void MainWindow::onSidebarContextMenu(const QPoint& pos)
     }
 
     if (chosen == openAction) {
-        navigateToDirectory(path);
+        navigateToDirectory(path, true, QStringLiteral("sidebar_context_open"));
     } else if (pinAction && chosen == pinAction) {
         onActionPinFavorite();
     } else if (unpinAction && chosen == unpinAction) {
@@ -5038,7 +5367,7 @@ void MainWindow::onNavigateBack()
         return;
     }
     m_navigationIndex -= 1;
-    navigateToDirectory(m_navigationHistory[m_navigationIndex], false);
+    navigateToDirectory(m_navigationHistory[m_navigationIndex], false, QStringLiteral("history_back"));
 }
 
 void MainWindow::onNavigateForward()
@@ -5047,7 +5376,7 @@ void MainWindow::onNavigateForward()
         return;
     }
     m_navigationIndex += 1;
-    navigateToDirectory(m_navigationHistory[m_navigationIndex], false);
+    navigateToDirectory(m_navigationHistory[m_navigationIndex], false, QStringLiteral("history_forward"));
 }
 
 void MainWindow::onNavigateUp()
@@ -5060,7 +5389,7 @@ void MainWindow::onNavigateUp()
     if (PathUtils::isArchiveVirtualPath(current)) {
         const QString parentPath = PathUtils::archiveVirtualParentPath(current);
         if (!parentPath.isEmpty()) {
-            navigateToDirectory(parentPath);
+            navigateToDirectory(parentPath, true, QStringLiteral("navigate_up"));
         }
         return;
     }
@@ -5068,7 +5397,7 @@ void MainWindow::onNavigateUp()
     if (PathUtils::isArchivePath(current)) {
         const QString parentPath = QFileInfo(current).absolutePath();
         if (!parentPath.isEmpty()) {
-            navigateToDirectory(parentPath);
+            navigateToDirectory(parentPath, true, QStringLiteral("navigate_up"));
         }
         return;
     }
@@ -5077,7 +5406,7 @@ void MainWindow::onNavigateUp()
     if (!dir.cdUp()) {
         return;
     }
-    navigateToDirectory(dir.absolutePath());
+    navigateToDirectory(dir.absolutePath(), true, QStringLiteral("navigate_up"));
 }
 
 void MainWindow::rebuildSidebar()
@@ -5128,6 +5457,8 @@ void MainWindow::rebuildSidebar()
 
     m_favoritesRootItem->setExpanded(true);
     m_standardRootItem->setExpanded(true);
+    appendRuntimeLog(QStringLiteral("favorites_sidebar_sources favorites_count=%1 favorites_source=config_json standard_source=system_locations favorites_do_not_filter_filesystem=true")
+                         .arg(m_favorites.size()));
 }
 
 void MainWindow::loadFavorites()
@@ -5866,7 +6197,303 @@ QString MainWindow::selectedPath(const QModelIndex& index) const
         return QString();
     }
     const QModelIndex pathIndex = m_fileModel.index(index.row(), 4, index.parent());
-    return m_fileModel.data(pathIndex, Qt::DisplayRole).toString();
+    QString path = m_fileModel.data(pathIndex, Qt::DisplayRole).toString().trimmed();
+    if (!path.isEmpty()) {
+        return QDir::cleanPath(path);
+    }
+
+    const QModelIndex nameIndex = m_fileModel.index(index.row(), 0, index.parent());
+    const QString name = m_fileModel.data(nameIndex, Qt::DisplayRole).toString().trimmed();
+    if (name.isEmpty()) {
+        return QString();
+    }
+
+    QString parentPath;
+    if (index.parent().isValid()) {
+        parentPath = selectedPath(index.parent());
+    }
+    if (parentPath.trimmed().isEmpty()) {
+        parentPath = currentRootPath();
+    }
+    if (parentPath.trimmed().isEmpty()) {
+        return QString();
+    }
+    return QDir::cleanPath(QDir(parentPath).filePath(name));
+}
+
+QString MainWindow::indexPathForLogging(const QModelIndex& proxyIndex) const
+{
+    if (!proxyIndex.isValid()) {
+        return QString();
+    }
+    const QModelIndex sourceIndex = m_proxyModel.mapToSource(proxyIndex);
+    return selectedPath(sourceIndex);
+}
+
+bool MainWindow::indexBelongsToModelRoot(const QModelIndex& proxyIndex, const QString& modelRootPath) const
+{
+    const QString normalizedRoot = QDir::fromNativeSeparators(QDir::cleanPath(modelRootPath));
+    const QString normalizedPath = QDir::fromNativeSeparators(QDir::cleanPath(indexPathForLogging(proxyIndex)));
+    if (normalizedRoot.trimmed().isEmpty() || normalizedPath.trimmed().isEmpty()) {
+        return false;
+    }
+    if (QString::compare(normalizedPath, normalizedRoot, Qt::CaseInsensitive) == 0) {
+        return true;
+    }
+    const QString prefix = normalizedRoot.endsWith('/') ? normalizedRoot : (normalizedRoot + QStringLiteral("/"));
+    return normalizedPath.startsWith(prefix, Qt::CaseInsensitive);
+}
+
+void MainWindow::syncNavigationStateFromView(bool enforceOwnership)
+{
+    const QString modelRootPath = currentRootPath();
+    m_navigationState.visiblePath = m_rootEdit ? m_rootEdit->text().trimmed() : QString();
+    m_navigationState.currentRootPath = modelRootPath;
+
+    if (!m_treeView || !m_treeView->selectionModel()) {
+        m_navigationState.currentIndexValid = false;
+        m_navigationState.selectedIndexValid = false;
+        m_navigationState.currentIndexPath.clear();
+        m_navigationState.selectedIndexPath.clear();
+        return;
+    }
+
+    QModelIndex currentProxy = m_treeView->currentIndex();
+    QModelIndex selectedProxy;
+    const QModelIndexList selectedRows = m_treeView->selectionModel()->selectedRows(0);
+    if (!selectedRows.isEmpty()) {
+        selectedProxy = selectedRows.first();
+    }
+
+    bool currentValid = currentProxy.isValid();
+    bool selectedValid = selectedProxy.isValid();
+    if (enforceOwnership) {
+        if (currentValid && !indexBelongsToModelRoot(currentProxy, modelRootPath)) {
+            currentValid = false;
+            currentProxy = QModelIndex();
+        }
+        if (selectedValid && !indexBelongsToModelRoot(selectedProxy, modelRootPath)) {
+            selectedValid = false;
+            selectedProxy = QModelIndex();
+        }
+    }
+
+    m_navigationState.currentIndexValid = currentValid;
+    m_navigationState.selectedIndexValid = selectedValid;
+    m_navigationState.currentIndexPath = currentValid ? indexPathForLogging(currentProxy) : QString();
+    m_navigationState.selectedIndexPath = selectedValid ? indexPathForLogging(selectedProxy) : QString();
+}
+
+void MainWindow::logNavigationState(const QString& stage,
+                                    const QString& routeToken,
+                                    const QString& targetPath,
+                                    const QString& note) const
+{
+    const QString line = QStringLiteral("CORE_NAV_SM stage=%1 route=%2 target=%3 generation=%4 currentRootPath=%5 visiblePath=%6 rowCount=%7 currentIndexValid=%8 currentIndexPath=%9 selectedIndexValid=%10 selectedIndexPath=%11 navigationBusy=%12 rebindComplete=%13 note=%14")
+                             .arg(stage,
+                                  routeToken,
+                                  targetPath,
+                                  QString::number(m_navigationState.navigationGeneration),
+                                  m_navigationState.currentRootPath,
+                                  m_navigationState.visiblePath,
+                                  QString::number(m_proxyModel.rowCount(QModelIndex())),
+                                  m_navigationState.currentIndexValid ? QStringLiteral("true") : QStringLiteral("false"),
+                                  m_navigationState.currentIndexPath,
+                                  m_navigationState.selectedIndexValid ? QStringLiteral("true") : QStringLiteral("false"),
+                                  m_navigationState.selectedIndexPath,
+                                  m_navigationState.navigationBusy ? QStringLiteral("true") : QStringLiteral("false"),
+                                  m_navigationState.rebindComplete ? QStringLiteral("true") : QStringLiteral("false"),
+                                  note);
+    appendRuntimeLog(line);
+
+    QDir dir(QDir::currentPath());
+    if (!dir.exists(QStringLiteral("debug"))) {
+        dir.mkpath(QStringLiteral("debug"));
+    }
+    QFile liveLog(dir.filePath(QStringLiteral("debug/core_nav_sm_live.log")));
+    if (liveLog.open(QIODevice::Append | QIODevice::Text)) {
+        QTextStream stream(&liveLog);
+        stream << QDateTime::currentDateTime().toString(Qt::ISODate) << " | " << line << "\n";
+    }
+}
+
+bool MainWindow::beginNavigationTransition(const QString& routeToken, const QString& targetPath)
+{
+    if (m_navigationState.navigationBusy || !m_navigationState.rebindComplete) {
+        logNavigationState(QStringLiteral("Abort"), routeToken, targetPath, QStringLiteral("transition_blocked_busy_or_rebind_pending"));
+        return false;
+    }
+
+    syncNavigationStateFromView(true);
+    m_navigationState.navigationGeneration += 1;
+    m_navigationState.navigationBusy = true;
+    m_navigationState.rebindComplete = false;
+    m_navigationState.lastRouteToken = routeToken;
+    m_navigationState.lastResolvedTargetPath = targetPath;
+    m_navigationState.pendingRestorePath = m_navigationState.selectedIndexPath;
+    m_pendingRestoreSelectionPath = m_navigationState.pendingRestorePath;
+
+    if (m_treeView && m_treeView->selectionModel()) {
+        m_treeView->selectionModel()->clearSelection();
+        m_treeView->selectionModel()->setCurrentIndex(QModelIndex(), QItemSelectionModel::Clear);
+        m_treeView->setCurrentIndex(QModelIndex());
+    }
+
+    logNavigationState(QStringLiteral("TransitionBegin"), routeToken, targetPath, QStringLiteral("entered_critical_section"));
+    return true;
+}
+
+void MainWindow::completeNavigationReady(const QString& note)
+{
+    syncNavigationStateFromView(true);
+    const bool rootsAligned = QString::compare(QDir::cleanPath(m_navigationState.currentRootPath),
+                                               QDir::cleanPath(m_navigationState.visiblePath),
+                                               Qt::CaseInsensitive) == 0;
+    if (!rootsAligned) {
+        abortNavigationTransition(QStringLiteral("root_visible_diverged"), note);
+        return;
+    }
+
+    m_navigationState.navigationBusy = false;
+    m_navigationState.rebindComplete = true;
+    m_navigationState.pendingRestorePath.clear();
+    m_pendingRestoreSelectionPath.clear();
+    logNavigationState(QStringLiteral("Ready"), m_navigationState.lastRouteToken, m_navigationState.lastResolvedTargetPath, note);
+    if (m_navigationState.lastRouteToken.contains(QStringLiteral("recover_missing"), Qt::CaseInsensitive)) {
+        logNavigationState(QStringLiteral("RecoveryRebindComplete"),
+                           m_navigationState.lastRouteToken,
+                           m_navigationState.lastResolvedTargetPath,
+                           QStringLiteral("rebind_complete_after_recovery"));
+    }
+}
+
+void MainWindow::abortNavigationTransition(const QString& reason, const QString& note)
+{
+    m_navigationState.navigationBusy = false;
+    m_navigationState.rebindComplete = true;
+    m_navigationState.pendingRestorePath.clear();
+    m_pendingRestoreSelectionPath.clear();
+    logNavigationState(QStringLiteral("Abort"), m_navigationState.lastRouteToken, m_navigationState.lastResolvedTargetPath,
+                       QStringLiteral("reason=%1 %2").arg(reason, note));
+}
+
+void MainWindow::replayDeferredNavigationIfAny(const QString& sourceStage)
+{
+    if (m_navigationState.navigationBusy || !m_navigationState.rebindComplete || m_scanInProgress) {
+        return;
+    }
+
+    const QString pendingPath = m_pendingActivatedPath.trimmed();
+    if (pendingPath.isEmpty()) {
+        return;
+    }
+
+    const QString pendingRoute = m_pendingNavigationRoute.trimmed().isEmpty()
+        ? QStringLiteral("deferred_replay")
+        : m_pendingNavigationRoute.trimmed();
+    m_pendingActivatedPath.clear();
+    m_pendingNavigationRoute.clear();
+
+    appendRuntimeLog(QStringLiteral("tree_activated_deferred_replay_after_ready source=%1 route=%2 path=%3")
+                         .arg(sourceStage, pendingRoute, pendingPath));
+    QTimer::singleShot(0, this, [this, pendingPath, pendingRoute]() {
+        if (isNavigablePath(pendingPath)) {
+            navigateToDirectory(pendingPath, true, pendingRoute);
+        } else {
+            appendRuntimeLog(QStringLiteral("tree_activated_deferred_replay_skipped reason=not_navigable path=%1")
+                                 .arg(pendingPath));
+        }
+    });
+}
+
+void MainWindow::clearStaleSelectionState(const QString& routeToken,
+                                          const QString& attemptedTarget,
+                                          const QString& reason)
+{
+    if (m_treeView && m_treeView->selectionModel()) {
+        m_treeView->selectionModel()->clearSelection();
+        m_treeView->selectionModel()->setCurrentIndex(QModelIndex(), QItemSelectionModel::Clear);
+        m_treeView->setCurrentIndex(QModelIndex());
+    }
+
+    m_pendingActivatedPath.clear();
+    m_pendingNavigationRoute.clear();
+    m_pendingRestoreSelectionPath.clear();
+    m_navigationState.pendingRestorePath.clear();
+    m_navigationState.currentIndexValid = false;
+    m_navigationState.selectedIndexValid = false;
+    m_navigationState.currentIndexPath.clear();
+    m_navigationState.selectedIndexPath.clear();
+
+    logNavigationState(QStringLiteral("StaleSelectionCleared"), routeToken, attemptedTarget, reason);
+}
+
+QString MainWindow::resolveSafeRootFallbackPath() const
+{
+    const QString current = QDir::cleanPath(currentRootPath());
+    const QFileInfo currentInfo(current);
+    if (isInternalNavigableDirectory(currentInfo)) {
+        return current;
+    }
+
+    const QString homePath = QDir::cleanPath(QStandardPaths::writableLocation(QStandardPaths::HomeLocation));
+    const QFileInfo homeInfo(homePath);
+    if (isInternalNavigableDirectory(homeInfo)) {
+        return homePath;
+    }
+
+    const QString rootPath = QDir::cleanPath(QDir::rootPath());
+    const QFileInfo rootInfo(rootPath);
+    if (isInternalNavigableDirectory(rootInfo)) {
+        return rootPath;
+    }
+
+    return QString();
+}
+
+QString MainWindow::resolveNearestExistingParentPath(const QString& path, bool* usedSafeRootFallback) const
+{
+    if (usedSafeRootFallback) {
+        *usedSafeRootFallback = false;
+    }
+
+    QString candidate = QDir::cleanPath(path.trimmed());
+    if (candidate.isEmpty()) {
+        const QString safeRoot = resolveSafeRootFallbackPath();
+        if (usedSafeRootFallback) {
+            *usedSafeRootFallback = !safeRoot.isEmpty();
+        }
+        return safeRoot;
+    }
+
+    QFileInfo info(candidate);
+    if (!info.isDir()) {
+        candidate = info.absolutePath();
+    }
+
+    while (!candidate.trimmed().isEmpty()) {
+        const QFileInfo candidateInfo(candidate);
+        if (isInternalNavigableDirectory(candidateInfo)) {
+            return QDir::cleanPath(candidate);
+        }
+
+        QDir dir(candidate);
+        const QString before = dir.absolutePath();
+        if (!dir.cdUp()) {
+            break;
+        }
+        const QString after = dir.absolutePath();
+        if (QString::compare(before, after, Qt::CaseInsensitive) == 0) {
+            break;
+        }
+        candidate = after;
+    }
+
+    const QString safeRoot = resolveSafeRootFallbackPath();
+    if (usedSafeRootFallback) {
+        *usedSafeRootFallback = !safeRoot.isEmpty();
+    }
+    return safeRoot;
 }
 
 QModelIndex MainWindow::findSourceIndexByPath(const QString& absolutePath, const QModelIndex& parent) const
@@ -5927,6 +6554,13 @@ void MainWindow::appendRuntimeLog(const QString& message) const
             QDir::Name);
     }
     if (dirs.isEmpty()) {
+        dirs = proofRoot.entryInfoList(
+            QStringList() << QStringLiteral("nav_watcher_favorites_1_*")
+                          << QStringLiteral("nav_watcher_fav_realfix_1_*"),
+            QDir::Dirs | QDir::NoDotAndDotDot,
+            QDir::Name);
+    }
+    if (dirs.isEmpty()) {
         return;
     }
 
@@ -5937,7 +6571,7 @@ void MainWindow::appendRuntimeLog(const QString& message) const
     }
 
     QTextStream stream(&out);
-    stream << QDateTime::currentDateTime().toString(Qt::ISODate) << " | " << message << "\n";
+    stream << QDateTime::currentDateTime().toString(Qt::ISODateWithMs) << " | " << message << "\n";
 }
 
 void MainWindow::updateStatusDisplay(const QString& status,
@@ -5985,23 +6619,97 @@ QString MainWindow::mapStatusErrorText(const QString& errorText, const QString& 
 
 void MainWindow::startScanNow()
 {
-    m_pendingRestoreSelectionPath.clear();
-    if (m_treeView && m_treeView->currentIndex().isValid()) {
-        const QModelIndex sourceIndex = m_proxyModel.mapToSource(m_treeView->currentIndex());
-        m_pendingRestoreSelectionPath = selectedPath(sourceIndex);
+    const bool watcherRequestedAuthoritativeRebuild = m_forceAuthoritativeRebuildNextScan;
+    m_forceAuthoritativeRebuildNextScan = false;
+    m_pendingRestoreSelectionPath = m_navigationState.pendingRestorePath;
+
+    if (watcherRequestedAuthoritativeRebuild) {
+        m_navigationState.pendingRestorePath.clear();
+        m_pendingRestoreSelectionPath.clear();
+        m_pendingActivatedPath.clear();
+        m_pendingNavigationRoute.clear();
+    }
+
+    const quint64 rowCountBefore = m_fileModel.itemCount();
+    const QString root = m_rootEdit->text().trimmed();
+    const bool queryActive = m_queryModeActive && !m_activeQueryString.trimmed().isEmpty();
+    const bool authoritativeModelReplacement = !queryActive;
+    const QString modelRefreshSource = authoritativeModelReplacement
+        ? QStringLiteral("filesystem")
+        : QStringLiteral("db_querycore_only");
+
+    if (m_treeView && m_treeView->selectionModel()) {
+        m_treeView->selectionModel()->clearSelection();
+        m_treeView->selectionModel()->setCurrentIndex(QModelIndex(), QItemSelectionModel::Clear);
+        m_treeView->setCurrentIndex(QModelIndex());
     }
 
     m_fileModel.clear();
     m_publishQueue.clear();
     m_publishTimer.stop();
-    const QString root = m_rootEdit->text().trimmed();
+    appendRuntimeLog(QStringLiteral("MODEL_REFRESH_BEGIN currentRootPath=%1 rowCountBefore=%2")
+                         .arg(root)
+                         .arg(rowCountBefore));
+    if (watcherRequestedAuthoritativeRebuild) {
+        m_rebuildApplyInProgress = true;
+        m_rebuildApplyPath = root;
+        m_rebuildRowCountBefore = rowCountBefore;
+        appendRuntimeLog(QStringLiteral("REBUILD_BEGIN path=%1 rowCountBefore=%2")
+                             .arg(root)
+                             .arg(rowCountBefore));
+    }
+    updateRootWatcherPath(root);
+    appendRuntimeLog(QStringLiteral("filesystem_listing_source root=%1 source=directory_model_query favorites_shortcuts_count=%2 favorites_do_not_filter_results=true")
+                         .arg(root)
+                         .arg(m_favorites.size()));
     const bool archiveRoot = PathUtils::isArchivePath(root) || PathUtils::isArchiveVirtualPath(root);
+
+    if (!archiveRoot) {
+        const QFileInfo rootInfo(root);
+        if (!isInternalNavigableDirectory(rootInfo)) {
+            syncNavigationStateFromView(true);
+            logNavigationState(QStringLiteral("RecoverMissingCurrentRootDetected"),
+                               QStringLiteral("rescan"),
+                               root,
+                               QStringLiteral("exists=%1 is_dir=%2")
+                                   .arg(rootInfo.exists() ? QStringLiteral("true") : QStringLiteral("false"))
+                                   .arg(rootInfo.isDir() ? QStringLiteral("true") : QStringLiteral("false")));
+
+            clearStaleSelectionState(QStringLiteral("rescan"), root, QStringLiteral("current_root_missing"));
+            bool usedSafeRootFallback = false;
+            const QString recoveryPath = resolveNearestExistingParentPath(root, &usedSafeRootFallback);
+            if (!recoveryPath.isEmpty() && QString::compare(QDir::cleanPath(recoveryPath), QDir::cleanPath(root), Qt::CaseInsensitive) != 0) {
+                logNavigationState(QStringLiteral("RecoveryPathChosen"),
+                                   QStringLiteral("rescan"),
+                                   root,
+                                   QStringLiteral("resolved_recovery_target=%1 fallback=%2")
+                                       .arg(recoveryPath,
+                                            usedSafeRootFallback ? QStringLiteral("safe_root") : QStringLiteral("parent")));
+                if (!m_missingPathRecoveryInFlight) {
+                    m_missingPathRecoveryInFlight = true;
+                    navigateToDirectory(recoveryPath, true, QStringLiteral("recover_missing_current_root"));
+                    m_missingPathRecoveryInFlight = false;
+                }
+                return;
+            }
+
+            updateStatusDisplay(QStringLiteral("Error"), 0, 0, QStringLiteral("Current folder is missing and no recovery path was found"));
+            if (m_navigationState.navigationBusy) {
+                abortNavigationTransition(QStringLiteral("missing_current_root_no_recovery"), root);
+            }
+            return;
+        }
+    }
+
     const QStringList extensions = PathUtils::splitExtensionsFilter(m_extensionFilterEdit->text());
     const QString search = m_searchEdit->text().trimmed();
 
     if (!archiveRoot && !ensureDirectoryModelReady()) {
         updateStatusDisplay(QStringLiteral("Error"), 0, 0, QStringLiteral("Database not ready"));
         appendRuntimeLog(QStringLiteral("ui_query_error db_not_ready path=%1").arg(m_uiDbPath));
+        if (m_navigationState.navigationBusy) {
+            abortNavigationTransition(QStringLiteral("db_not_ready"), root);
+        }
         return;
     }
 
@@ -6015,7 +6723,14 @@ void MainWindow::startScanNow()
 
     QueryResult result;
     QString effectiveRoot = root;
-    const bool queryActive = m_queryModeActive && !m_activeQueryString.trimmed().isEmpty();
+    appendRuntimeLog(QStringLiteral("MODEL_REFRESH_SOURCE source=%1 currentRootPath=%2")
+                         .arg(modelRefreshSource)
+                         .arg(root));
+
+    if (authoritativeModelReplacement) {
+        appendRuntimeLog(QStringLiteral("MODEL_STALE_MERGE_BYPASSED reason=authoritative_current_root_rebuild"));
+    }
+
     if (queryActive) {
         appendRuntimeLog(QStringLiteral("ui_querybar_begin scan_id=%1 root=%2 mode=%3 db=%4 query=%5")
                              .arg(m_activeScanId)
@@ -6028,6 +6743,9 @@ void MainWindow::startScanNow()
             m_scanInProgress = false;
             updateStatusDisplay(QStringLiteral("Error"), 0, 0, QStringLiteral("Query controller not ready"));
             appendRuntimeLog(QStringLiteral("ui_querybar_failed error=query_controller_not_ready"));
+            if (m_navigationState.navigationBusy) {
+                abortNavigationTransition(QStringLiteral("query_controller_not_ready"), root);
+            }
             return;
         }
 
@@ -6051,6 +6769,9 @@ void MainWindow::startScanNow()
             updateStatusDisplay(QStringLiteral("Error"), 0, 0,
                                 QStringLiteral("Query parse error: %1").arg(queryExec.parseError));
             appendRuntimeLog(QStringLiteral("ui_querybar_failed phase=parse error=%1").arg(queryExec.parseError));
+            if (m_navigationState.navigationBusy) {
+                abortNavigationTransition(QStringLiteral("query_parse_failed"), queryExec.parseError);
+            }
             return;
         }
 
@@ -6074,6 +6795,7 @@ void MainWindow::startScanNow()
         DirectoryModel::Request request;
         request.rootPath = root;
         request.mode = m_viewModeController.mode();
+        request.authoritativeRebuild = authoritativeModelReplacement || watcherRequestedAuthoritativeRebuild;
         request.includeHidden = m_showHiddenCheck->isChecked();
         request.includeSystem = m_showSystemCheck->isChecked();
         request.foldersFirst = true;
@@ -6088,27 +6810,112 @@ void MainWindow::startScanNow()
     }
 
     if (!result.ok) {
+        const QString queryError = result.errorText.trimmed();
+        const bool deferredByPublishGate = queryError.startsWith(QStringLiteral("publish_deferred_active_scan"), Qt::CaseInsensitive);
+        const bool failedClosedByPublishGate = queryError.startsWith(QStringLiteral("publish_gate_failed_closed"), Qt::CaseInsensitive)
+            || queryError.startsWith(QStringLiteral("publish_gate_terminal_status_not_complete"), Qt::CaseInsensitive)
+            || queryError.startsWith(QStringLiteral("publish_gate_list_scan_sessions_failed"), Qt::CaseInsensitive);
+
+        if (deferredByPublishGate && !queryActive) {
+            m_scanInProgress = false;
+            m_rebuildApplyInProgress = false;
+            m_treeView->setSortingEnabled(true);
+            updateStatusDisplay(QStringLiteral("Indexing"), 0, m_fileModel.itemCount(), QStringLiteral("Publish deferred: waiting for active scan reconcile"));
+            appendRuntimeLog(QStringLiteral("PUBLISH_GATE_DEFERRED active_session=YES publish_deferred=YES root=%1 error=%2")
+                                 .arg(root)
+                                 .arg(queryError));
+            QTimer::singleShot(150, this, [this]() {
+                if (!m_scanInProgress) {
+                    startScanNow();
+                }
+            });
+            return;
+        }
+
         m_scanInProgress = false;
+        m_rebuildApplyInProgress = false;
         m_treeView->setSortingEnabled(true);
         updateStatusDisplay(QStringLiteral("Error"), 0, 0, mapStatusErrorText(result.errorText, root));
+        if (failedClosedByPublishGate && !queryActive) {
+            appendRuntimeLog(QStringLiteral("PUBLISH_GATE_FAIL_CLOSED publish_deferred=YES root=%1 error=%2")
+                                 .arg(root)
+                                 .arg(queryError));
+        }
         appendRuntimeLog(QStringLiteral("ui_query_failed error=%1 query_mode=%2")
                              .arg(result.errorText)
                              .arg(queryActive ? QStringLiteral("true") : QStringLiteral("false")));
+        if (m_navigationState.navigationBusy) {
+            abortNavigationTransition(QStringLiteral("query_failed"), result.errorText);
+        }
         return;
     }
 
     m_fileModel.setViewMode(m_viewModeController.toFileViewMode(), archiveRoot ? root : effectiveRoot);
 
     const QVector<FileEntry> rows = QueryResultAdapter::toFileEntries(result);
-    m_publishQueue = rows;
     m_scanBatchCount = 1;
     m_scanEntryCount = static_cast<quint64>(rows.size());
     m_scanEnumeratedCount = static_cast<quint64>(rows.size());
     m_scanInProgress = false;
-    if (!m_publishQueue.isEmpty()) {
+
+    if (authoritativeModelReplacement || watcherRequestedAuthoritativeRebuild) {
+        m_publishQueue.clear();
+        m_fileModel.appendBatch(rows);
+        m_treeView->setSortingEnabled(true);
+        const quint64 effectiveRowCountBefore = m_rebuildApplyInProgress ? m_rebuildRowCountBefore : rowCountBefore;
+        const QString effectiveRebuildPath = m_rebuildApplyInProgress ? m_rebuildApplyPath : root;
+        const quint64 rowCountAfter = m_fileModel.itemCount();
+        const quint64 removedCount = (effectiveRowCountBefore > rowCountAfter) ? (effectiveRowCountBefore - rowCountAfter) : 0;
+        const quint64 addedCount = (rowCountAfter > effectiveRowCountBefore) ? (rowCountAfter - effectiveRowCountBefore) : 0;
+        appendRuntimeLog(QStringLiteral("MODEL_REBUILD_APPLY rowCountFresh=%1 rowCountAfter=%2 replacedDataset=YES")
+                             .arg(rows.size())
+                             .arg(rowCountAfter));
+        appendRuntimeLog(QStringLiteral("REBUILD_COMPLETE path=%1 rowCountAfter=%2")
+                             .arg(effectiveRebuildPath)
+                             .arg(rowCountAfter));
+        appendRuntimeLog(QStringLiteral("REBUILD_DIFF removed=%1 added=%2")
+                             .arg(removedCount)
+                             .arg(addedCount));
+        appendRuntimeLog(QStringLiteral("MODEL_SYNC source_rows=%1 proxy_rows=%2 publish_queue=%3")
+                     .arg(m_fileModel.rowCount(QModelIndex()))
+                     .arg(m_proxyModel.rowCount(QModelIndex()))
+                     .arg(m_publishQueue.size()));
+        m_rebuildApplyInProgress = false;
+        if (m_navigationState.navigationBusy) {
+            syncNavigationStateFromView(true);
+            logNavigationState(QStringLiteral("RebindSelection"),
+                               m_navigationState.lastRouteToken,
+                               m_navigationState.lastResolvedTargetPath,
+                               QStringLiteral("authoritative_rebuild_applied"));
+            logNavigationState(QStringLiteral("RebindCurrentIndex"),
+                               m_navigationState.lastRouteToken,
+                               m_navigationState.lastResolvedTargetPath,
+                               QStringLiteral("authoritative_rebuild_applied"));
+            completeNavigationReady(QStringLiteral("authoritative_rebuild_completed"));
+            replayDeferredNavigationIfAny(QStringLiteral("authoritative_rebuild_completed"));
+        }
+    } else if (!rows.isEmpty()) {
+        m_publishQueue = rows;
         m_publishTimer.start();
     } else {
+        m_publishQueue.clear();
         m_treeView->setSortingEnabled(true);
+        if (m_navigationState.navigationBusy) {
+            syncNavigationStateFromView(true);
+            logNavigationState(QStringLiteral("Republish"),
+                               m_navigationState.lastRouteToken,
+                               m_navigationState.lastResolvedTargetPath,
+                               QStringLiteral("remaining_queue=0"));
+            logNavigationState(QStringLiteral("RebindSelection"),
+                               m_navigationState.lastRouteToken,
+                               m_navigationState.lastResolvedTargetPath,
+                               QStringLiteral("row_count=0 selection_cleared"));
+            logNavigationState(QStringLiteral("RebindCurrentIndex"),
+                               m_navigationState.lastRouteToken,
+                               m_navigationState.lastResolvedTargetPath,
+                               QStringLiteral("row_count=0 current_cleared"));
+            completeNavigationReady(QStringLiteral("requery_completed_no_rows"));
+        }
     }
 
     updateStatusDisplay(QStringLiteral("Ready"), 100, static_cast<quint64>(rows.size()),
@@ -6116,6 +6923,12 @@ void MainWindow::startScanNow()
     appendRuntimeLog(QStringLiteral("ui_query_complete rows=%1 query_mode=%2")
                          .arg(rows.size())
                          .arg(queryActive ? QStringLiteral("true") : QStringLiteral("false")));
+    appendRuntimeLog(QStringLiteral("MODEL_REFRESH_COMPLETE currentRootPath=%1 visiblePath=%2 sort_mode=column_%3_%4 rowCountAfter=%5")
+                         .arg(root)
+                         .arg(effectiveRoot)
+                         .arg(m_treeView->header()->sortIndicatorSection())
+                         .arg(m_treeView->header()->sortIndicatorOrder() == Qt::AscendingOrder ? QStringLiteral("asc") : QStringLiteral("desc"))
+                         .arg(m_fileModel.itemCount()));
 
     if (m_viewModeController.mode() == ViewModeController::UiViewMode::Hierarchy) {
         m_treeView->expandAll();
@@ -6178,6 +6991,53 @@ void MainWindow::onPublishTick()
     if (m_publishQueue.isEmpty()) {
         m_publishTimer.stop();
         m_treeView->setSortingEnabled(!m_scanInProgress);
+        m_proxyModel.invalidate();
+        appendRuntimeLog(QStringLiteral("PUBLISH_SYNC source_rows=%1 proxy_rows=%2 publish_queue=%3")
+                             .arg(m_fileModel.rowCount(QModelIndex()))
+                             .arg(m_proxyModel.rowCount(QModelIndex()))
+                             .arg(m_publishQueue.size()));
+        if (m_rebuildApplyInProgress) {
+            const quint64 rowCountAfter = m_fileModel.itemCount();
+            const quint64 removedCount = (m_rebuildRowCountBefore > rowCountAfter) ? (m_rebuildRowCountBefore - rowCountAfter) : 0;
+            const quint64 addedCount = (rowCountAfter > m_rebuildRowCountBefore) ? (rowCountAfter - m_rebuildRowCountBefore) : 0;
+            appendRuntimeLog(QStringLiteral("REBUILD_COMPLETE path=%1 rowCountAfter=%2")
+                                 .arg(m_rebuildApplyPath)
+                                 .arg(rowCountAfter));
+            appendRuntimeLog(QStringLiteral("REBUILD_DIFF removed=%1 added=%2")
+                                 .arg(removedCount)
+                                 .arg(addedCount));
+            m_rebuildApplyInProgress = false;
+        }
+        if (!m_scanInProgress && m_navigationState.navigationBusy) {
+            if (!m_navigationState.pendingRestorePath.trimmed().isEmpty()) {
+                const QModelIndex sourceMatch = findSourceIndexByPath(m_navigationState.pendingRestorePath);
+                if (sourceMatch.isValid()) {
+                    const QModelIndex proxyMatch = m_proxyModel.mapFromSource(sourceMatch);
+                    if (proxyMatch.isValid() && m_treeView && m_treeView->selectionModel()) {
+                        m_treeView->selectionModel()->setCurrentIndex(
+                            proxyMatch,
+                            QItemSelectionModel::ClearAndSelect | QItemSelectionModel::Rows);
+                        m_treeView->scrollTo(proxyMatch, QAbstractItemView::PositionAtCenter);
+                    }
+                }
+                m_navigationState.pendingRestorePath.clear();
+                m_pendingRestoreSelectionPath.clear();
+            }
+
+            if (m_treeView && m_treeView->selectionModel() && !m_treeView->currentIndex().isValid() && m_proxyModel.rowCount(QModelIndex()) > 0) {
+                const QModelIndex firstProxy = m_proxyModel.index(0, 0, QModelIndex());
+                if (firstProxy.isValid()) {
+                    m_treeView->selectionModel()->setCurrentIndex(
+                        firstProxy,
+                        QItemSelectionModel::ClearAndSelect | QItemSelectionModel::Rows);
+                    m_treeView->scrollTo(firstProxy, QAbstractItemView::PositionAtTop);
+                }
+            }
+
+            syncNavigationStateFromView(true);
+            completeNavigationReady(QStringLiteral("publish_queue_empty"));
+        }
+        replayDeferredNavigationIfAny(QStringLiteral("publish_tick_empty"));
         return;
     }
 
@@ -6191,8 +7051,8 @@ void MainWindow::onPublishTick()
 
     m_fileModel.appendBatch(chunk);
 
-    if (!m_pendingRestoreSelectionPath.trimmed().isEmpty()) {
-        const QModelIndex sourceMatch = findSourceIndexByPath(m_pendingRestoreSelectionPath);
+    if (!m_navigationState.pendingRestorePath.trimmed().isEmpty()) {
+        const QModelIndex sourceMatch = findSourceIndexByPath(m_navigationState.pendingRestorePath);
         if (sourceMatch.isValid()) {
             const QModelIndex proxyMatch = m_proxyModel.mapFromSource(sourceMatch);
             if (proxyMatch.isValid() && m_treeView && m_treeView->selectionModel()) {
@@ -6200,7 +7060,12 @@ void MainWindow::onPublishTick()
                     proxyMatch,
                     QItemSelectionModel::ClearAndSelect | QItemSelectionModel::Rows);
                 m_treeView->scrollTo(proxyMatch, QAbstractItemView::PositionAtCenter);
+                m_navigationState.pendingRestorePath.clear();
                 m_pendingRestoreSelectionPath.clear();
+                logNavigationState(QStringLiteral("RebindSelection"),
+                                   m_navigationState.lastRouteToken,
+                                   m_navigationState.lastResolvedTargetPath,
+                                   QStringLiteral("restored_selection_path"));
             }
         }
     }
@@ -6210,6 +7075,17 @@ void MainWindow::onPublishTick()
     const quint64 total = shown + queued;
     const int percent = total > 0 ? qBound(0, static_cast<int>((shown * 100ULL) / total), 100) : 100;
     updateStatusDisplay(QStringLiteral("Indexing"), percent, shown);
+    syncNavigationStateFromView(true);
+    logNavigationState(QStringLiteral("RebindCurrentIndex"),
+                       m_navigationState.lastRouteToken,
+                       m_navigationState.lastResolvedTargetPath,
+                       QStringLiteral("current_index_valid=%1 selected_index_valid=%2")
+                           .arg(m_navigationState.currentIndexValid ? QStringLiteral("true") : QStringLiteral("false"))
+                           .arg(m_navigationState.selectedIndexValid ? QStringLiteral("true") : QStringLiteral("false")));
+    logNavigationState(QStringLiteral("Republish"),
+                       m_navigationState.lastRouteToken,
+                       m_navigationState.lastResolvedTargetPath,
+                       QStringLiteral("remaining_queue=%1").arg(m_publishQueue.size()));
     if (m_viewMode == FileViewMode::FullHierarchy && (m_scanBatchCount % 10ULL) == 0ULL) {
         m_treeView->expandAll();
     }
@@ -6244,15 +7120,59 @@ bool MainWindow::isNavigablePath(const QString& path) const
     return isInternalNavigableDirectory(QFileInfo(path));
 }
 
-void MainWindow::navigateToDirectory(const QString& path, bool pushHistory)
+void MainWindow::navigateToDirectory(const QString& path, bool pushHistory, const QString& routeToken)
 {
+    const QString resolvedRouteToken = routeToken.trimmed().isEmpty() ? QStringLiteral("direct") : routeToken.trimmed();
+    appendRuntimeLog(QStringLiteral("navigate_handler_entry route=%1 target=%2 current_before=%3 visible_before=%4")
+                         .arg(resolvedRouteToken)
+                         .arg(path)
+                         .arg(currentRootPath())
+                         .arg(m_rootEdit ? m_rootEdit->text().trimmed() : QString()));
+    logNavigationState(QStringLiteral("ResolveTarget"), resolvedRouteToken, path, QStringLiteral("incoming_request"));
     const QFileInfo fileInfo(path);
     if (!isNavigablePath(path)) {
+        syncNavigationStateFromView(true);
+        const bool missingTarget = !fileInfo.exists();
+        if (missingTarget) {
+            logNavigationState(QStringLiteral("RecoverMissingTargetDetected"),
+                               resolvedRouteToken,
+                               path,
+                               QStringLiteral("target_missing_before_navigation"));
+            clearStaleSelectionState(resolvedRouteToken, path, QStringLiteral("target_missing_before_navigation"));
+
+            bool usedSafeRootFallback = false;
+            const QString recoveryPath = QDir::cleanPath(resolveNearestExistingParentPath(path, &usedSafeRootFallback));
+            const QString currentRoot = QDir::cleanPath(currentRootPath());
+            const QString attemptedPath = QDir::cleanPath(path);
+            if (!recoveryPath.isEmpty()
+                && QString::compare(recoveryPath, currentRoot, Qt::CaseInsensitive) != 0
+                && QString::compare(recoveryPath, attemptedPath, Qt::CaseInsensitive) != 0
+                && !m_missingPathRecoveryInFlight) {
+                logNavigationState(QStringLiteral("RecoveryPathChosen"),
+                                   resolvedRouteToken,
+                                   path,
+                                   QStringLiteral("resolved_recovery_target=%1 fallback=%2")
+                                       .arg(recoveryPath,
+                                            usedSafeRootFallback ? QStringLiteral("safe_root") : QStringLiteral("parent")));
+                m_missingPathRecoveryInFlight = true;
+                navigateToDirectory(recoveryPath, true, QStringLiteral("recover_missing_target"));
+                m_missingPathRecoveryInFlight = false;
+                return;
+            }
+        }
+
         appendRuntimeLog(QStringLiteral("navigate_rejected path=%1 exists=%2 is_dir=%3 is_link=%4")
                              .arg(path)
                              .arg(fileInfo.exists() ? QStringLiteral("true") : QStringLiteral("false"))
                              .arg(fileInfo.isDir() ? QStringLiteral("true") : QStringLiteral("false"))
                              .arg(fileInfo.isSymLink() ? QStringLiteral("true") : QStringLiteral("false")));
+        logNavigationState(QStringLiteral("Abort"),
+                           resolvedRouteToken,
+                           path,
+                           missingTarget ? QStringLiteral("missing_target_no_additional_recovery") : QStringLiteral("not_navigable"));
+        if (m_navigationState.navigationBusy) {
+            abortNavigationTransition(QStringLiteral("not_navigable_target"), path);
+        }
         return;
     }
 
@@ -6270,7 +7190,20 @@ void MainWindow::navigateToDirectory(const QString& path, bool pushHistory)
     } else {
         normalizedPath = fileInfo.absoluteFilePath();
     }
+    logNavigationState(QStringLiteral("ValidateTarget"), resolvedRouteToken, normalizedPath, QStringLiteral("navigable=true"));
+    if (!beginNavigationTransition(resolvedRouteToken, normalizedPath)) {
+        m_pendingActivatedPath = normalizedPath;
+        m_pendingNavigationRoute = resolvedRouteToken;
+        appendRuntimeLog(QStringLiteral("navigate_deferred route=%1 path=%2 reason=busy_or_rebind_pending")
+                             .arg(resolvedRouteToken, normalizedPath));
+        return;
+    }
+
     m_rootEdit->setText(normalizedPath);
+    m_navigationState.currentRootPath = normalizedPath;
+    m_navigationState.visiblePath = normalizedPath;
+    updateRootWatcherPath(normalizedPath);
+    logNavigationState(QStringLiteral("RootChange"), resolvedRouteToken, normalizedPath, QStringLiteral("push_history=%1").arg(pushHistory ? QStringLiteral("true") : QStringLiteral("false")));
 
     // Navigation should default to plain directory listing; explicit query execution can be re-triggered by the user.
     m_queryModeActive = false;
@@ -6293,6 +7226,10 @@ void MainWindow::navigateToDirectory(const QString& path, bool pushHistory)
     appendRuntimeLog(QStringLiteral("navigate_internal path=%1 push_history=%2")
                          .arg(normalizedPath)
                          .arg(pushHistory ? QStringLiteral("true") : QStringLiteral("false")));
+    appendRuntimeLog(QStringLiteral("navigate_handler_apply route=%1 current_after=%2 visible_after=%3 trigger=rescan")
+                         .arg(resolvedRouteToken)
+                         .arg(currentRootPath())
+                         .arg(m_rootEdit ? m_rootEdit->text().trimmed() : QString()));
     onRescan();
 }
 

@@ -197,6 +197,20 @@ bool MetaStore::findSubtreeByRootPath(const QString& rootPath,
     return m_entries->findSubtreeByRootPath(rootPath, maxDepth, out, errorText);
 }
 
+bool MetaStore::removeStaleDescendantsByRootPath(const QString& rootPath,
+                                                 qint64 scanSessionId,
+                                                 qint64* removedCount,
+                                                 QString* errorText)
+{
+    if (!m_entries) {
+        if (errorText) {
+            *errorText = QStringLiteral("metastore_not_ready");
+        }
+        return false;
+    }
+    return m_entries->removeStaleDescendantsByRootPath(rootPath, scanSessionId, removedCount, errorText);
+}
+
 qint64 MetaStore::countEntriesUnderRoot(const QString& rootPath, int maxDepth, QString* errorText)
 {
     if (!m_entries) {

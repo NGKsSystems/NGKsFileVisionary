@@ -136,6 +136,22 @@ bool ScanCoordinator::runScan(const ScanTask& task,
         return true;
     }
 
+    QString reconcileError;
+    if (!reconcileRemovedEntries(rootPath, state.sessionId, &state, &reconcileError)) {
+        state.errorText = QStringLiteral("reconcile_removed_entries_failed: %1").arg(reconcileError);
+        QString failError;
+        m_store.failScanSession(state.sessionId,
+                                state.totalSeen,
+                                state.totalInserted,
+                                state.totalUpdated,
+                                state.totalRemoved,
+                                state.errorText,
+                                &failError);
+        state.success = false;
+        *outResult = state;
+        return false;
+    }
+
     QString completeError;
     if (!m_store.completeScanSession(state.sessionId,
                                      state.totalSeen,
@@ -224,6 +240,29 @@ bool ScanCoordinator::ingestBatch(const QVector<ScanIngestItem>& batch,
         return false;
     }
 
+    return true;
+}
+
+bool ScanCoordinator::reconcileRemovedEntries(const QString& rootPath,
+                                              qint64 scanSessionId,
+                                              ScanCoordinatorResult* state,
+                                              QString* errorText)
+{
+    if (!state) {
+        if (errorText) {
+            *errorText = QStringLiteral("null_scan_state");
+        }
+        return false;
+    }
+
+    qint64 removedCount = 0;
+    if (!m_store.removeStaleDescendantsByRootPath(rootPath, scanSessionId, &removedCount, errorText)) {
+        return false;
+    }
+
+    if (removedCount > 0) {
+        state->totalRemoved += removedCount;
+    }
     return true;
 }
 

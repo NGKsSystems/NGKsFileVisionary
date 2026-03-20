@@ -159,7 +159,7 @@ RefreshRequestResult RefreshService::requestRefresh(const QString& path, const R
             deferredEvent.reason = response.reason;
             deferredEvent.timestampUtc = nowIso();
             hasDeferredEvent = true;
-        } else if (hasRecentDuplicateWithinWindow(response.path)) {
+        } else if (!force && hasRecentDuplicateWithinWindow(response.path)) {
             response.state = RefreshState::SkippedDuplicate;
             response.reason = QStringLiteral("dedupe_window");
 

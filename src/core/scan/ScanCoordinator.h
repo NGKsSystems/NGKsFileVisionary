@@ -23,6 +23,10 @@ private:
     bool ingestBatch(const QVector<ScanIngestItem>& batch,
                      ScanCoordinatorResult* state,
                      QString* errorText);
+    bool reconcileRemovedEntries(const QString& rootPath,
+                                 qint64 scanSessionId,
+                                 ScanCoordinatorResult* state,
+                                 QString* errorText);
     QString buildVolumeKey(const QString& rootPath) const;
 
 private:

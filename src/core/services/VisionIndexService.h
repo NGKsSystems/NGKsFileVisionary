@@ -9,6 +9,7 @@
 
 class MetaStore;
 class QueryCore;
+struct ScanSessionRecord;
 
 class VisionIndexService
 {
@@ -43,6 +44,12 @@ public:
     bool waitForRefreshIdle(int timeoutMs);
 
 private:
+    bool waitForPublishReady(const QString& path,
+                             int timeoutMs,
+                             bool* sawActiveSession,
+                             ScanSessionRecord* terminalSession,
+                             QString* errorText) const;
+    bool allowPublishForPath(const QString& path, QString* errorText);
     void scheduleVisibleRefresh(const QString& path, const QString& reason);
 
 private:

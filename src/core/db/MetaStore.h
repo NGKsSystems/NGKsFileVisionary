@@ -43,6 +43,10 @@ public:
                                int maxDepth,
                                QVector<EntryRecord>* out,
                                QString* errorText = nullptr);
+    bool removeStaleDescendantsByRootPath(const QString& rootPath,
+                                          qint64 scanSessionId,
+                                          qint64* removedCount,
+                                          QString* errorText = nullptr);
     qint64 countEntriesUnderRoot(const QString& rootPath, int maxDepth = -1, QString* errorText = nullptr);
     bool listSampleRows(int limit, QVector<EntryRecord>* out, QString* errorText = nullptr);
     bool resolveParentIdByPath(const QString& parentPath,

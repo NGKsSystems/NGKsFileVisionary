@@ -2,6 +2,7 @@
 
 #include <QFutureWatcher>
 #include <QAction>
+#include <QFileSystemWatcher>
 #include <QLineEdit>
 #include <QMainWindow>
 #include <QPushButton>
@@ -205,14 +206,35 @@ private slots:
     void onActionUnpinFavorite();
     void onRunTestScript();
     void onRefreshPollTick();
+    void onRootWatcherDirectoryChanged(const QString& path);
+    void onRootWatcherFileChanged(const QString& path);
+    void onWatcherRefreshTick();
 
 private:
     void setupUi();
     void setupScanner();
+    void updateRootWatcherPath(const QString& rootPath);
+    void queueWatcherRefresh(const QString& reason, const QString& changedPath);
     bool ensureDirectoryModelReady();
     QString resolveUiDbPath() const;
     QuerySortField currentQuerySortField() const;
     QString selectedPath(const QModelIndex& index) const;
+    QString indexPathForLogging(const QModelIndex& proxyIndex) const;
+    bool indexBelongsToModelRoot(const QModelIndex& proxyIndex, const QString& modelRootPath) const;
+    void syncNavigationStateFromView(bool enforceOwnership);
+    void logNavigationState(const QString& stage,
+                            const QString& routeToken,
+                            const QString& targetPath,
+                            const QString& note = QString()) const;
+    bool beginNavigationTransition(const QString& routeToken, const QString& targetPath);
+    void completeNavigationReady(const QString& note = QString());
+    void abortNavigationTransition(const QString& reason, const QString& note = QString());
+    void replayDeferredNavigationIfAny(const QString& sourceStage);
+    void clearStaleSelectionState(const QString& routeToken,
+                                  const QString& attemptedTarget,
+                                  const QString& reason);
+    QString resolveSafeRootFallbackPath() const;
+    QString resolveNearestExistingParentPath(const QString& path, bool* usedSafeRootFallback = nullptr) const;
     QModelIndex findSourceIndexByPath(const QString& absolutePath, const QModelIndex& parent = QModelIndex()) const;
     void appendRuntimeLog(const QString& message) const;
     void updateStatusDisplay(const QString& status,
@@ -223,7 +245,9 @@ private:
     void startScanNow();
     bool isInternalNavigableDirectory(const QFileInfo& fileInfo) const;
     bool isNavigablePath(const QString& path) const;
-    void navigateToDirectory(const QString& path, bool pushHistory = true);
+    void navigateToDirectory(const QString& path,
+                             bool pushHistory = true,
+                             const QString& routeToken = QString());
     void updateNavigationButtons();
     void rebuildSidebar();
     void loadFavorites();
@@ -402,6 +426,7 @@ private:
     QVector<FileEntry> m_publishQueue;
     QTimer m_publishTimer;
     QTimer m_refreshPollTimer;
+    QTimer m_watcherRefreshTimer;
     FileViewMode m_viewMode = FileViewMode::Standard;
     QStringList m_navigationHistory;
     int m_navigationIndex = -1;
@@ -436,7 +461,35 @@ private:
     QDateTime m_lastActivatedTreeAt;
     bool m_treeActivationInFlight = false;
     QString m_pendingActivatedPath;
+    QString m_pendingNavigationRoute;
     QString m_pendingRestoreSelectionPath;
+    bool m_missingPathRecoveryInFlight = false;
+    QFileSystemWatcher* m_rootWatcher = nullptr;
+    QString m_watchedRootPath;
+    QStringList m_watchedDirectoryPaths;
+    QString m_pendingWatcherReason;
+    QString m_pendingWatcherChangedPath;
+    bool m_watcherRefreshPending = false;
+    bool m_forceAuthoritativeRebuildNextScan = false;
+    bool m_rebuildApplyInProgress = false;
+    QString m_rebuildApplyPath;
+    quint64 m_rebuildRowCountBefore = 0;
+
+    struct NavigationState {
+        QString currentRootPath;
+        QString visiblePath;
+        bool navigationBusy = false;
+        bool rebindComplete = true;
+        quint64 navigationGeneration = 0;
+        bool currentIndexValid = false;
+        bool selectedIndexValid = false;
+        QString currentIndexPath;
+        QString selectedIndexPath;
+        QString pendingRestorePath;
+        QString lastResolvedTargetPath;
+        QString lastRouteToken;
+    };
+    NavigationState m_navigationState;
 
     QAction* m_actionTreeSnapshot = nullptr;
     QAction* m_actionCompressZip = nullptr;

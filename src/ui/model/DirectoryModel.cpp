@@ -139,6 +139,10 @@ QueryResult DirectoryModel::query(const Request& request)
         return m_archiveQueryAdapter->query(request.rootPath, request.mode, options, nullptr);
     }
 
+    if (request.authoritativeRebuild) {
+        return queryFilesystemFallback(request.rootPath, options, request.mode);
+    }
+
     QueryResult result;
     if (!isReady()) {
         result.ok = false;

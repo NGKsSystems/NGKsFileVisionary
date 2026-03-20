@@ -20,6 +20,7 @@ public:
     {
         QString rootPath;
         ViewModeController::UiViewMode mode = ViewModeController::UiViewMode::Standard;
+        bool authoritativeRebuild = false;
         bool includeHidden = false;
         bool includeSystem = false;
         bool foldersFirst = true;
